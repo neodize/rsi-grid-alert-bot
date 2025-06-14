@@ -1,23 +1,33 @@
-🧠 RSI Grid Bot (Hourly)
+🧠 RSI & Grid Scanner Bot Description
 
-This bot runs every hour to help you identify ideal crypto trading opportunities using two strategies:
+This bot monitors hourly market data for cryptocurrencies using the CoinGecko API. It performs two main functions:
 
-1. 📉 RSI-Based Alerts (Oversold Coins)
+🔻 RSI Monitoring:
 
-It monitors key coins — BTC, ETH, SOL, and HYPE — and alerts when their RSI (Relative Strength Index) drops below 35 (oversold).For each oversold coin, it generates a personalized Grid Bot Setup, including:
+Tracks BTC, ETH, SOL, and HYPE hourly RSI (Relative Strength Index).
 
-Optimal price range
+Sends an alert when RSI drops below a certain threshold (typically 35), signaling potential entry points.
 
-Number of grids (based on volatility)
+Suggests Futures Grid Bot parameters such as:
 
-Grid mode, trailing option, and direction (Long)
+Price Range
 
-2. 📊 Sideways Market Scanner
+Number of Grids (dynamic based on volatility)
 
-It also scans the top 50 coins by trading volume and picks 3–5 coins that are:
+Grid Mode (Arithmetic)
 
-In a sideways trend (low volatility, low momentum)
+Trailing (Disabled)
 
-Ideal for grid bot trading
+Direction (Long)
 
-For each selected coin, it provides a complete grid bot configuration.
+📊 Sideways Market Scanner:
+
+Scans hundreds of cryptocurrencies every hour to identify coins trading in a sideways range.
+
+Selects up to 5 trending candidates (excluding BTC, ETH, SOL, HYPE) with flat price action.
+
+Recommends suitable Grid Bot parameters for each.
+
+All market data (prices, sparkline trends, RSI calculations) are powered by the CoinGecko API.
+
+The Telegram bot sends a unified alert combining both RSI-based signals and sideways coin suggestions to help you start a Futures Grid Bot confidently with real-time, data-driven insights.
