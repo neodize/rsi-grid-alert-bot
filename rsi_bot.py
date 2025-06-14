@@ -1,95 +1,131 @@
-# rsi_bot.py  ───────────────────────────────────────────────────────────────────
-# Sends RSI alerts + grid‑bot suggestions for selected coins.
-
-import requests, numpy as np
+# rsi_grid_combo.py  ────────────────────────────────────────────────────────────
+import requests, numpy as np, sys
 from datetime import datetime, timezone
-import sys
 
-# ─── TELEGRAM (your credentials) ───────────────────────────────────────────────
-TELEGRAM_TOKEN  = "7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8"
-TELEGRAM_CHATID = "7588547693"          # your private chat ID
+# ─── TELEGRAM CREDENTIALS (hard‑coded) ─────────────────────────────────────────
+TOKEN  = "7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8"
+CHATID = "7588547693"
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-VS   = "usd"
-COINS = {                                # CoinGecko ID → symbol
-    "bitcoin"     : "BTC",
-    "ethereum"    : "ETH",
-    "solana"      : "SOL",
-    "dogwifcoin"  : "WIF",
-    "pepe"        : "PEPE"
-}
-RSI_LOW  = 35
-RSI_HIGH = 65
-
-# ─── HELPERS ───────────────────────────────────────────────────────────────────
-def send_tg(msg:str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def tg(msg):  # send Telegram
     try:
-        requests.post(url,
-                      data={"chat_id": TELEGRAM_CHATID,
-                            "text": msg,
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHATID, "text": msg,
                             "parse_mode": "Markdown"},
                       timeout=12).raise_for_status()
     except Exception as e:
         print(f"[WARN] Telegram send failed: {e}", file=sys.stderr)
 
-def calc_rsi(closes, period=14):
-    closes=np.array(closes)
-    delta=np.diff(closes)
-    seed=delta[:period]
+# ─── CONSTANTS ─────────────────────────────────────────────────────────────────
+VS="usd"
+FOCUS = { "bitcoin":"BTC", "ethereum":"ETH",
+          "solana":"SOL", "hyperliquid":"HYPE" }
+RSI_LOW, RSI_HIGH = 35, 65          # focus‑coin extremes
+
+# scanner
+SCAN_TOP_N     = 50
+SCAN_PICKS_MAX = 5
+RS_SC_LOW, RS_SC_HIGH = 40, 60
+VOL_MIN, VOL_MAX = 0.03, 0.08
+TREND_MAX = 0.65
+EXCLUDE_SYM = set(FOCUS.values())
+
+# ─── TECHNICAL HELPER FUNCTIONS ───────────────────────────────────────────────
+def rsi(vals, period=14):
+    v=np.array(vals); d=np.diff(v)
+    seed=d[:period]
     up=seed[seed>=0].sum()/period
     dn=-seed[seed<0].sum()/period or 1e-9
-    rs=up/dn
-    rsi=100-100/(1+rs)
-    for d in delta[period:]:
-        gain=max(d,0); loss=-min(d,0)
-        up=(up*(period-1)+gain)/period
-        dn=(dn*(period-1)+loss)/period or 1e-9
-        rs=up/dn
-        rsi=100-100/(1+rs)
-    return round(rsi,2)
+    rs=up/dn; r=100-100/(1+rs)
+    for delta in d[period:]:
+        g=max(delta,0); l=-min(delta,0)
+        up=(up*(period-1)+g)/period
+        dn=(dn*(period-1)+l)/period or 1e-9
+        rs=up/dn; r=100-100/(1+rs)
+    return round(r,2)
 
 def cg_closes(cid):
     url=f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart"
-    r=requests.get(url,params={"vs_currency":VS,"days":2},timeout=15)
-    r.raise_for_status()
-    return [p[1] for p in r.json()["prices"]]
+    j=requests.get(url,params={"vs_currency":VS,"days":2},timeout=20).json()
+    return [p[1] for p in j["prices"]]
 
-def grid_suggestion(rsi, closes):
-    lo = round(min(closes[-48:]), -1)
-    hi = round(max(closes[-48:]), -1)
-    grids = 20
-    mode  = "Arithmetic"
-    trailing = "✅ Enabled"
-    direction = "Long" if rsi < RSI_LOW else "Short"
-    return lo, hi, grids, mode, trailing, direction
+def markets_spark():
+    url="https://api.coingecko.com/api/v3/coins/markets"
+    j=requests.get(url,params={
+        "vs_currency":VS,"order":"volume_desc","per_page":SCAN_TOP_N,
+        "page":1,"sparkline":"true","price_change_percentage":"24h"
+    },timeout=25).json()
+    return j
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
-def main():
-    alerts=[]
-    for cid,sym in COINS.items():
+def grid_params(closes):
+    lo=round(min(closes[-48:]),  0 if max(closes)<10 else -1)
+    hi=round(max(closes[-48:]),  0 if max(closes)<10 else -1)
+    grids=15
+    mode="Arithmetic"
+    trailing="Disabled"
+    return lo,hi,grids,mode,trailing
+
+# ─── BUILD TELEGRAM MESSAGE ───────────────────────────────────────────────────
+def build():
+    lines=[]
+    ts=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    lines.append(f"*HOURLY RSI ALERT — {ts}*")
+
+    # --- focus coins
+    for cid,sym in FOCUS.items():
         try:
             closes=cg_closes(cid)
-            rsi=calc_rsi(closes[-15:])
-            if rsi < RSI_LOW or rsi > RSI_HIGH:
-                lo,hi,grids,mode,trail,dirn = grid_suggestion(rsi, closes)
-                status="Oversold" if rsi<RSI_LOW else "Overbought"
-                alerts.append(
-f"""🔻 *{sym}* RSI {rsi:.2f} — {status}!
-
-📊 *Grid Bot Settings* ({sym.upper()}/{VS.upper()}):
-• Price Range: {lo} – {hi}
-• Grids: {grids}
-• Mode: {mode}
-• Trailing: {trail}
-• Direction: *{dirn}*"""
-                )
+            r=rsi(closes[-15:])
+            if r<RSI_LOW or r>RSI_HIGH:
+                lo,hi,grids,mode,trail = grid_params(closes)
+                direction="Long" if r<RSI_LOW else "Short"
+                emoji="🔻" if r<RSI_LOW else "🔺"
+                lines.append(f"\n{emoji} *{sym} RSI {r:.2f}*")
+                lines.append(f"📊 *{sym} Grid Bot Suggestion*")
+                lines.append(f"• Price Range: ${lo:,} – ${hi:,}")
+                lines.append(f"• Grids: {grids}")
+                lines.append(f"• Mode: {mode}")
+                lines.append(f"• Trailing: {trail}")
+                lines.append(f"• Direction: {direction}")
         except Exception as e:
-            print(f"[WARN] {sym}: {e}", file=sys.stderr)
+            print(f"[WARN] focus {cid}: {e}", file=sys.stderr)
 
-    if alerts:
-        ts=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        send_tg(f"*RSI Alert Bot* — {ts}\n\n" + "\n\n".join(alerts))
+    # --- sparkline scanner
+    picks=[]
+    try:
+        for coin in markets_spark():
+            sym=coin["symbol"].upper()
+            if sym in EXCLUDE_SYM: continue
+            prices=coin.get("sparkline_in_7d",{}).get("price",[])
+            if len(prices)<48: continue
+            closes=prices[-48:]
+            r   = rsi(closes[-15:])
+            vol = (max(closes[-24:])-min(closes[-24:]))/closes[-1]
+            trend=np.std(closes[-6:])/np.std(closes[-24:]) or 0
+            if RS_SC_LOW<r<RS_SC_HIGH and VOL_MIN<vol<VOL_MAX and trend<TREND_MAX:
+                picks.append((sym,r,vol,trend,closes))
+            if len(picks)>=SCAN_PICKS_MAX:
+                break
+    except Exception as e:
+        print(f"[WARN] sparkline: {e}", file=sys.stderr)
 
+    if picks:
+        lines.append("\n📊 *Sideways coins to grid now*")
+        for sym,r,vol,trend,closes in picks:
+            lo,hi,grids,mode,trail=grid_params(closes)
+            lines.append(f"{sym}")
+            lines.append(f"• Price Range: ${lo:,} – ${hi:,}")
+            lines.append(f"• Grids: {grids}")
+            lines.append(f"• Mode: {mode}")
+            lines.append(f"• Trailing: {trail}")
+            lines.append(f"• Direction: Neutral")
+    else:
+        lines.append("\n_No additional sideways coins found._")
+
+    return "\n".join(lines)
+
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__=="__main__":
-    main()
+    try:
+        tg(build())
+    except Exception as e:
+        tg(f"❌ combo bot error: {e}")
