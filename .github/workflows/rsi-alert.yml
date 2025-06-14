@@ -1,24 +1,28 @@
-name: RSI Grid Alert Bot
+name: Run RSI Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'  # every hour
-  workflow_dispatch:     # allow manual run
+    - cron: '0 * * * *'  # Every hour
+  workflow_dispatch:
 
 jobs:
-  run:
+  run-bot:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: 3.x
+          python-version: '3.x'
 
       - name: Install dependencies
-        run: pip install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy requests
 
       - name: Run RSI Bot
-        run: python rsi_bot.py
+        run: |
+          python3 rsi_bot.py
