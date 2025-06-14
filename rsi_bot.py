@@ -1,30 +1,32 @@
 import requests
+import numpy as np
 import time
-from datetime import datetime
-import math
 
-# === CONFIG ===
+# === CONFIGURATION ===
 TELEGRAM_TOKEN = "7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8"
 CHAT_ID = "7588547693"
-COINS = ["bitcoin", "ethereum", "solana"]
-VS_CURRENCY = "usd"
+
+COINS = {
+    "bitcoin": "BTC",
+    "ethereum": "ETH",
+    "solana": "SOL",
+    "hyperliquid": "HYPE"  # CoinGecko ID for Hype is "hyperliquid"
+}
+
+VS_CURRENCY = "usdt"
 RSI_PERIOD = 14
-SAFE_RSI_MIN = 30
-SAFE_RSI_MAX = 45
+RSI_LOWER = 35
+RSI_UPPER = 70
+
 
 # === FUNCTIONS ===
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    response = requests.post(url, data=payload)
-    return response.ok
 
 def fetch_ohlc_from_coingecko(coin_id):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {
         "vs_currency": VS_CURRENCY,
-        "days": "2"  # returns hourly data automatically
+        "days": "2"  # Automatically gives hourly candles (48+)
+        # Do NOT include 'interval' param
     }
     res = requests.get(url, params=params)
     if res.status_code != 200:
@@ -37,44 +39,58 @@ def fetch_ohlc_from_coingecko(coin_id):
 
 
 def calculate_rsi(closes, period=RSI_PERIOD):
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        change = closes[-i] - closes[-i - 1]
-        if change >= 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(-change)
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    closes = np.array(closes)
+    deltas = np.diff(closes)
+    seed = deltas[:period]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0
+    rsi = [100 - (100 / (1 + rs))]
 
-# === MAIN ===
+    for delta in deltas[period:]:
+        upval = max(delta, 0)
+        downval = -min(delta, 0)
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi.append(100 - (100 / (1 + rs)))
 
-def main():
-    triggered = []
-    for coin in COINS:
+    return rsi[-1]
+
+
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    response = requests.post(url, data=payload)
+    return response.status_code == 200
+
+
+# === MAIN LOOP ===
+
+try:
+    alert_messages = []
+
+    for coin_id, symbol in COINS.items():
         try:
-            closes = fetch_ohlc_from_coingecko(coin)
+            closes = fetch_ohlc_from_coingecko(coin_id)
             rsi = calculate_rsi(closes)
-            print(f"{coin.upper()} RSI: {rsi:.2f}")
-            if SAFE_RSI_MIN < rsi < SAFE_RSI_MAX:
-                triggered.append(f"{coin.upper()} RSI is {rsi:.2f} ✅")
+
+            if rsi < RSI_LOWER:
+                alert_messages.append(f"🔻 *{symbol}* RSI is *{rsi:.2f}* — Oversold!")
+            elif rsi > RSI_UPPER:
+                alert_messages.append(f"🚀 *{symbol}* RSI is *{rsi:.2f}* — Overbought!")
+
         except Exception as e:
-            error_message = f"❌ Error in RSI Bot for {coin.upper()}: {str(e)}"
-            send_telegram_message(error_message)
-            print(error_message)
+            alert_messages.append(f"❌ Error in RSI Bot for {symbol}: {e}")
 
-    if triggered:
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        message = f"📊 HOURLY RSI ALERT [{timestamp}]\n" + "\n".join(triggered)
-        send_telegram_message(message)
+    if alert_messages:
+        send_telegram_message("\n".join(alert_messages))
+    else:
+        send_telegram_message("✅ No RSI alerts this hour.")
 
-if __name__ == "__main__":
-    main()
+except Exception as e:
+    send_telegram_message(f"❌ Error in RSI Bot: {e}")
