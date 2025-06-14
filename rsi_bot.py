@@ -1,104 +1,96 @@
-#!/usr/bin/env python3
-"""
-Telegram RSI bot — CoinGecko (market_chart) edition
-"""
+import requests
+import numpy as np
+import time
 
-import os, sys, time, logging, requests, numpy as np
+# === CONFIGURATION ===
+TELEGRAM_TOKEN = "7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8"
+CHAT_ID = "7588547693"
 
-# --------------------------------------------------------------------------- #
-# ░ CONFIG                                                                    #
-# --------------------------------------------------------------------------- #
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN")
-CHAT_ID        = os.getenv("CHAT_ID",        "YOUR_CHAT_ID")
-
-COINS = {                 # CoinGecko ID → nice symbol
-    "bitcoin":     "BTC",
-    "ethereum":    "ETH",
-    "solana":      "SOL",
-    "hyperliquid": "HYPE",
+COINS = {
+    "bitcoin": "BTC",
+    "ethereum": "ETH",
+    "solana": "SOL",
+    "hyperliquid": "HYPE"  # CoinGecko ID for Hype is "hyperliquid"
 }
-VS_CURRENCY      = "usd"  # <—  **fiat or btc/eth**, lower‑case
-RSI_PERIOD       = 14
-RSI_LOWER, RSI_UPPER = 35, 70
 
-DEBUG = False            # flip to True to print each URL you call
-TIMEOUT = 15
-session = requests.Session()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s")
+VS_CURRENCY = "usdt"
+RSI_PERIOD = 14
+RSI_LOWER = 35
+RSI_UPPER = 70
 
-# --------------------------------------------------------------------------- #
-# ░ HELPERS                                                                   #
-# --------------------------------------------------------------------------- #
-def fetch_prices(coin_id: str, vs_currency: str) -> list[float]:
-    """
-    Returns a list of close prices (hourly candles, last ≈48 h).
-    Falls back to 'usd' once if the first vs_currency is rejected.
-    """
+
+# === FUNCTIONS ===
+
+def fetch_ohlc_from_coingecko(coin_id):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": vs_currency, "days": "2"}
-    if DEBUG:
-        logging.info("GET %s", session.prepare_request(requests.Request("GET", url, params=params)).url)
-
-    r = session.get(url, params=params, timeout=TIMEOUT)
-    if r.status_code == 400 and "invalid vscurrency" in r.text.lower() and vs_currency != "usd":
-        logging.warning("'%s' rejected for %s — retrying with usd", vs_currency, coin_id)
-        return fetch_prices(coin_id, "usd")
-
-    if r.status_code != 200:
-        raise RuntimeError(f"Failed to fetch data for {coin_id}: {r.text}")
-
-    closes = [p[1] for p in r.json().get("prices", [])]
+    params = {
+        "vs_currency": VS_CURRENCY,
+        "days": "2"  # Automatically gives hourly candles (48+)
+        # Do NOT include 'interval' param
+    }
+    res = requests.get(url, params=params)
+    if res.status_code != 200:
+        raise Exception(f"Failed to fetch data for {coin_id}: {res.text}")
+    prices = res.json().get("prices", [])
+    closes = [price[1] for price in prices]
     if len(closes) < RSI_PERIOD + 1:
-        raise RuntimeError(f"Not enough data for {coin_id} (got {len(closes)})")
+        raise Exception(f"Not enough data to calculate RSI for {coin_id}")
     return closes
 
 
-def rsi(closes: list[float], period: int = RSI_PERIOD) -> float:
-    closes = np.asarray(closes, float)
+def calculate_rsi(closes, period=RSI_PERIOD):
+    closes = np.array(closes)
     deltas = np.diff(closes)
-
     seed = deltas[:period]
-    up   = seed[seed >= 0].sum() / period
+    up = seed[seed >= 0].sum() / period
     down = -seed[seed < 0].sum() / period
-    rs   = up / down if down else 0
-    rsi_vals = [100 - (100 / (1 + rs))]
+    rs = up / down if down != 0 else 0
+    rsi = [100 - (100 / (1 + rs))]
 
-    for d in deltas[period:]:
-        up   = (up   * (period - 1) + max(d, 0)) / period
-        down = (down * (period - 1) + max(-d, 0)) / period
-        rs   = up / down if down else 0
-        rsi_vals.append(100 - (100 / (1 + rs)))
+    for delta in deltas[period:]:
+        upval = max(delta, 0)
+        downval = -min(delta, 0)
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi.append(100 - (100 / (1 + rs)))
 
-    return rsi_vals[-1]
+    return rsi[-1]
 
 
-def send_telegram(text: str) -> None:
+def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    session.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=TIMEOUT)
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    response = requests.post(url, data=payload)
+    return response.status_code == 200
 
-# --------------------------------------------------------------------------- #
-# ░ MAIN                                                                      #
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    try:
-        alerts = []
 
-        for cid, sym in COINS.items():
-            try:
-                prices = fetch_prices(cid, VS_CURRENCY.lower())
-                value  = rsi(prices)
+# === MAIN LOOP ===
 
-                if value < RSI_LOWER:
-                    alerts.append(f"🔻 *{sym}* RSI {value:.2f} — *Oversold*")
-                elif value > RSI_UPPER:
-                    alerts.append(f"🚀 *{sym}* RSI {value:.2f} — *Overbought*")
+try:
+    alert_messages = []
 
-            except Exception as e:
-                alerts.append(f"❌ Error in RSI Bot for {sym}: {e}")
+    for coin_id, symbol in COINS.items():
+        try:
+            closes = fetch_ohlc_from_coingecko(coin_id)
+            rsi = calculate_rsi(closes)
 
-        send_telegram("\n".join(alerts) if alerts else "✅ No RSI alerts this hour.")
+            if rsi < RSI_LOWER:
+                alert_messages.append(f"🔻 *{symbol}* RSI is *{rsi:.2f}* — Oversold!")
+            elif rsi > RSI_UPPER:
+                alert_messages.append(f"🚀 *{symbol}* RSI is *{rsi:.2f}* — Overbought!")
 
-    except Exception as e:
-        send_telegram(f"❌ Fatal error in *RSI Bot*: {e}")
-        logging.exception(e)
-        sys.exit(1)
+        except Exception as e:
+            alert_messages.append(f"❌ Error in RSI Bot for {symbol}: {e}")
+
+    if alert_messages:
+        send_telegram_message("\n".join(alert_messages))
+    else:
+        send_telegram_message("✅ No RSI alerts this hour.")
+
+except Exception as e:
+    send_telegram_message(f"❌ Error in RSI Bot: {e}")
