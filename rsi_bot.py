@@ -1,7 +1,8 @@
 import requests, numpy as np
 from datetime import datetime, timezone
-from rsi_bot_helpers import calc_rsi, send_telegram
+import os
 
+# === CONFIGURATION ===
 VS = "usd"
 COINS = {
     "bitcoin": "BTC",
@@ -11,6 +12,41 @@ COINS = {
     "pepe": "PEPE"
 }
 RSI_LOWER, RSI_UPPER = 35, 65
+
+# === TELEGRAM SETTINGS ===
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("BOT_CHAT_ID")
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram token or chat ID not set")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, json=payload)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] Telegram send failed: {e}")
+
+def calc_rsi(closes, period=14):
+    closes = np.array(closes)
+    deltas = np.diff(closes)
+    seed = deltas[:period]
+    up = seed[seed > 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0
+    rsi = 100 - 100 / (1 + rs)
+
+    for i in range(period, len(deltas)):
+        delta = deltas[i]
+        upval = max(delta, 0)
+        downval = -min(delta, 0)
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi = 100 - 100 / (1 + rs)
+    return rsi
 
 def get_closes(coin_id):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
