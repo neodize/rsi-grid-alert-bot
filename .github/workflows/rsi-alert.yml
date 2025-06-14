@@ -26,6 +26,3 @@ jobs:
       - name: Run RSI Bot
         run: |
           python3 rsi_bot.py
-
-      - name: Run Grid Scanner
-        run: python grid_scanner.py
