@@ -24,8 +24,7 @@ def fetch_ohlc_from_coingecko(coin_id):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {
         "vs_currency": VS_CURRENCY,
-        "days": "1",
-        "interval": "hourly"
+        "days": "2"  # returns hourly data automatically
     }
     res = requests.get(url, params=params)
     if res.status_code != 200:
@@ -35,6 +34,7 @@ def fetch_ohlc_from_coingecko(coin_id):
     if len(closes) < RSI_PERIOD + 1:
         raise Exception(f"Not enough data to calculate RSI for {coin_id}")
     return closes
+
 
 def calculate_rsi(closes, period=RSI_PERIOD):
     gains = []
