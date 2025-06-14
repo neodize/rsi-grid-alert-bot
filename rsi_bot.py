@@ -1,99 +1,117 @@
-import requests
-import numpy as np
-import time
+import requests, numpy as np, math, statistics
+from datetime import datetime
 
-# === CONFIGURATION ===
+# ─── USER CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = "7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8"
-CHAT_ID = "7588547693"
+CHAT_ID        = "7588547693"
 
-COINS = {
-    "bitcoin": "BTC",
-    "ethereum": "ETH",
-    "solana": "SOL",
-    "hyperliquid": "HYPE"  # CoinGecko ID for Hype is "hyperliquid"
+COINS = {                 # CoinGecko IDs → symbols for the alert
+    "bitcoin"      : "BTC",
+    "ethereum"     : "ETH",
+    "solana"       : "SOL",
+    "hyperliquid"  : "HYPE",      # “hyperliquid” is HYPE on CG
 }
 
-VS_CURRENCY = "usd"  # MUST be 'usd' or another fiat (usd, eur, myr, etc.)
-RSI_PERIOD = 14
-RSI_LOWER = 35
-RSI_UPPER = 70
+VS_CURRENCY = "usd"       # CoinGecko quote currency
+RSI_PERIOD  = 14
+RSI_LOW     = 35          # Oversold  → Long bias
+RSI_HIGH    = 70          # Overbought→ Short bias
 
-# === FUNCTIONS ===
+DAYS_OF_DATA = 2          # 48 hourly candles (free CG plan)
 
-def fetch_ohlc_from_coingecko(coin_id):
+# ─── TELEGRAM ───────────────────────────────────────────────────────────────────
+def send_tg(msg:str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    requests.post(url, data=payload, timeout=15)
+
+# ─── DATA HELPERS ───────────────────────────────────────────────────────────────
+def cg_closes(coin_id:str):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {
-        "vs_currency": VS_CURRENCY,
-        "days": "2"  # Automatically gives hourly candles (48+)
-    }
-
-    full_url = requests.Request("GET", url, params=params).prepare().url
-    print(f"[DEBUG] Requesting: {full_url}")
-
-    res = requests.get(url, params=params)
-    if res.status_code != 200:
-        raise Exception(f"Failed to fetch data for {coin_id}: {res.text}")
-
-    prices = res.json().get("prices", [])
-    closes = [price[1] for price in prices]
-    if len(closes) < RSI_PERIOD + 1:
-        raise Exception(f"Not enough data to calculate RSI for {coin_id}")
+    r = requests.get(url, params={"vs_currency": VS_CURRENCY, "days": str(DAYS_OF_DATA)}, timeout=20)
+    r.raise_for_status()
+    closes = [float(p[1]) for p in r.json().get("prices", [])]
+    if len(closes) < RSI_PERIOD+1: raise ValueError("Not enough data")
     return closes
 
+def rsi(values, period=RSI_PERIOD):
+    v = np.array(values)
+    deltas = np.diff(v)
+    seed   = deltas[:period]
+    up     = seed[seed>0].sum()/period
+    down   = -seed[seed<0].sum()/period
+    if down == 0: return 100
+    rs  = up/down
+    rsi = 100 - (100/(1+rs))
+    for d in deltas[period:]:
+        gain = max(d,0); loss = -min(d,0)
+        up   = (up*(period-1)+gain)/period
+        down = (down*(period-1)+loss)/period
+        rs   = up/down if down else 0
+        rsi  = 100 - (100/(1+rs))
+    return round(rsi,2)
 
-def calculate_rsi(closes, period=RSI_PERIOD):
-    closes = np.array(closes)
-    deltas = np.diff(closes)
-    seed = deltas[:period]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi = [100 - (100 / (1 + rs))]
+def ema(values, length=24):
+    k=2/(length+1)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = v*k + ema_val*(1-k)
+    return ema_val
 
-    for delta in deltas[period:]:
-        upval = max(delta, 0)
-        downval = -min(delta, 0)
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down != 0 else 0
-        rsi.append(100 - (100 / (1 + rs)))
+# ─── GRID SUGGESTION LOGIC ──────────────────────────────────────────────────────
+def grid_suggestion(prices:list, symbol:str, rsi_val:float):
+    # Trend filter: 24‑hour EMA vs last close
+    trend_up = prices[-1] > ema(prices[-24:])
+    recent_high = max(prices[-24:])
+    recent_low  = min(prices[-24:])
+    mid         = (recent_high+recent_low)/2
+    pct_band    = 0.06 if trend_up else 0.04
+    low_price   = round(mid*(1-pct_band), 2)
+    high_price  = round(mid*(1+pct_band), 2)
 
-    return rsi[-1]
+    # Grid qty based on recent volatility
+    vol_pct = (recent_high-recent_low)/mid
+    grids   = 25 if vol_pct>0.08 else 15
 
+    mode     = "Geometric" if trend_up else "Arithmetic"
+    trailing = "Enabled"   if trend_up else "Disabled"
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    response = requests.post(url, data=payload)
-    return response.status_code == 200
+    if rsi_val < RSI_LOW:  direction="Long"
+    elif rsi_val > RSI_HIGH: direction="Short"
+    else: direction="Neutral"
 
+    return (
+        f"📊 *{symbol} Grid Bot Suggestion*\n"
+        f"• Price Range: `${low_price}` – `${high_price}`\n"
+        f"• Grids: {grids}\n"
+        f"• Mode: {mode}\n"
+        f"• Trailing: {trailing}\n"
+        f"• Direction: *{direction}*"
+    )
 
-# === MAIN LOOP ===
-
-try:
-    alert_messages = []
-
-    for coin_id, symbol in COINS.items():
+# ─── MAIN ───────────────────────────────────────────────────────────────────────
+def main():
+    alerts=[]
+    for cg_id,sym in COINS.items():
         try:
-            closes = fetch_ohlc_from_coingecko(coin_id)
-            rsi = calculate_rsi(closes)
-
-            if rsi < RSI_LOWER:
-                alert_messages.append(f"🔻 *{symbol}* RSI is *{rsi:.2f}* — Oversold!")
-            elif rsi > RSI_UPPER:
-                alert_messages.append(f"🚀 *{symbol}* RSI is *{rsi:.2f}* — Overbought!")
-
+            closes = cg_closes(cg_id)
+            last_rsi = rsi(closes)
+            if last_rsi < RSI_LOW or last_rsi > RSI_HIGH:
+                emoji = "🔻" if last_rsi<RSI_LOW else "🚀"
+                header = f"{emoji} *{sym}* RSI {last_rsi:.2f}"
+                alerts.append(header)
+                alerts.append(grid_suggestion(closes, sym, last_rsi))
         except Exception as e:
-            alert_messages.append(f"❌ Error in RSI Bot for {symbol}: {e}")
+            alerts.append(f"❌ *{sym}* error: {e}")
 
-    if alert_messages:
-        send_telegram_message("\n".join(alert_messages))
-    else:
-        send_telegram_message("✅ No RSI alerts this hour.")
+    if alerts:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        send_tg(f"*HOURLY RSI ALERT* — {ts}\n\n" + "\n".join(alerts))
+    # else:  # uncomment if you want “no alert” pings
+    #     send_tg("✅ No RSI alerts this hour.")
 
-except Exception as e:
-    send_telegram_message(f"❌ Fatal error in RSI Bot: {e}")
+if __name__=="__main__":
+    try:
+        main()
+    except Exception as e:
+        send_tg(f"❌ Fatal error in RSI Bot: {e}")
