@@ -1,123 +1,121 @@
-import requests, numpy as np
-from datetime import datetime, timezone
-from rsi_bot_helpers import rsi, send_telegram
+import requests
+import os
+import datetime
+import numpy as np
 
-VS = "usd"
-RSI_LOW = 30
-RSI_HIGH = 70
-GRID_MODE = "Arithmetic"
-GRID_DIRECTION = "Long"
-GRID_TRAILING = "Disabled"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RSI_THRESHOLD = 31
+RSI_PERIOD = 14
+TOP_N = 5
+EXCLUDED = {"bitcoin", "ethereum", "solana", "hype"}
 
-MAIN_COINS = {
-    "BTC": {"id": "bitcoin"},
-    "ETH": {"id": "ethereum"},
-    "SOL": {"id": "solana"},
-    "HYPE": {"id": "hyperliquid"},
-}
+def rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
 
-EXCLUDE = {"BTC", "ETH", "SOL", "HYPE", "USDT", "USDC"}
+def get_price_history(coin_id, vs="usd", days=2):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    try:
+        r = requests.get(url, params={"vs_currency": vs, "days": days})
+        r.raise_for_status()
+        prices = [p[1] for p in r.json()["prices"]]
+        return prices
+    except Exception as e:
+        print(f"[WARN] skip {coin_id.upper()}: {e}")
+        return []
 
-RS_SC_LOW, RS_SC_HIGH = 40, 60
-VOL_MIN, VOL_MAX = 0.03, 0.08
-TREND_MAX = 0.65
-SCAN_PICKS = 5
-
-def closes(id):
-    url = f"https://api.coingecko.com/api/v3/coins/{id}/market_chart"
-    r = requests.get(url, params={"vs_currency": VS, "days": 2})
-    r.raise_for_status()
-    return [p[1] for p in r.json()["prices"]]
-
-def price_now(id):
-    url = f"https://api.coingecko.com/api/v3/simple/price"
-    r = requests.get(url, params={"ids": id, "vs_currencies": VS})
-    r.raise_for_status()
-    return r.json()[id][VS]
-
-def grid_range(prices, step_pct=0.012):
-    lo = min(prices[-24:])
-    hi = max(prices[-24:])
-    return round(lo, 2), round(hi, 2)
-
-def grid_count(price_range, step_pct=0.012):
-    low, high = price_range
-    step = low * step_pct
-    grids = max(3, min(50, int((high - low) / step)))
-    return grids
-
-def markets_spark():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": VS,
-        "order": "volume_desc",
-        "per_page": 250,
-        "page": 1,
-        "sparkline": "true"
+def send_telegram(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram token or chat ID not set")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
     }
-    r = requests.get(url, params=params)
-    r.raise_for_status()
-    return r.json()
+    r = requests.post(url, json=payload)
+    if r.status_code != 200:
+        print(f"[ERROR] Telegram send failed: {r.text}")
 
-def scan():
-    picks = []
-    for c in markets_spark():
-        sym = c["symbol"].upper()
-        if sym in EXCLUDE:
-            continue
-        closes = c.get("sparkline_in_7d", {}).get("price", [])
-        if len(closes) < 48:
-            continue
-        closes = closes[-48:]
-        r_val = rsi(closes[-15:])
-        vol = (max(closes[-24:]) - min(closes[-24:])) / closes[-1]
-        trend = np.std(closes[-6:]) / np.std(closes[-24:]) or 0
-        if RS_SC_LOW < r_val < RS_SC_HIGH and VOL_MIN < vol < VOL_MAX and trend < TREND_MAX:
-            picks.append((sym, closes))
-        if len(picks) >= SCAN_PICKS:
-            break
-    return picks
+def format_grid_settings(prices):
+    low = min(prices)
+    high = max(prices)
+    range_pct = (high - low) / low * 100
+    grids = 15 if range_pct < 4 else 25 if range_pct < 8 else 35
+    return {
+        "price_range": f"${low:,.2f} – ${high:,.2f}",
+        "grids": grids,
+        "mode": "Arithmetic",
+        "trailing": "Disabled",
+        "direction": "Long"
+    }
+
+def build_grid_section(coin, settings):
+    return f"""• {coin.upper()}
+  • Price Range: {settings['price_range']}
+  • Grids: {settings['grids']}
+  • Mode: {settings['mode']}
+  • Trailing: {settings['trailing']}
+  • Direction: {settings['direction']}"""
+
+def get_trending_coins():
+    url = "https://api.coingecko.com/api/v3/search/trending"
+    try:
+        r = requests.get(url)
+        r.raise_for_status()
+        return [item["item"]["id"] for item in r.json()["coins"] if item["item"]["id"] not in EXCLUDED]
+    except Exception as e:
+        print(f"[ERROR] Trending fetch failed: {e}")
+        return []
 
 def main():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"📉 HOURLY RSI ALERT — {now}"]
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    message = f"*HOURLY RSI ALERT — {ts}*\n"
+    rsi_alerts = []
+    coins = ["bitcoin", "ethereum", "solana", "hype"]
+    for coin in coins:
+        closes = get_price_history(coin)
+        if not closes: continue
+        rsi_value = rsi(closes, RSI_PERIOD)
+        if rsi_value < RSI_THRESHOLD:
+            rsi_alerts.append((coin.upper(), rsi_value, closes))
 
-    for sym, meta in MAIN_COINS.items():
-        try:
-            prices = closes(meta["id"])
-            r_val = rsi(prices[-15:])
-            if r_val < RSI_HIGH:
-                grid_lo, grid_hi = grid_range(prices)
-                grid_num = grid_count((grid_lo, grid_hi))
-                lines += [
-                    f"\n🔻 {sym} RSI {r_val:.2f}",
-                    f"📊 {sym} Grid Bot Suggestion",
-                    f"• Price Range: ${grid_lo} – ${grid_hi}",
-                    f"• Grids: {grid_num}",
-                    f"• Mode: {GRID_MODE}",
-                    f"• Trailing: {GRID_TRAILING}",
-                    f"• Direction: {GRID_DIRECTION}",
-                ]
-        except Exception as e:
-            lines.append(f"\n⚠️ {sym} data error: {e}")
+    for coin, rsi_val, closes in rsi_alerts:
+        message += f"\n🔻 {coin} RSI {rsi_val}\n"
+        grid = format_grid_settings(closes)
+        message += f"📊 {coin} Grid Bot Suggestion\n"
+        message += f"""• Price Range: {grid['price_range']}
+• Grids: {grid['grids']}
+• Mode: {grid['mode']}
+• Trailing: {grid['trailing']}
+• Direction: {grid['direction']}\n"""
 
-    # Grid Scanner Picks
-    picks = scan()
-    if picks:
-        lines.append(f"\n📊 Sideways coins to grid now:")
-        for sym, prices in picks:
-            grid_lo, grid_hi = grid_range(prices)
-            grid_num = grid_count((grid_lo, grid_hi))
-            lines += [
-                f"\n• {sym}",
-                f"  • Price Range: ${grid_lo} – ${grid_hi}",
-                f"  • Grids: {grid_num}",
-                f"  • Mode: {GRID_MODE}",
-                f"  • Trailing: {GRID_TRAILING}",
-                f"  • Direction: {GRID_DIRECTION}",
-            ]
+    # Trending coins for Grid Bot
+    trending = get_trending_coins()
+    grid_recos = []
+    for coin in trending[:TOP_N]:
+        closes = get_price_history(coin)
+        if not closes: continue
+        settings = format_grid_settings(closes)
+        grid_recos.append(build_grid_section(coin, settings))
 
-    send_telegram("\n".join(lines))
+    if grid_recos:
+        message += f"\n📊 Sideways Coins to Grid Now:\n" + "\n".join(grid_recos)
+
+    print(message)
+    send_telegram(message)
 
 if __name__ == "__main__":
     main()
