@@ -1,148 +1,104 @@
 #!/usr/bin/env python3
 """
-RSI‑alert Telegram bot
-================================
-Pulls hourly OHLC data from CoinGecko, computes 14‑period RSI,
-and notifies you on Telegram when a coin becomes overbought
-(RSI > 70) or oversold (RSI < 35).
+Telegram RSI bot — CoinGecko (market_chart) edition
 """
 
-import os
-import time
-import requests
-import numpy as np
+import os, sys, time, logging, requests, numpy as np
 
-# === CONFIGURATION === -------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# ░ CONFIG                                                                    #
+# --------------------------------------------------------------------------- #
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN")
+CHAT_ID        = os.getenv("CHAT_ID",        "YOUR_CHAT_ID")
 
-# (Tip) Store these two in your shell environment instead of hard‑coding
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8")
-CHAT_ID        = os.getenv("CHAT_ID",        "7588547693")
-
-COINS = {
+COINS = {                 # CoinGecko ID → nice symbol
     "bitcoin":     "BTC",
     "ethereum":    "ETH",
     "solana":      "SOL",
-    "hyperliquid": "HYPE",       # CoinGecko ID for Hype is “hyperliquid”
+    "hyperliquid": "HYPE",
 }
+VS_CURRENCY      = "usd"  # <—  **fiat or btc/eth**, lower‑case
+RSI_PERIOD       = 14
+RSI_LOWER, RSI_UPPER = 35, 70
 
-VS_CURRENCY = "USDT"             # Use any currency you like; case‑insensitive
-RSI_PERIOD  = 14
-RSI_LOWER   = 35
-RSI_UPPER   = 70
+DEBUG = False            # flip to True to print each URL you call
+TIMEOUT = 15
+session = requests.Session()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s")
 
-REQUEST_TIMEOUT = 15             # seconds
-SESSION = requests.Session()     # reusable HTTP connection
-
-
-# === HELPER FUNCTIONS === ----------------------------------------------------
-
-def validate_vs_currency(vs_currency: str) -> str:
+# --------------------------------------------------------------------------- #
+# ░ HELPERS                                                                   #
+# --------------------------------------------------------------------------- #
+def fetch_prices(coin_id: str, vs_currency: str) -> list[float]:
     """
-    Make sure the chosen vs_currency is supported by CoinGecko.
-    Returns the lower‑case version if valid, otherwise raises ValueError.
-    """
-    url = "https://api.coingecko.com/api/v3/simple/supported_vs_currencies"
-    try:
-        supported = SESSION.get(url, timeout=REQUEST_TIMEOUT).json()
-    except Exception as exc:
-        raise RuntimeError(f"Could not fetch supported vs_currencies list: {exc}")
-
-    lc = vs_currency.lower()
-    if lc not in supported:
-        raise ValueError(f"'{vs_currency}' is not in CoinGecko's supported vs_currencies list.")
-    return lc
-
-
-def fetch_ohlc_from_coingecko(coin_id: str, vs_currency: str) -> list[float]:
-    """
-    Returns a list of closing prices (hourly candles, 48+ values).
+    Returns a list of close prices (hourly candles, last ≈48 h).
+    Falls back to 'usd' once if the first vs_currency is rejected.
     """
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {
-        "vs_currency": vs_currency,   # already lower‑cased & validated
-        "days": "2"                   # → hourly data for the last ~48 h
-    }
-    r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    params = {"vs_currency": vs_currency, "days": "2"}
+    if DEBUG:
+        logging.info("GET %s", session.prepare_request(requests.Request("GET", url, params=params)).url)
+
+    r = session.get(url, params=params, timeout=TIMEOUT)
+    if r.status_code == 400 and "invalid vscurrency" in r.text.lower() and vs_currency != "usd":
+        logging.warning("'%s' rejected for %s — retrying with usd", vs_currency, coin_id)
+        return fetch_prices(coin_id, "usd")
+
     if r.status_code != 200:
         raise RuntimeError(f"Failed to fetch data for {coin_id}: {r.text}")
 
-    closes = [price[1] for price in r.json().get("prices", [])]
+    closes = [p[1] for p in r.json().get("prices", [])]
     if len(closes) < RSI_PERIOD + 1:
-        raise RuntimeError(f"Not enough data to calculate RSI for {coin_id} (got {len(closes)})")
+        raise RuntimeError(f"Not enough data for {coin_id} (got {len(closes)})")
     return closes
 
 
-def calculate_rsi(closes: list[float], period: int = RSI_PERIOD) -> float:
-    """
-    Vectorised, running‑average RSI implementation.
-    """
-    closes = np.asarray(closes, dtype=float)
+def rsi(closes: list[float], period: int = RSI_PERIOD) -> float:
+    closes = np.asarray(closes, float)
     deltas = np.diff(closes)
 
     seed = deltas[:period]
     up   = seed[seed >= 0].sum() / period
     down = -seed[seed < 0].sum() / period
-    rs   = up / down if down != 0 else 0.0
-    rsi  = [100.0 - (100.0 / (1.0 + rs))]
+    rs   = up / down if down else 0
+    rsi_vals = [100 - (100 / (1 + rs))]
 
-    for delta in deltas[period:]:
-        upval   = max(delta, 0.0)
-        downval = -min(delta, 0.0)
-        up   = (up * (period - 1) + upval)   / period
-        down = (down * (period - 1) + downval) / period
-        rs   = up / down if down != 0 else 0.0
-        rsi.append(100.0 - (100.0 / (1.0 + rs)))
+    for d in deltas[period:]:
+        up   = (up   * (period - 1) + max(d, 0)) / period
+        down = (down * (period - 1) + max(-d, 0)) / period
+        rs   = up / down if down else 0
+        rsi_vals.append(100 - (100 / (1 + rs)))
 
-    return rsi[-1]
+    return rsi_vals[-1]
 
 
-def send_telegram_message(text: str) -> bool:
-    """
-    Sends a Markdown‑formatted message. Returns True on success.
-    """
+def send_telegram(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id":   CHAT_ID,
-        "text":      text,
-        "parse_mode": "Markdown",
-    }
-    try:
-        r = SESSION.post(url, data=payload, timeout=REQUEST_TIMEOUT)
-        return r.status_code == 200
-    except Exception:
-        return False
+    session.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=TIMEOUT)
 
-
-# === MAIN EXECUTION === ------------------------------------------------------
-
+# --------------------------------------------------------------------------- #
+# ░ MAIN                                                                      #
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     try:
-        # 1) Ensure vs_currency is valid and force lower‑case
-        vs_curr = validate_vs_currency(VS_CURRENCY)   # raises if invalid
+        alerts = []
 
-        # 2) Build all alert lines first, then send one composite message
-        alerts: list[str] = []
-
-        for coin_id, symbol in COINS.items():
+        for cid, sym in COINS.items():
             try:
-                closes = fetch_ohlc_from_coingecko(coin_id, vs_curr)
-                rsi    = calculate_rsi(closes)
+                prices = fetch_prices(cid, VS_CURRENCY.lower())
+                value  = rsi(prices)
 
-                if rsi < RSI_LOWER:
-                    alerts.append(f"🔻 *{symbol}* RSI {rsi:.2f} — *Oversold*")
-                elif rsi > RSI_UPPER:
-                    alerts.append(f"🚀 *{symbol}* RSI {rsi:.2f} — *Overbought*")
+                if value < RSI_LOWER:
+                    alerts.append(f"🔻 *{sym}* RSI {value:.2f} — *Oversold*")
+                elif value > RSI_UPPER:
+                    alerts.append(f"🚀 *{sym}* RSI {value:.2f} — *Overbought*")
 
-            except Exception as exc:
-                alerts.append(f"❌ Error in RSI Bot for {symbol}: {exc}")
+            except Exception as e:
+                alerts.append(f"❌ Error in RSI Bot for {sym}: {e}")
 
-        if not alerts:
-            alerts.append("✅ No RSI alerts this hour.")
+        send_telegram("\n".join(alerts) if alerts else "✅ No RSI alerts this hour.")
 
-        # 3) Fire the Telegram message
-        if not send_telegram_message("\n".join(alerts)):
-            raise RuntimeError("Telegram API request failed")
-
-    except Exception as exc:
-        # Top‑level catch to ensure you are notified of unexpected crashes
-        send_telegram_message(f"❌ Error in *RSI Bot*: {exc}")
+    except Exception as e:
+        send_telegram(f"❌ Fatal error in *RSI Bot*: {e}")
+        logging.exception(e)
+        sys.exit(1)
