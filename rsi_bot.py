@@ -3,10 +3,11 @@ import time
 from datetime import datetime, timezone
 import logging
 import re
+import os
 
 # Configuration
-TELEGRAM_TOKEN = '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8'  # Provided Telegram bot token
-TELEGRAM_CHAT_ID = '7588547693'  # Provided Telegram chat ID
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')  # Use env var or fallback
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')  # Use env var or fallback
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
 TOP_COINS_LIMIT = 50  # Number of top coins by market cap to scan
 MIN_VOLUME = 10_000_000  # Minimum daily trading volume in USD
@@ -15,14 +16,14 @@ TOP_COINS_TO_EXCLUDE = 20  # Exclude top 20 coins to focus on smaller tokens
 MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']  # Prioritized tokens
 
 # Logging setup
-logging.basicConfig(filename='grid_scanner.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename='rsi_bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     response = requests.post(url, data=payload)
     if response.status_code != 200:
-        logging.error(f"Telegram send failed: {response.text}")
+        logging.error(f"Telegram send failed: {response.text}, status: {response.status_code}")
         time.sleep(60)  # Retry after 1 minute
         requests.post(url, data=payload)
 
@@ -43,10 +44,20 @@ def fetch_market_data():
         if not any(coin['id'] == token_id for coin in smaller_tokens):
             main_coin = next((coin for coin in data if coin['id'] == token_id), None)
             if main_coin:
-                logging.info(f"Adding main token: {token_id}, price: {main_coin['current_price']}, volume: {main_coin['total_volume']}")
+                logging.info(f"Adding main token from initial data: {token_id}, price: {main_coin['current_price']}, volume: {main_coin['total_volume']}")
                 smaller_tokens.append(main_coin)
             else:
-                logging.warning(f"Main token {token_id} not found in data")
+                logging.warning(f"Main token {token_id} not found in initial data, attempting direct fetch")
+                # Direct fetch attempt for the token
+                direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
+                direct_response = requests.get(direct_url)
+                direct_response.raise_for_status()
+                direct_data = direct_response.json()
+                if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
+                    logging.info(f"Direct fetch success for {token_id}, price: {direct_data[0]['current_price']}, volume: {direct_data[0]['total_volume']}")
+                    smaller_tokens.append(direct_data[0])
+                else:
+                    logging.error(f"Direct fetch failed for {token_id}, response: {direct_data}")
     return smaller_tokens
 
 def calc_rsi(prices):
