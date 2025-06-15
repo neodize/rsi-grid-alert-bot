@@ -5,8 +5,8 @@ import os
 import re
 
 # Configuration
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')  # Use env var or fallback
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')  # Use env var or fallback
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
 TOP_COINS_LIMIT = 50  # Number of top coins by market cap to scan
 MIN_VOLUME = 10_000_000  # Minimum daily trading volume in USD
@@ -16,6 +16,11 @@ MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']  # Prioritized to
 HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']  # Possible ID variants for HYPE
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        error_msg = "Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set"
+        print(error_msg)
+        raise ValueError(error_msg)
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
@@ -23,14 +28,17 @@ def send_telegram(message):
         response.raise_for_status()
         print(f"Telegram sent successfully: {message[:50]}...")
     except requests.exceptions.RequestException as e:
-        print(f"Telegram send failed: {e}, status: {getattr(e.response, 'status_code', 'N/A')}")
+        error_msg = f"Telegram send failed: {e}, status: {getattr(e.response, 'status_code', 'N/A')}, token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
+        print(error_msg)
         time.sleep(60)  # Retry after 1 minute
         try:
             response = requests.post(url, data=payload, timeout=10)
             response.raise_for_status()
             print(f"Telegram retry succeeded: {message[:50]}...")
         except requests.exceptions.RequestException as e2:
-            print(f"Telegram retry failed: {e2}")
+            error_msg = f"Telegram retry failed: {e2}, status: {getattr(e2.response, 'status_code', 'N/A')}, token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
+            print(error_msg)
+            raise
 
 def fetch_market_data():
     print("Fetching market data from CoinGecko...")
