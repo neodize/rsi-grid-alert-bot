@@ -23,9 +23,10 @@ def send_telegram(message):
     token_source = "GitHub Secrets" if os.getenv('TELEGRAM_TOKEN') else "fallback"
     chat_id_source = "GitHub Secrets" if os.getenv('TELEGRAM_CHAT_ID') else "fallback"
     logging.info(f"Attempting to send Telegram message using token from {token_source} and chat_id from {chat_id_source}")
+    logging.info(f"Token (partial): {TELEGRAM_TOKEN[:10]}..., Chat ID: {TELEGRAM_CHAT_ID}")
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning(f"TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set, skipping message: {message[:50]}...")
+    if not TELEGRAM_TOKEN.strip() or not TELEGRAM_CHAT_ID.strip():
+        logging.warning(f"TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is empty or unset, skipping message: {message[:50]}...")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
