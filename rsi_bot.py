@@ -66,11 +66,6 @@ def fetch_market_data():
     logging.info(f"After table coin filter: {len(filtered_data)}")
     smaller_tokens = [coin for coin in filtered_data if filtered_data.index(coin) >= TOP_COINS_TO_EXCLUDE]
     logging.info(f"After top 20 exclusion: {len(smaller_tokens)}")
-    
-    # Debug: Log existing tokens
-    existing_ids = [coin['id'] for coin in smaller_tokens]
-    logging.info(f"Existing token IDs: {existing_ids}")
-    
     for token_id in MAIN_TOKENS:
         if not any(coin['id'] == token_id for coin in smaller_tokens):
             main_coin = next((coin for coin in data if coin['id'] == token_id), None)
@@ -88,10 +83,7 @@ def fetch_market_data():
                                 direct_data = direct_response.json()
                                 if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
                                     logging.info(f"Direct fetch success for {variant}")
-                                    # Debug: Log the fetched coin data
-                                    coin_data = direct_data[0]
-                                    logging.info(f"Fetched coin ID: {coin_data['id']}, Symbol: {coin_data['symbol']}")
-                                    smaller_tokens.append(coin_data)
+                                    smaller_tokens.append(direct_data[0])
                                     break
                             except requests.exceptions.RequestException as e:
                                 logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
@@ -109,10 +101,6 @@ def fetch_market_data():
                             smaller_tokens.append(direct_data[0])
                     except requests.exceptions.RequestException as e:
                         logging.error(f"Direct fetch failed for {token_id}: {e}")
-    
-    # Debug: Log final token IDs
-    final_ids = [coin['id'] for coin in smaller_tokens]
-    logging.info(f"Final token IDs: {final_ids}")
     logging.info(f"Final market data count: {len(smaller_tokens)}")
     return smaller_tokens
 
@@ -170,10 +158,6 @@ def main():
             sparkline = coin['sparkline_in_7d']['price'][-15:]
             rsi = calc_rsi(sparkline)
 
-            # Debug: Log token processing
-            logging.info(f"Processing token: ID={id_}, Symbol={symbol}")
-            logging.info(f"Is {id_} in MAIN_TOKENS? {id_ in MAIN_TOKENS}")
-
             if rsi is None:
                 continue
 
@@ -196,23 +180,17 @@ def main():
                 reason = f"Neutral with RSI {rsi:.2f}, indicating a ranging market."
 
             alert = f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}"
-            
-            # Debug: Log alert categorization
             if id_ in MAIN_TOKENS:
-                logging.info(f"Adding {symbol} to main_alerts")
                 main_alerts.append(alert)
             else:
-                logging.info(f"Adding {symbol} to small_alerts")
                 small_alerts.append(alert)
-
-        # Debug: Log final alert counts
-        logging.info(f"Main alerts count: {len(main_alerts)}")
-        logging.info(f"Small alerts count: {len(small_alerts)}")
 
         message = f"*HOURLY GRID TRADING ALERT — {ts}*\n"
         if main_alerts:
-            message += "*Main Tokens*\n" + '\n\n'.join(main_alerts[:3]) + '\n'
+            # FIXED: Show ALL main tokens, not just first 3
+            message += "*Main Tokens*\n" + '\n\n'.join(main_alerts) + '\n'
         if small_alerts:
+            # Still limit smaller tokens to 3 to keep message manageable
             message += "====\n*Smaller Tokens*\n" + '\n\n'.join(small_alerts[:3]) if small_alerts else ''
         if not main_alerts and not small_alerts:
             message += '\nNo suitable grid trading opportunities this hour.'
