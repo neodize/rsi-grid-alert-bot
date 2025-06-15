@@ -359,15 +359,6 @@ def main():
             message += '❌ No suitable grid trading opportunities this hour.\n'
             message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.'
 
-        # Add footer with tips
-        message += f"\n\n*📝 QUICK SETUP GUIDE:*\n"
-        message += f"1. Copy price range exactly as shown\n"
-        message += f"2. Set grid count as recommended\n"  
-        message += f"3. Choose Arithmetic/Geometric mode\n"
-        message += f"4. Set direction (Long/Short/Neutral)\n"
-        message += f"5. Enable/disable trailing as suggested\n"
-        message += f"\n⚠️ *Always use proper risk management!*"
-
         logging.info(f"Sending enhanced Telegram message: {message[:100]}...")
         send_telegram(message)
         logging.info("Enhanced grid analysis completed")
