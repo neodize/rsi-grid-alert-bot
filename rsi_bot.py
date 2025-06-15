@@ -17,7 +17,6 @@ PIONEX_API = 'https://api.pionex.com/api/v1'
 MIN_VOLUME = 10_000_000
 MIN_PRICE = 0.01
 MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']
-HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']
 
 # Cache for Pionex supported tokens
 PIONEX_SUPPORTED_TOKENS = set()
@@ -55,17 +54,17 @@ def get_pionex_supported_tokens():
             base_currency = symbol_info.get('baseCurrency', '').upper()
             quote_currency = symbol_info.get('quoteCurrency', '').upper()
             
-            # Focus on SPOT pairs with USDT as quote currency for grid trading
-            if symbol_type == 'SPOT' and quote_currency == 'USDT' and base_currency:
+            # Focus on PERP pairs with USDT as quote currency for futures grid trading
+            if symbol_type == 'PERP' and quote_currency == 'USDT' and base_currency:
                 supported_tokens.add(base_currency)
-                spot_pairs += 1
-            elif symbol_type == 'PERP':
                 perp_pairs += 1
+            elif symbol_type == 'SPOT':
+                spot_pairs += 1
         
         PIONEX_SUPPORTED_TOKENS = supported_tokens
-        logging.info(f"Pionex supports {len(supported_tokens)} SPOT tokens with USDT pairs")
-        logging.info(f"Found {spot_pairs} SPOT pairs and {perp_pairs} PERP pairs")
-        logging.info(f"Sample supported tokens: {list(supported_tokens)[:10]}")
+        logging.info(f"Pionex supports {len(supported_tokens)} PERP tokens with USDT pairs")
+        logging.info(f"Found {perp_pairs} PERP pairs and {spot_pairs} SPOT pairs")
+        logging.info(f"Sample supported PERP tokens: {list(supported_tokens)[:10]}")
         
         return supported_tokens
         
@@ -186,7 +185,7 @@ def fetch_market_data():
     for coin in data:
         if coin['id'] in MAIN_TOKENS:
             main_tokens_found.append(coin)
-            logging.info(f"Found main token supported on Pionex: {coin['symbol']} ({coin['id']})")
+            logging.info(f"Found main token supported on Pionex PERP: {coin['symbol']} ({coin['id']})")
     
     # Get smaller tokens (excluding top 20 by market cap)
     sorted_data = sorted(data, key=lambda x: x['market_cap'], reverse=True)
@@ -194,7 +193,7 @@ def fetch_market_data():
         if i >= 20 and coin['id'] not in MAIN_TOKENS:  # Skip top 20 by market cap
             smaller_tokens.append(coin)
     
-    logging.info(f"Main tokens found on Pionex: {len(main_tokens_found)}")
+    logging.info(f"Main tokens found on Pionex PERP: {len(main_tokens_found)}")
     logging.info(f"Smaller tokens after top 20 exclusion: {len(smaller_tokens)}")
     
     # Try to fetch missing main tokens directly if they're supported on Pionex
@@ -204,68 +203,36 @@ def fetch_market_data():
     for token_id in missing_main_tokens:
         logging.info(f"Attempting to fetch missing main token: {token_id}")
         
-        if token_id == 'hyperliquid':
-            # Special handling for hyperliquid variants
-            for variant in HYPE_VARIANTS:
-                for attempt in range(3):
-                    try:
-                        direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={variant}&sparkline=true"
-                        direct_response = requests.get(direct_url, timeout=10)
-                        direct_response.raise_for_status()
-                        direct_data = direct_response.json()
-                        
-                        if (direct_data and len(direct_data) > 0 and 
-                            direct_data[0]['total_volume'] > MIN_VOLUME and 
-                            direct_data[0]['current_price'] > MIN_PRICE):
-                            
-                            # Check if this variant is supported on Pionex
-                            if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
-                                logging.info(f"Successfully fetched {variant} (Pionex supported): {direct_data[0]['symbol']}")
-                                main_tokens_found.append(direct_data[0])
-                                break
-                            else:
-                                logging.info(f"Fetched {variant} but not supported on Pionex")
-                    except requests.exceptions.RequestException as e:
-                        logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
-                        if attempt < 2:
-                            time.sleep(2 ** attempt)
-                        else:
-                            logging.error(f"Failed to fetch {variant} after 3 attempts")
+        # Direct fetch for main tokens (including hyperliquid)
+        for attempt in range(3):
+            try:
+                direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
+                direct_response = requests.get(direct_url, timeout=10)
+                direct_response.raise_for_status()
+                direct_data = direct_response.json()
                 
-                # If successful, break out of variant loop
-                if any(coin['id'] == variant for coin in main_tokens_found):
-                    break
-        else:
-            # Direct fetch for other main tokens
-            for attempt in range(3):
-                try:
-                    direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
-                    direct_response = requests.get(direct_url, timeout=10)
-                    direct_response.raise_for_status()
-                    direct_data = direct_response.json()
+                if (direct_data and len(direct_data) > 0 and 
+                    direct_data[0]['total_volume'] > MIN_VOLUME and 
+                    direct_data[0]['current_price'] > MIN_PRICE):
                     
-                    if (direct_data and len(direct_data) > 0 and 
-                        direct_data[0]['total_volume'] > MIN_VOLUME and 
-                        direct_data[0]['current_price'] > MIN_PRICE):
-                        
-                        # Check if this token is supported on Pionex
-                        if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
-                            logging.info(f"Successfully fetched {token_id} (Pionex supported): {direct_data[0]['symbol']}")
-                            main_tokens_found.append(direct_data[0])
-                            break
-                        else:
-                            logging.info(f"Fetched {token_id} but not supported on Pionex")
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Direct fetch attempt {attempt + 1} for {token_id} failed: {e}")
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
+                    # Check if this token is supported on Pionex
+                    if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
+                        logging.info(f"Successfully fetched {token_id} (Pionex PERP supported): {direct_data[0]['symbol']}")
+                        main_tokens_found.append(direct_data[0])
+                        break
                     else:
-                        logging.error(f"Failed to fetch {token_id} after 3 attempts")
+                        logging.info(f"Fetched {token_id} but not supported on Pionex PERP")
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Direct fetch attempt {attempt + 1} for {token_id} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                else:
+                    logging.error(f"Failed to fetch {token_id} after 3 attempts")
     
     # Combine main tokens and smaller tokens
     final_tokens = main_tokens_found + smaller_tokens
     
-    logging.info(f"Final Pionex-compatible token breakdown:")
+    logging.info(f"Final Pionex PERP-compatible token breakdown:")
     logging.info(f"  Main tokens: {len(main_tokens_found)} - {[coin['symbol'] for coin in main_tokens_found]}")
     logging.info(f"  Smaller tokens: {len(smaller_tokens)}")
     logging.info(f"  Total tokens: {len(final_tokens)}")
@@ -455,7 +422,7 @@ def get_enhanced_grid_setup(coin, rsi):
 
 def main():
     try:
-        logging.info("Starting Pionex-enhanced grid analysis...")
+        logging.info("Starting Pionex PERP-enhanced grid analysis...")
         market_data = fetch_market_data()
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
@@ -463,8 +430,8 @@ def main():
         small_alerts = []
 
         if not market_data:
-            logging.info("No Pionex-compatible market data available, sending empty alert")
-            send_telegram(f"🤖 PIONEX GRID TRADING ALERT — {ts}\n❌ No suitable Pionex-compatible grid trading opportunities this hour.\n💡 Check back later for new opportunities!")
+            logging.info("No Pionex PERP-compatible market data available, sending empty alert")
+            send_telegram(f"🤖 PIONEX FUTURES GRID ALERT — {ts}\n❌ No suitable Pionex PERP-compatible grid trading opportunities this hour.\n💡 Check back later for new opportunities!")
             return
 
         # Get count of supported tokens for context
@@ -492,7 +459,7 @@ def main():
             direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
             
             alert = f"{direction_emoji} {symbol} RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
-            alert += f"📊 PIONEX GRID SETUP\n"
+            alert += f"📊 PIONEX FUTURES GRID SETUP\n"
             alert += f"• Price Range: {low_fmt} - {high_fmt}\n"
             alert += f"• Grid Count: {grid_params['grids']} grids\n"
             alert += f"• Grid Mode: {grid_params['mode']}\n"
@@ -518,8 +485,8 @@ def main():
                 small_alerts.append(alert)
 
         # Compose final message
-        message = f"🤖 PIONEX GRID TRADING ALERTS — {ts}\n"
-        message += f"📊 Analyzed {supported_count} Pionex-supported tokens\n\n"
+        message = f"🤖 PIONEX FUTURES GRID ALERTS — {ts}\n"
+        message += f"📊 Analyzed {supported_count} Pionex PERP-supported tokens\n\n"
         
         if main_alerts:
             message += "🏆 MAIN TOKENS\n" + '\n\n'.join(main_alerts) + '\n\n'
@@ -530,11 +497,11 @@ def main():
         if not main_alerts and not small_alerts:
             message += '❌ No suitable grid trading opportunities this hour.\n'
             message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.\n'
-            message += f'💡 Monitoring {supported_count} Pionex tokens for next opportunity.'
+            message += f'💡 Monitoring {supported_count} Pionex PERP tokens for next opportunity.'
 
         logging.info(f"Sending Pionex-enhanced Telegram message: {message[:100]}...")
         send_telegram(message)
-        logging.info("Pionex-enhanced grid analysis completed")
+        logging.info("Pionex PERP-enhanced grid analysis completed")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"API Error: {e}")
