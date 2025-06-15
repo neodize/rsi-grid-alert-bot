@@ -17,9 +17,8 @@ HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']  # Possible ID variants for 
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        error_msg = "Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set"
-        print(error_msg)
-        raise ValueError(error_msg)
+        print(f"Warning: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set, skipping Telegram message: {message[:50]}...")
+        return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
