@@ -1,22 +1,7 @@
-name: Grid Trading Scanner
-on:
-  schedule:
-    # Every 4 hours for opportunity detection
-    - cron: '0 */4 * * *'  # Fixed: removed extra asterisk
-    # Daily summary at 8 AM UTC
-    - cron: '0 8 * * *'    # Fixed: removed extra asterisk
-  workflow_dispatch:  # Allows manual triggering
-    inputs:
-      force_summary:
-        description: 'Force daily summary regardless of opportunities'
-        required: false
-        default: 'false'
-        type: boolean
-
 jobs:
   opportunity-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Increased timeout for numpy/scipy installation
+    timeout-minutes: 15
     
     steps:
       - name: Checkout code
@@ -25,7 +10,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'  # Specific version for consistency
+          python-version: '3.11'
           
       - name: Cache pip
         uses: actions/cache@v4
@@ -40,15 +25,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-dev gcc g++
       
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas numpy matplotlib seaborn python-telegram-bot pytz
-      
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests numpy>=1.24.0 scipy>=1.10.0
+          pip install requests pandas numpy>=1.24.0 scipy>=1.10.0 matplotlib seaborn python-telegram-bot pytz
           
       - name: Check secrets
         run: |
@@ -73,36 +53,3 @@ jobs:
           -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
           -d text="⚠️ Grid Trading Scanner workflow failed! Check GitHub Actions logs for details." || true
         continue-on-error: true
-
-  # Optional: Weekly deep analysis job
-  weekly-analysis:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # Run every Sunday at 10 AM UTC
-    if: github.event.schedule == '0 10 * * 0'  # Fixed cron syntax
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-dev gcc g++
-          
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests numpy>=1.24.0 scipy>=1.10.0
-          
-      - name: Run weekly analysis
-        run: python rsi_bot.py
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FORCE_DAILY_SUMMARY: 'true'  # Always send summary for weekly analysis
