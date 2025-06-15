@@ -16,7 +16,7 @@ COINGECKO_API = 'https://api.coingecko.com/api/v3'
 PIONEX_API = 'https://api.pionex.com/api/v1'
 MIN_VOLUME = 10_000_000
 MIN_PRICE = 0.01
-MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']
+MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid' , 'hyperliquid-hype']
 HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']
 
 # Cache for Pionex supported tokens
