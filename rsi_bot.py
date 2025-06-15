@@ -122,7 +122,7 @@ def main():
         if main_alerts:
             message += "*Main Tokens*\n" + '\n\n'.join(main_alerts[:3]) + '\n'
         if small_alerts:
-            message += "*Smaller Tokens*\n" + '\n\n'.join(small_alerts[:3]) if small_alerts else ''
+            message += "====\n*Smaller Tokens*\n" + '\n\n'.join(small_alerts[:3]) if small_alerts else ''
         message += '\nNo suitable grid trading opportunities this hour.' if not main_alerts and not small_alerts else ''
 
         send_telegram(message)
