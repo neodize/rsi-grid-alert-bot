@@ -1,23 +1,23 @@
 name: Grid Trading Scanner
-
 on:
   schedule:
-    - cron: '0 * * * *'  # Runs every hour at minute 0
+    - cron: '0 * * * *'  # Fixed: Runs every hour at minute 0
   workflow_dispatch:  # Allows manual triggering
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10  # Cancel job if it takes >10 minutes
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+        
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'  # Specific version for consistency
-
+          
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -25,24 +25,27 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-
+            
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
-
+          
       - name: Check secrets
         run: |
           if [ -z "${{ secrets.TELEGRAM_TOKEN }}" ] || [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
-            echo "Warning: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set. Using fallback credentials."
+            echo "Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set in repository secrets"
+            exit 1
+          else
+            echo "Secrets are properly configured"
           fi
-
+          
       - name: Run scanner
         run: python rsi_bot.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
+          
       - name: Notify on failure
         if: failure()
         run: |
