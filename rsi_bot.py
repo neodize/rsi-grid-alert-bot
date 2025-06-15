@@ -31,15 +31,17 @@ def fetch_market_data():
     response = requests.get(url)
     response.raise_for_status()
     data = [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
-    # Exclude table coins (e.g., BTC3L, ETH3S) and top 20 coins, but include main tokens
-    filtered_data = [coin for coin in data if not re.search(r'(\d+[LS])$', coin['symbol'].upper()) and data.index(coin) >= TOP_COINS_TO_EXCLUDE]
-    # Add main tokens if not already included
-    for token in MAIN_TOKENS:
-        if not any(coin['id'] == token for coin in filtered_data):
-            main_coin = next((coin for coin in data if coin['id'] == token), None)
-            if main_coin and not re.search(r'(\d+[LS])$', main_coin['symbol'].upper()):
-                filtered_data.append(main_coin)
-    return filtered_data
+    # Exclude table coins (e.g., BTC3L, ETH3S)
+    filtered_data = [coin for coin in data if not re.search(r'(\d+[LS])$', coin['symbol'].upper())]
+    # Exclude top 20 coins but ensure main tokens are included
+    smaller_tokens = [coin for coin in filtered_data if filtered_data.index(coin) >= TOP_COINS_TO_EXCLUDE]
+    # Add main tokens if not already in the list
+    for token_id in MAIN_TOKENS:
+        if not any(coin['id'] == token_id for coin in smaller_tokens):
+            main_coin = next((coin for coin in filtered_data if coin['id'] == token_id), None)
+            if main_coin:
+                smaller_tokens.append(main_coin)
+    return smaller_tokens
 
 def calc_rsi(prices):
     if len(prices) < 15:  # Need at least 15 points for 14-period RSI
@@ -79,7 +81,8 @@ def main():
         market_data = fetch_market_data()
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-        alerts = []
+        main_alerts = []
+        small_alerts = []
 
         for coin in market_data:
             id_ = coin['id']
@@ -109,10 +112,18 @@ def main():
                 suggestion += "Neutral"
                 reason = f"Neutral with RSI {rsi:.2f}, indicating a ranging market."
 
-            alerts.append(f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}")
+            alert = f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}"
+            if id_ in MAIN_TOKENS:
+                main_alerts.append(alert)
+            else:
+                small_alerts.append(alert)
 
         message = f"*HOURLY GRID TRADING ALERT — {ts}*\n"
-        message += '\n\n'.join(alerts[:5]) if alerts else 'No suitable grid trading opportunities this hour.'
+        if main_alerts:
+            message += "*Main Tokens*\n" + '\n\n'.join(main_alerts[:3]) + '\n'
+        if small_alerts:
+            message += "*Smaller Tokens*\n" + '\n\n'.join(small_alerts[:3]) if small_alerts else ''
+        message += '\nNo suitable grid trading opportunities this hour.' if not main_alerts and not small_alerts else ''
 
         send_telegram(message)
         logging.info(f"Scan completed at {ts}")
