@@ -1,10 +1,12 @@
 name: Grid Trading Scanner
 on:
-schedule:
-  # Regular scans every 4 hours during MYT active hours (01:00-17:00 UTC)
-  - cron: '0 1,5,9,13,17 * * *'
-  # Urgent scans every 45 min during active hours (01:00-17:00 UTC)
-  - cron: '*/45 1-17 * * *'
+  schedule:
+    # High frequency scans during active trading hours (every 30 minutes)
+    - cron: '*/30 6-22 * * *'  # Every 30 min from 6 AM to 10 PM UTC
+    # Lower frequency during off-hours (every 2 hours)
+    - cron: '0 */2 * * *'      # Every 2 hours during night
+    # Daily summary at 8 AM UTC
+    - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
       force_summary:
@@ -12,6 +14,15 @@ schedule:
         required: false
         default: 'false'
         type: boolean
+      scan_frequency:
+        description: 'Scan frequency (high/normal/low)'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - high
+          - normal
+          - low
 
 jobs:
   opportunity-scan:
@@ -60,6 +71,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_DAILY_SUMMARY: ${{ github.event.inputs.force_summary || 'false' }}
+          SCAN_FREQUENCY: ${{ github.event.inputs.scan_frequency || 'normal' }}
           
       - name: Notify on failure
         if: failure()
@@ -69,10 +81,11 @@ jobs:
           -d text="⚠️ Grid Trading Scanner workflow failed! Check GitHub Actions logs for details." || true
         continue-on-error: true
 
-  weekly-analysis:
+  # Separate job for urgent alerts (runs every 15 minutes during market hours)
+  urgent-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    if: github.event.schedule == '0 10 * * 0'
+    timeout-minutes: 10
+    if: github.event.schedule == '*/15 * * * *'
     
     steps:
       - name: Checkout code
@@ -83,19 +96,14 @@ jobs:
         with:
           python-version: '3.11'
           
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-dev gcc g++
-          
-      - name: Install dependencies
+      - name: Install dependencies (minimal)
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy>=1.24.0 scipy>=1.10.0 matplotlib seaborn python-telegram-bot pytz
+          pip install requests numpy scipy
           
-      - name: Run weekly analysis
-        run: python rsi_bot.py
+      - name: Run urgent opportunity scanner
+        run: python rsi_bot.py --urgent-only
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FORCE_DAILY_SUMMARY: 'true'
+          URGENT_SCAN: 'true'
