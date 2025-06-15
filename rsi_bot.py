@@ -89,50 +89,80 @@ def send_telegram(message):
             return
 
 def fetch_pionex_market_data():
-    """Fetch market data from Pionex API"""
+    """Fetch market data from Pionex API using correct endpoints"""
     logging.info("Fetching market data from Pionex API...")
     
     try:
-        # Get 24hr ticker data for all symbols
-        url = f"{PIONEX_API}/api/v1/market/24hrs"
-        response = requests.get(url, timeout=10)
+        # First, get all available symbols with PERP type
+        symbols_url = f"{PIONEX_API}/api/v1/common/symbols"
+        params = {'type': 'PERP'}
+        
+        logging.info(f"Fetching symbols from: {symbols_url}")
+        response = requests.get(symbols_url, params=params, timeout=10)
         response.raise_for_status()
         
-        if not response.json().get('result'):
-            logging.error(f"Pionex API error: {response.json()}")
+        symbols_data = response.json()
+        if not symbols_data.get('result', False):
+            logging.error(f"Pionex symbols API error: {symbols_data}")
             return []
         
-        tickers = response.json().get('data', [])
-        logging.info(f"Retrieved {len(tickers)} tickers from Pionex")
+        perp_symbols = symbols_data.get('data', {}).get('symbols', [])
+        logging.info(f"Retrieved {len(perp_symbols)} PERP symbols from Pionex")
         
-        # Filter for perpetual contracts only (futures grid)
+        if not perp_symbols:
+            logging.warning("No PERP symbols found")
+            return []
+        
+        # Get 24hr ticker data for all symbols
+        tickers_url = f"{PIONEX_API}/api/v1/market/tickers"
+        response = requests.get(tickers_url, timeout=10)
+        response.raise_for_status()
+        
+        tickers_data = response.json()
+        if not tickers_data.get('result', False):
+            logging.error(f"Pionex tickers API error: {tickers_data}")
+            return []
+        
+        all_tickers = tickers_data.get('data', [])
+        logging.info(f"Retrieved {len(all_tickers)} total tickers from Pionex")
+        
+        # Create a map of PERP symbols for filtering
+        perp_symbol_set = {symbol['symbol'] for symbol in perp_symbols}
+        
+        # Filter and process tickers for PERP contracts only
         perp_tickers = []
-        for ticker in tickers:
+        for ticker in all_tickers:
             symbol = ticker.get('symbol', '')
-            if symbol.endswith('_USDT') and 'PERP' in symbol:  # Filter for perpetual contracts
-                # Extract base symbol
-                base_symbol = symbol.replace('_USDT', '').replace('PERP', '')
+            
+            if symbol not in perp_symbol_set:
+                continue
+            
+            # Extract base symbol (remove PERP suffix if present)
+            base_symbol = symbol.replace('PERP', '').strip('_')
+            if base_symbol.endswith('_USDT'):
+                base_symbol = base_symbol.replace('_USDT', '')
+            
+            # Convert Pionex format to our expected format
+            market_data = {
+                'symbol': base_symbol,
+                'name': base_symbol,
+                'current_price': float(ticker.get('price', 0)),
+                'price_change_percentage_24h': float(ticker.get('dailyChange', 0)) * 100,
+                'total_volume': float(ticker.get('quoteVolume', 0)),
+                'market_cap': float(ticker.get('quoteVolume', 0)) * 24,  # Approximate market cap
+                'high_24h': float(ticker.get('high', 0)),
+                'low_24h': float(ticker.get('low', 0)),
+                'raw_symbol': symbol
+            }
+            
+            # Apply filters
+            if (market_data['total_volume'] > MIN_VOLUME and 
+                market_data['current_price'] > MIN_PRICE):
                 
-                # Convert Pionex format to our expected format
-                market_data = {
-                    'symbol': base_symbol,
-                    'name': base_symbol,
-                    'current_price': float(ticker.get('close', 0)),
-                    'price_change_percentage_24h': float(ticker.get('priceChangePercent', 0)),
-                    'total_volume': float(ticker.get('quoteVolume', 0)),
-                    'market_cap': float(ticker.get('quoteVolume', 0)) * 24,  # Approximate market cap
-                    'high_24h': float(ticker.get('high', 0)),
-                    'low_24h': float(ticker.get('low', 0)),
-                    'raw_symbol': symbol
-                }
-                
-                # Apply filters
-                if (market_data['total_volume'] > MIN_VOLUME and 
-                    market_data['current_price'] > MIN_PRICE):
-                    
-                    is_excluded, reason = is_excluded_token(base_symbol)
-                    if not is_excluded:
-                        perp_tickers.append(market_data)
+                is_excluded, reason = is_excluded_token(base_symbol)
+                if not is_excluded:
+                    perp_tickers.append(market_data)
+                    logging.debug(f"Added PERP: {base_symbol} (${market_data['current_price']:.4f})")
         
         logging.info(f"After filtering: {len(perp_tickers)} perpetual contracts")
         
@@ -142,7 +172,26 @@ def fetch_pionex_market_data():
         
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching Pionex market data: {e}")
-        return []
+        # Try alternative endpoint structure
+        try:
+            logging.info("Trying alternative endpoint structure...")
+            alt_url = f"{PIONEX_API}/api/v1/market/24hrs"
+            response = requests.get(alt_url, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data.get('result', False):
+                logging.info("Alternative endpoint worked!")
+                # Process alternative data format here if needed
+                return []
+            else:
+                logging.error(f"Alternative endpoint also failed: {data}")
+                return []
+                
+        except Exception as alt_e:
+            logging.error(f"Alternative endpoint also failed: {alt_e}")
+            return []
+            
     except Exception as e:
         logging.error(f"Unexpected error in fetch_pionex_market_data: {e}")
         return []
@@ -160,10 +209,12 @@ def fetch_kline_data(symbol, interval='1h', limit=100):
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         
-        if not response.json().get('result'):
-            return []
+        data = response.json()
+        if not data.get('result', False):
+            logging.debug(f"Kline API error for {symbol}: {data}")
+            return None
             
-        klines = response.json().get('data', [])
+        klines = data.get('data', [])
         
         # Convert kline data to price arrays
         prices = []
@@ -172,10 +223,12 @@ def fetch_kline_data(symbol, interval='1h', limit=100):
         lows = []
         
         for kline in klines:
-            prices.append(float(kline[4]))  # Close price
-            volumes.append(float(kline[5]))  # Volume
-            highs.append(float(kline[2]))    # High price
-            lows.append(float(kline[3]))     # Low price
+            # Pionex kline format: [timestamp, open, high, low, close, volume, quoteVolume]
+            if len(kline) >= 7:
+                prices.append(float(kline[4]))  # Close price
+                volumes.append(float(kline[6]))  # Quote Volume
+                highs.append(float(kline[2]))    # High price
+                lows.append(float(kline[3]))     # Low price
         
         return {
             'prices': prices,
@@ -263,7 +316,7 @@ class GridAnalyzer:
         
         # Fetch historical data from Pionex
         kline_data = fetch_kline_data(self.raw_symbol)
-        if kline_data:
+        if kline_data and len(kline_data['prices']) > 10:
             self.prices = kline_data['prices']
             self.volumes = kline_data['volumes']
             self.highs = kline_data['highs']
@@ -556,7 +609,7 @@ def create_grid_alert(analyzer, grid_params):
     return alert
 
 def main():
-    """Main function using only Pionex API"""
+    """Main function using corrected Pionex API"""
     try:
         logging.info("Starting Pionex-only grid analysis for futures...")
         market_data = fetch_pionex_market_data()
@@ -564,7 +617,7 @@ def main():
 
         if not market_data:
             logging.info("No market data available from Pionex")
-            send_telegram(f"*PIONEX FUTURES GRID ANALYSIS -- {ts}*\nNo market data available for analysis.")
+            send_telegram(f"*PIONEX FUTURES GRID ANALYSIS -- {ts}*\n\n❌ No market data available. Possible issues:\n• API endpoints may have changed\n• Network connectivity issues\n• Rate limiting")
             return
 
         suitable_alerts = []
@@ -604,7 +657,7 @@ def main():
             message += '📈 Current market conditions may not favor grid trading.'
 
         message += '\n\n*📚 DATA SOURCE*\n'
-        message += 'Analysis powered by Pionex API - Free real-time perpetual contract data'
+        message += 'Analysis powered by Pionex API - Real-time perpetual contract data'
 
         logging.info(f"Sending Pionex analysis message ({len(top_alerts)} opportunities)")
         send_telegram(message)
