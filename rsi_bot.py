@@ -13,18 +13,74 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
-TOP_COINS_LIMIT = 50
+TOP_COINS_LIMIT = 100  # Increased to ensure we get main tokens
 MIN_VOLUME = 10_000_000
 MIN_PRICE = 0.01
 TOP_COINS_TO_EXCLUDE = 20
 MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']
 HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']
 
-# Opportunity detection thresholds
-RSI_OVERSOLD_THRESHOLD = 30
-RSI_OVERBOUGHT_THRESHOLD = 70
-HIGH_VOLATILITY_THRESHOLD = 0.15  # 15%
-FORCE_DAILY_SUMMARY = os.getenv('FORCE_DAILY_SUMMARY', 'false').lower() == 'true'
+# Comprehensive exclusion lists
+WRAPPED_TOKENS = {
+    'WBTC', 'WETH', 'WBNB', 'WMATIC', 'WAVAX', 'WFTM', 'WONE', 'WROSE',
+    'CBBTC', 'CBETH', 'RETH', 'STETH', 'WSTETH', 'FRXETH', 'SFRXETH',
+    'WSOL', 'MSOL', 'STSOL', 'JSOL', 'BSOL', 'BONK', 'WIF'  # Some wrapped SOL variants
+}
+
+STABLECOINS = {
+    'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'USDD', 'FRAX', 'LUSD',
+    'GUSD', 'USDC.E', 'USDT.E', 'FDUSD', 'PYUSD', 'USDB', 'USDE', 'CRVUSD',
+    'SUSD', 'DUSD', 'OUSD', 'USTC', 'USDK', 'USDN', 'USDS', 'USDY'
+}
+
+EXCLUDED_TOKENS = {
+    # Leveraged tokens
+    'ETHUP', 'ETHDOWN', 'BTCUP', 'BTCDOWN', 'ADAUP', 'ADADOWN',
+    # Synthetic/derivative tokens
+    'SYNTH', 'PERP', 
+    # Meme tokens with questionable utility (optional - remove if you want these)
+    'SHIB', 'DOGE', 'PEPE', 'FLOKI', 'BABYDOGE',
+    # Other problematic tokens
+    'LUNA', 'LUNC', 'USTC'  # Terra ecosystem tokens
+}
+
+def is_excluded_token(symbol, name):
+    """
+    Check if a token should be excluded based on symbol and name
+    """
+    symbol_upper = symbol.upper()
+    name_upper = name.upper() if name else ""
+    
+    # Check wrapped tokens
+    if symbol_upper in WRAPPED_TOKENS:
+        return True, "wrapped"
+    
+    # Check stablecoins
+    if symbol_upper in STABLECOINS:
+        return True, "stablecoin"
+    
+    # Check explicitly excluded tokens
+    if symbol_upper in EXCLUDED_TOKENS:
+        return True, "excluded"
+    
+    # Check leveraged tokens (numbers + L/S pattern)
+    if re.search(r'(\d+[LS])$', symbol_upper):
+        return True, "leveraged"
+    
+    # Check for common wrapped patterns
+    if (symbol_upper.startswith('W') and len(symbol_upper) > 1 and 
+        symbol_upper[1:] in ['BTC', 'ETH', 'SOL', 'BNB', 'MATIC', 'AVAX']):
+        return True, "wrapped_pattern"
+    
+    # Check for USD/stable patterns in name
+    if any(pattern in name_upper for pattern in ['USD COIN', 'TETHER', 'BINANCE USD', 'DAI STABLECOIN']):
+        return True, "stablecoin_name"
+    
+    # Check for wrapped patterns in name
+    if any(pattern in name_upper for pattern in ['WRAPPED', 'WORMHOLE', 'BRIDGE']):
+        return True, "wrapped_name"
+    
+    return False, None
 
 def send_telegram(message):
     token_source = "GitHub Secrets" if os.getenv('TELEGRAM_TOKEN') else "fallback"
@@ -67,49 +123,120 @@ def fetch_market_data():
     url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={TOP_COINS_LIMIT}&page=1&sparkline=true"
     response = requests.get(url, timeout=10)
     response.raise_for_status()
+    
+    # Initial filtering by volume and price
     data = [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
-    logging.info(f"Filtered data count: {len(data)}")
-    filtered_data = [coin for coin in data if not re.search(r'(\d+[LS])$', coin['symbol'].upper())]
-    logging.info(f"After table coin filter: {len(filtered_data)}")
-    smaller_tokens = [coin for coin in filtered_data if filtered_data.index(coin) >= TOP_COINS_TO_EXCLUDE]
-    logging.info(f"After top 20 exclusion: {len(smaller_tokens)}")
-    for token_id in MAIN_TOKENS:
-        if not any(coin['id'] == token_id for coin in smaller_tokens):
-            main_coin = next((coin for coin in data if coin['id'] == token_id), None)
-            if main_coin:
-                logging.info(f"Adding main token from initial data: {token_id}")
-                smaller_tokens.append(main_coin)
-            else:
-                if token_id == 'hyperliquid':
-                    for variant in HYPE_VARIANTS:
-                        for attempt in range(3):
-                            try:
-                                direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={variant}&sparkline=true"
-                                direct_response = requests.get(direct_url, timeout=10)
-                                direct_response.raise_for_status()
-                                direct_data = direct_response.json()
-                                if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
-                                    logging.info(f"Direct fetch success for {variant}")
-                                    smaller_tokens.append(direct_data[0])
-                                    break
-                            except requests.exceptions.RequestException as e:
-                                logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
-                                time.sleep(2 ** attempt)
-                                if attempt == 2:
-                                    logging.error(f"Failed to fetch {variant} after 3 attempts")
-                else:
-                    direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
+    logging.info(f"After volume/price filter: {len(data)} coins")
+    
+    # Filter out unwanted tokens
+    filtered_data = []
+    excluded_count = {"wrapped": 0, "stablecoin": 0, "leveraged": 0, "excluded": 0, "other": 0}
+    
+    for coin in data:
+        is_excluded, reason = is_excluded_token(coin['symbol'], coin['name'])
+        if is_excluded:
+            excluded_count[reason] += 1
+            logging.debug(f"Excluded {coin['symbol']} ({coin['name']}) - Reason: {reason}")
+        else:
+            filtered_data.append(coin)
+    
+    logging.info(f"Exclusion summary: {dict(excluded_count)}")
+    logging.info(f"After token filtering: {len(filtered_data)} coins")
+    
+    # Separate main tokens from smaller tokens
+    main_tokens_found = []
+    smaller_tokens = []
+    
+    # First, find main tokens in the filtered data
+    for coin in filtered_data:
+        if coin['id'] in MAIN_TOKENS:
+            main_tokens_found.append(coin)
+            logging.info(f"Found main token in filtered data: {coin['symbol']} ({coin['id']})")
+    
+    # Get smaller tokens (excluding top 20 from filtered data)
+    for i, coin in enumerate(filtered_data):
+        if i >= TOP_COINS_TO_EXCLUDE and coin['id'] not in MAIN_TOKENS:
+            smaller_tokens.append(coin)
+    
+    logging.info(f"Main tokens found: {len(main_tokens_found)}")
+    logging.info(f"Smaller tokens after top {TOP_COINS_TO_EXCLUDE} exclusion: {len(smaller_tokens)}")
+    
+    # Try to fetch missing main tokens directly
+    missing_main_tokens = [token_id for token_id in MAIN_TOKENS 
+                          if not any(coin['id'] == token_id for coin in main_tokens_found)]
+    
+    for token_id in missing_main_tokens:
+        logging.info(f"Attempting to fetch missing main token: {token_id}")
+        
+        if token_id == 'hyperliquid':
+            # Special handling for hyperliquid variants
+            for variant in HYPE_VARIANTS:
+                for attempt in range(3):
                     try:
+                        direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={variant}&sparkline=true"
                         direct_response = requests.get(direct_url, timeout=10)
                         direct_response.raise_for_status()
                         direct_data = direct_response.json()
-                        if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
-                            logging.info(f"Direct fetch success for {token_id}")
-                            smaller_tokens.append(direct_data[0])
+                        
+                        if (direct_data and len(direct_data) > 0 and 
+                            direct_data[0]['total_volume'] > MIN_VOLUME and 
+                            direct_data[0]['current_price'] > MIN_PRICE):
+                            
+                            # Check if this variant should be excluded
+                            is_excluded, reason = is_excluded_token(direct_data[0]['symbol'], direct_data[0]['name'])
+                            if not is_excluded:
+                                logging.info(f"Successfully fetched {variant}: {direct_data[0]['symbol']}")
+                                main_tokens_found.append(direct_data[0])
+                                break
+                            else:
+                                logging.warning(f"Fetched {variant} but it was excluded: {reason}")
                     except requests.exceptions.RequestException as e:
-                        logging.error(f"Direct fetch failed for {token_id}: {e}")
-    logging.info(f"Final market data count: {len(smaller_tokens)}")
-    return smaller_tokens
+                        logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                        else:
+                            logging.error(f"Failed to fetch {variant} after 3 attempts")
+                
+                # If successful, break out of variant loop
+                if any(coin['id'] == variant for coin in main_tokens_found):
+                    break
+        else:
+            # Direct fetch for other main tokens
+            for attempt in range(3):
+                try:
+                    direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
+                    direct_response = requests.get(direct_url, timeout=10)
+                    direct_response.raise_for_status()
+                    direct_data = direct_response.json()
+                    
+                    if (direct_data and len(direct_data) > 0 and 
+                        direct_data[0]['total_volume'] > MIN_VOLUME and 
+                        direct_data[0]['current_price'] > MIN_PRICE):
+                        
+                        # Check if this token should be excluded
+                        is_excluded, reason = is_excluded_token(direct_data[0]['symbol'], direct_data[0]['name'])
+                        if not is_excluded:
+                            logging.info(f"Successfully fetched {token_id}: {direct_data[0]['symbol']}")
+                            main_tokens_found.append(direct_data[0])
+                            break
+                        else:
+                            logging.warning(f"Fetched {token_id} but it was excluded: {reason}")
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Direct fetch attempt {attempt + 1} for {token_id} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    else:
+                        logging.error(f"Failed to fetch {token_id} after 3 attempts")
+    
+    # Combine main tokens and smaller tokens
+    final_tokens = main_tokens_found + smaller_tokens
+    
+    logging.info(f"Final token breakdown:")
+    logging.info(f"  Main tokens: {len(main_tokens_found)} - {[coin['symbol'] for coin in main_tokens_found]}")
+    logging.info(f"  Smaller tokens: {len(smaller_tokens)}")
+    logging.info(f"  Total tokens: {len(final_tokens)}")
+    
+    return final_tokens
 
 def calc_rsi(prices):
     if len(prices) < 15:
@@ -159,40 +286,6 @@ def format_price(value):
         return f"${value:.6f}"
     else:
         return f"${value:.10f}"
-
-def should_send_alert(coin, rsi, grid_params):
-    """
-    Determine if this coin warrants an alert based on opportunity criteria
-    """
-    symbol = coin['symbol'].upper()
-    
-    # Strong RSI signals (oversold/overbought)
-    if rsi <= RSI_OVERSOLD_THRESHOLD:
-        logging.info(f"{symbol}: Strong oversold signal (RSI: {rsi:.1f})")
-        return True, "OVERSOLD"
-    
-    if rsi >= RSI_OVERBOUGHT_THRESHOLD:
-        logging.info(f"{symbol}: Strong overbought signal (RSI: {rsi:.1f})")
-        return True, "OVERBOUGHT"
-    
-    # High volatility opportunities
-    if grid_params['volatility'] > HIGH_VOLATILITY_THRESHOLD:
-        logging.info(f"{symbol}: High volatility opportunity ({grid_params['volatility']:.1%})")
-        return True, "HIGH_VOLATILITY"
-    
-    # High confidence directional bias (but not neutral)
-    if (grid_params['direction_confidence'] == "High" and 
-        grid_params['direction'] != "Neutral" and
-        (rsi <= 35 or rsi >= 65)):  # Slightly less strict than extreme RSI
-        logging.info(f"{symbol}: High confidence directional signal ({grid_params['direction']})")
-        return True, "DIRECTIONAL"
-    
-    # Main tokens with medium signals (lower threshold for priority tokens)
-    if coin['id'] in MAIN_TOKENS and (rsi <= 35 or rsi >= 65):
-        logging.info(f"{symbol}: Main token with medium signal (RSI: {rsi:.1f})")
-        return True, "MAIN_TOKEN"
-    
-    return False, None
 
 def get_enhanced_grid_setup(coin, rsi):
     """
@@ -327,18 +420,16 @@ def get_enhanced_grid_setup(coin, rsi):
 
 def main():
     try:
-        logging.info("Starting opportunity-based grid analysis...")
+        logging.info("Starting enhanced grid analysis...")
         market_data = fetch_market_data()
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        current_hour = datetime.now(timezone.utc).hour
 
-        opportunities = []
-        summary_data = []
+        main_alerts = []
+        small_alerts = []
 
         if not market_data:
-            logging.info("No market data available")
-            if FORCE_DAILY_SUMMARY:
-                send_telegram(f"*📊 DAILY GRID SUMMARY — {ts}*\nNo market data available.")
+            logging.info("No market data available, sending empty alert")
+            send_telegram(f"*ENHANCED GRID TRADING ALERT — {ts}*\nNo suitable grid trading opportunities this hour.")
             return
 
         for coin in market_data:
@@ -354,110 +445,63 @@ def main():
             # Get enhanced grid parameters
             grid_params = get_enhanced_grid_setup(coin, rsi)
             
-            # Store for potential daily summary
-            summary_data.append({
-                'coin': coin,
-                'rsi': rsi,
-                'grid_params': grid_params,
-                'symbol': symbol
-            })
+            price_fmt = format_price(current_price)
+            low_fmt = format_price(grid_params['min_price'])
+            high_fmt = format_price(grid_params['max_price'])
             
-            # Check if this is an opportunity worth alerting
-            should_alert, alert_type = should_send_alert(coin, rsi, grid_params)
+            # Create comprehensive alert
+            confidence_emoji = "🔥" if grid_params['direction_confidence'] == "High" else "⚡"
+            direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
             
-            if should_alert:
-                price_fmt = format_price(current_price)
-                low_fmt = format_price(grid_params['min_price'])
-                high_fmt = format_price(grid_params['max_price'])
-                
-                # Create alert with opportunity type
-                alert_type_emoji = {
-                    "OVERSOLD": "🟢💥",
-                    "OVERBOUGHT": "🔴💥", 
-                    "HIGH_VOLATILITY": "⚡🌪️",
-                    "DIRECTIONAL": "🎯📈",
-                    "MAIN_TOKEN": "🏆⭐"
-                }
-                
-                confidence_emoji = "🔥" if grid_params['direction_confidence'] == "High" else "⚡"
-                direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
-                
-                alert = f"{alert_type_emoji.get(alert_type, '🚨')} *OPPORTUNITY DETECTED*\n"
-                alert += f"{direction_emoji} *{symbol}* RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
-                alert += f"📊 *COMPLETE GRID SETUP*\n"
-                alert += f"• Price Range: `{low_fmt} - {high_fmt}`\n"
-                alert += f"• Grid Count: `{grid_params['grids']} grids`\n"
-                alert += f"• Grid Mode: `{grid_params['mode']}`\n"
-                alert += f"• Direction: `{grid_params['direction']}` {confidence_emoji}\n"
-                alert += f"• Trailing: `{grid_params['trailing']}`\n"
-                alert += f"• Stop Loss: `{grid_params['stop_loss']}`\n"
-                alert += f"• Expected Cycles/Day: `~{grid_params['expected_daily_cycles']}`\n"
-                alert += f"• Volatility: `{grid_params['volatility']:.1%}` ({grid_params['mode']} recommended)\n"
-                
-                # Add reasoning based on alert type
-                if alert_type == "OVERSOLD":
-                    reason = f"Extremely oversold conditions (RSI {rsi:.1f}). Strong rebound potential for Long grid."
-                elif alert_type == "OVERBOUGHT":
-                    reason = f"Extremely overbought conditions (RSI {rsi:.1f}). High decline potential for Short grid."
-                elif alert_type == "HIGH_VOLATILITY":
-                    reason = f"High volatility ({grid_params['volatility']:.1%}) creates excellent grid trading conditions."
-                elif alert_type == "DIRECTIONAL":
-                    reason = f"High confidence {grid_params['direction'].lower()} signal with favorable RSI positioning."
-                elif alert_type == "MAIN_TOKEN":
-                    reason = f"Priority token with favorable RSI positioning for grid trading."
-                else:
-                    reason = f"Multiple favorable conditions detected for grid trading setup."
-                
-                alert += f"\n💡 *Analysis*: {reason}"
-                
-                opportunities.append(alert)
-                logging.info(f"Opportunity detected: {symbol} ({alert_type})")
-
-        # Send alerts based on conditions
-        if opportunities:
-            # Send opportunity alerts
-            message = f"*🚨 GRID TRADING OPPORTUNITIES — {ts}*\n\n"
-            message += '\n\n'.join(opportunities[:3])  # Limit to 3 opportunities per message
+            alert = f"{direction_emoji} *{symbol}* RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
+            alert += f"📊 *COMPLETE GRID SETUP*\n"
+            alert += f"• Price Range: `{low_fmt} - {high_fmt}`\n"
+            alert += f"• Grid Count: `{grid_params['grids']} grids`\n"
+            alert += f"• Grid Mode: `{grid_params['mode']}`\n"
+            alert += f"• Direction: `{grid_params['direction']}` {confidence_emoji}\n"
+            alert += f"• Trailing: `{grid_params['trailing']}`\n"
+            alert += f"• Stop Loss: `{grid_params['stop_loss']}`\n"
+            alert += f"• Expected Cycles/Day: `~{grid_params['expected_daily_cycles']}`\n"
+            alert += f"• Volatility: `{grid_params['volatility']:.1%}` ({grid_params['mode']} recommended)\n"
             
-            if len(opportunities) > 3:
-                message += f"\n\n*📈 Additional Opportunities*: {len(opportunities) - 3} more detected. Check next update for details."
-            
-            logging.info(f"Sending {len(opportunities)} opportunity alerts")
-            send_telegram(message)
-            
-        elif FORCE_DAILY_SUMMARY or current_hour == 8:  # Daily summary at 8 AM UTC
-            # Send daily summary when no opportunities or forced
-            top_3 = sorted(summary_data, key=lambda x: abs(x['rsi'] - 50), reverse=True)[:3]
-            
-            if top_3:
-                message = f"*📊 DAILY GRID SUMMARY — {ts}*\n\n"
-                message += "*🔍 Market Analysis*\n"
-                message += f"• Scanned {len(summary_data)} tokens\n"
-                message += f"• No immediate opportunities detected\n"
-                message += f"• Market appears to be in consolidation phase\n\n"
-                
-                message += "*📈 Top RSI Positions*\n"
-                for i, item in enumerate(top_3, 1):
-                    direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[item['grid_params']['direction']]
-                    message += f"{i}. {direction_emoji} *{item['symbol']}*: RSI {item['rsi']:.1f} ({item['grid_params']['volatility']:.1%} vol)\n"
-                
-                message += f"\n⏰ *Next Check*: Will alert when opportunities arise"
-                
-                logging.info("Sending daily summary")
-                send_telegram(message)
+            # Add reasoning
+            if rsi <= 35:
+                reason = f"Oversold conditions suggest potential rebound. Recommended for Long bias grid."
+            elif rsi >= 65:
+                reason = f"Overbought conditions suggest potential decline. Recommended for Short bias grid."
             else:
-                logging.info("No data available for daily summary")
-        else:
-            logging.info(f"No opportunities detected. Checked {len(summary_data)} tokens. Staying quiet.")
+                reason = f"Neutral RSI perfect for range-bound grid trading. High profit potential from volatility."
+            
+            alert += f"\n💡 *Analysis*: {reason}"
+            
+            if id_ in MAIN_TOKENS:
+                main_alerts.append(alert)
+            else:
+                small_alerts.append(alert)
 
-        logging.info("Opportunity-based analysis completed")
+        # Compose final message
+        message = f"*🤖 ENHANCED GRID TRADING ALERTS — {ts}*\n\n"
+        
+        if main_alerts:
+            message += "*🏆 MAIN TOKENS*\n" + '\n\n'.join(main_alerts) + '\n\n'
+        
+        if small_alerts:
+            message += "*💎 SMALLER OPPORTUNITIES*\n" + '\n\n'.join(small_alerts[:2])  # Limit to 2 for message size
+        
+        if not main_alerts and not small_alerts:
+            message += '❌ No suitable grid trading opportunities this hour.\n'
+            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.'
+
+        logging.info(f"Sending enhanced Telegram message: {message[:100]}...")
+        send_telegram(message)
+        logging.info("Enhanced grid analysis completed")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"API Error: {e}")
-        send_telegram(f"⚠️ API Error: {e}")
+        send_telegram(f"API Error: {e}")
     except Exception as e:
         logging.error(f"Unexpected Error: {e}")
-        send_telegram(f"⚠️ Unexpected Error: {e}")
+        send_telegram(f"Unexpected Error: {e}")
 
 if __name__ == "__main__":
     main()
