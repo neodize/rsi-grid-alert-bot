@@ -13,74 +13,102 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
-TOP_COINS_LIMIT = 100  # Increased to ensure we get main tokens
+PIONEX_API = 'https://api.pionex.com/api/v1'
 MIN_VOLUME = 10_000_000
 MIN_PRICE = 0.01
-TOP_COINS_TO_EXCLUDE = 20
 MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']
 HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']
 
-# Comprehensive exclusion lists
-WRAPPED_TOKENS = {
-    'WBTC', 'WETH', 'WBNB', 'WMATIC', 'WAVAX', 'WFTM', 'WONE', 'WROSE',
-    'CBBTC', 'CBETH', 'RETH', 'STETH', 'WSTETH', 'FRXETH', 'SFRXETH',
-    'WSOL', 'MSOL', 'STSOL', 'JSOL', 'BSOL', 'BONK', 'WIF'  # Some wrapped SOL variants
-}
+# Cache for Pionex supported tokens
+PIONEX_SUPPORTED_TOKENS = set()
 
-STABLECOINS = {
-    'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'USDD', 'FRAX', 'LUSD',
-    'GUSD', 'USDC.E', 'USDT.E', 'FDUSD', 'PYUSD', 'USDB', 'USDE', 'CRVUSD',
-    'SUSD', 'DUSD', 'OUSD', 'USTC', 'USDK', 'USDN', 'USDS', 'USDY'
-}
-
-EXCLUDED_TOKENS = {
-    # Leveraged tokens
-    'ETHUP', 'ETHDOWN', 'BTCUP', 'BTCDOWN', 'ADAUP', 'ADADOWN',
-    # Synthetic/derivative tokens
-    'SYNTH', 'PERP', 
-    # Meme tokens with questionable utility (optional - remove if you want these)
-    'SHIB', 'DOGE', 'PEPE', 'FLOKI', 'BABYDOGE',
-    # Other problematic tokens
-    'LUNA', 'LUNC', 'USTC'  # Terra ecosystem tokens
-}
-
-def is_excluded_token(symbol, name):
+def get_pionex_supported_tokens():
     """
-    Check if a token should be excluded based on symbol and name
+    Fetch all supported trading pairs from Pionex API and extract base currencies
     """
-    symbol_upper = symbol.upper()
-    name_upper = name.upper() if name else ""
+    global PIONEX_SUPPORTED_TOKENS
     
-    # Check wrapped tokens
-    if symbol_upper in WRAPPED_TOKENS:
-        return True, "wrapped"
+    if PIONEX_SUPPORTED_TOKENS:  # Return cached data if available
+        return PIONEX_SUPPORTED_TOKENS
     
-    # Check stablecoins
-    if symbol_upper in STABLECOINS:
-        return True, "stablecoin"
+    try:
+        logging.info("Fetching supported tokens from Pionex API...")
+        url = f"{PIONEX_API}/common/symbols"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        if 'data' not in data or 'symbols' not in data['data']:
+            logging.error("Unexpected Pionex API response format")
+            return set()
+        
+        supported_tokens = set()
+        spot_pairs = 0
+        perp_pairs = 0
+        
+        for symbol_info in data['data']['symbols']:
+            # Only consider enabled trading pairs
+            if not symbol_info.get('enable', False):
+                continue
+                
+            symbol_type = symbol_info.get('type', '')
+            base_currency = symbol_info.get('baseCurrency', '').upper()
+            quote_currency = symbol_info.get('quoteCurrency', '').upper()
+            
+            # Focus on SPOT pairs with USDT as quote currency for grid trading
+            if symbol_type == 'SPOT' and quote_currency == 'USDT' and base_currency:
+                supported_tokens.add(base_currency)
+                spot_pairs += 1
+            elif symbol_type == 'PERP':
+                perp_pairs += 1
+        
+        PIONEX_SUPPORTED_TOKENS = supported_tokens
+        logging.info(f"Pionex supports {len(supported_tokens)} SPOT tokens with USDT pairs")
+        logging.info(f"Found {spot_pairs} SPOT pairs and {perp_pairs} PERP pairs")
+        logging.info(f"Sample supported tokens: {list(supported_tokens)[:10]}")
+        
+        return supported_tokens
+        
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch Pionex supported tokens: {e}")
+        return set()
+    except Exception as e:
+        logging.error(f"Error processing Pionex API response: {e}")
+        return set()
+
+def map_coingecko_to_pionex_symbol(coingecko_symbol):
+    """
+    Map CoinGecko symbol to Pionex symbol format
+    Some tokens might have different symbols between platforms
+    """
+    # Common mappings
+    symbol_mappings = {
+        'WBTC': 'BTC',  # Wrapped Bitcoin might be listed as BTC on Pionex
+        'WETH': 'ETH',  # Wrapped Ethereum might be listed as ETH on Pionex
+        # Add more mappings as needed
+    }
     
-    # Check explicitly excluded tokens
-    if symbol_upper in EXCLUDED_TOKENS:
-        return True, "excluded"
+    return symbol_mappings.get(coingecko_symbol.upper(), coingecko_symbol.upper())
+
+def is_token_supported_on_pionex(coingecko_symbol, coingecko_id):
+    """
+    Check if a token from CoinGecko is supported on Pionex
+    """
+    supported_tokens = get_pionex_supported_tokens()
+    if not supported_tokens:
+        logging.warning("No Pionex supported tokens available, allowing all tokens")
+        return True
     
-    # Check leveraged tokens (numbers + L/S pattern)
-    if re.search(r'(\d+[LS])$', symbol_upper):
-        return True, "leveraged"
+    # Map the symbol to Pionex format
+    pionex_symbol = map_coingecko_to_pionex_symbol(coingecko_symbol)
     
-    # Check for common wrapped patterns
-    if (symbol_upper.startswith('W') and len(symbol_upper) > 1 and 
-        symbol_upper[1:] in ['BTC', 'ETH', 'SOL', 'BNB', 'MATIC', 'AVAX']):
-        return True, "wrapped_pattern"
+    # Check if the token is supported
+    is_supported = pionex_symbol in supported_tokens
     
-    # Check for USD/stable patterns in name
-    if any(pattern in name_upper for pattern in ['USD COIN', 'TETHER', 'BINANCE USD', 'DAI STABLECOIN']):
-        return True, "stablecoin_name"
+    if not is_supported:
+        logging.debug(f"Token {coingecko_symbol} ({coingecko_id}) not supported on Pionex")
     
-    # Check for wrapped patterns in name
-    if any(pattern in name_upper for pattern in ['WRAPPED', 'WORMHOLE', 'BRIDGE']):
-        return True, "wrapped_name"
-    
-    return False, None
+    return is_supported
 
 def send_telegram(message):
     token_source = "GitHub Secrets" if os.getenv('TELEGRAM_TOKEN') else "fallback"
@@ -93,7 +121,6 @@ def send_telegram(message):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Remove parse_mode to avoid markdown issues
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
     try:
         response = requests.post(url, data=payload, timeout=10)
@@ -121,56 +148,56 @@ def send_telegram(message):
 
 def fetch_market_data():
     logging.info("Fetching market data from CoinGecko...")
-    url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={TOP_COINS_LIMIT}&page=1&sparkline=true"
+    url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=true"
     response = requests.get(url, timeout=10)
     response.raise_for_status()
     
-    # Initial filtering by volume and price
-    data = [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
-    logging.info(f"After volume/price filter: {len(data)} coins")
+    # Get Pionex supported tokens first
+    get_pionex_supported_tokens()  # This will populate the cache
     
-    # Filter out unwanted tokens - Fixed: Initialize with all possible keys
-    filtered_data = []
-    excluded_count = {
-        "wrapped": 0, 
-        "stablecoin": 0, 
-        "leveraged": 0, 
-        "excluded": 0, 
-        "wrapped_pattern": 0,
-        "stablecoin_name": 0,
-        "wrapped_name": 0
-    }
+    # Initial filtering by volume, price, and Pionex support
+    data = []
+    pionex_filtered_count = 0
+    volume_filtered_count = 0
     
-    for coin in data:
-        is_excluded, reason = is_excluded_token(coin['symbol'], coin['name'])
-        if is_excluded:
-            excluded_count[reason] += 1
-            logging.debug(f"Excluded {coin['symbol']} ({coin['name']}) - Reason: {reason}")
-        else:
-            filtered_data.append(coin)
+    for coin in response.json():
+        # Check volume and price first
+        if coin['total_volume'] <= MIN_VOLUME or coin['current_price'] <= MIN_PRICE:
+            volume_filtered_count += 1
+            continue
+            
+        # Check if token is supported on Pionex
+        if not is_token_supported_on_pionex(coin['symbol'], coin['id']):
+            pionex_filtered_count += 1
+            continue
+            
+        data.append(coin)
     
-    logging.info(f"Exclusion summary: {dict(excluded_count)}")
-    logging.info(f"After token filtering: {len(filtered_data)} coins")
+    logging.info(f"Filtering results:")
+    logging.info(f"  - Volume/price filtered: {volume_filtered_count}")
+    logging.info(f"  - Not supported on Pionex: {pionex_filtered_count}")
+    logging.info(f"  - Remaining tokens: {len(data)}")
     
     # Separate main tokens from smaller tokens
     main_tokens_found = []
     smaller_tokens = []
     
-    # First, find main tokens in the filtered data
-    for coin in filtered_data:
+    # Find main tokens in the filtered data
+    for coin in data:
         if coin['id'] in MAIN_TOKENS:
             main_tokens_found.append(coin)
-            logging.info(f"Found main token in filtered data: {coin['symbol']} ({coin['id']})")
+            logging.info(f"Found main token supported on Pionex: {coin['symbol']} ({coin['id']})")
     
-    # Get smaller tokens (excluding top 20 from filtered data)
-    for i, coin in enumerate(filtered_data):
-        if i >= TOP_COINS_TO_EXCLUDE and coin['id'] not in MAIN_TOKENS:
+    # Get smaller tokens (excluding top 20 by market cap)
+    sorted_data = sorted(data, key=lambda x: x['market_cap'], reverse=True)
+    for i, coin in enumerate(sorted_data):
+        if i >= 20 and coin['id'] not in MAIN_TOKENS:  # Skip top 20 by market cap
             smaller_tokens.append(coin)
     
-    logging.info(f"Main tokens found: {len(main_tokens_found)}")
-    logging.info(f"Smaller tokens after top {TOP_COINS_TO_EXCLUDE} exclusion: {len(smaller_tokens)}")
+    logging.info(f"Main tokens found on Pionex: {len(main_tokens_found)}")
+    logging.info(f"Smaller tokens after top 20 exclusion: {len(smaller_tokens)}")
     
-    # Try to fetch missing main tokens directly
+    # Try to fetch missing main tokens directly if they're supported on Pionex
     missing_main_tokens = [token_id for token_id in MAIN_TOKENS 
                           if not any(coin['id'] == token_id for coin in main_tokens_found)]
     
@@ -191,14 +218,13 @@ def fetch_market_data():
                             direct_data[0]['total_volume'] > MIN_VOLUME and 
                             direct_data[0]['current_price'] > MIN_PRICE):
                             
-                            # Check if this variant should be excluded
-                            is_excluded, reason = is_excluded_token(direct_data[0]['symbol'], direct_data[0]['name'])
-                            if not is_excluded:
-                                logging.info(f"Successfully fetched {variant}: {direct_data[0]['symbol']}")
+                            # Check if this variant is supported on Pionex
+                            if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
+                                logging.info(f"Successfully fetched {variant} (Pionex supported): {direct_data[0]['symbol']}")
                                 main_tokens_found.append(direct_data[0])
                                 break
                             else:
-                                logging.warning(f"Fetched {variant} but it was excluded: {reason}")
+                                logging.info(f"Fetched {variant} but not supported on Pionex")
                     except requests.exceptions.RequestException as e:
                         logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
                         if attempt < 2:
@@ -222,14 +248,13 @@ def fetch_market_data():
                         direct_data[0]['total_volume'] > MIN_VOLUME and 
                         direct_data[0]['current_price'] > MIN_PRICE):
                         
-                        # Check if this token should be excluded
-                        is_excluded, reason = is_excluded_token(direct_data[0]['symbol'], direct_data[0]['name'])
-                        if not is_excluded:
-                            logging.info(f"Successfully fetched {token_id}: {direct_data[0]['symbol']}")
+                        # Check if this token is supported on Pionex
+                        if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
+                            logging.info(f"Successfully fetched {token_id} (Pionex supported): {direct_data[0]['symbol']}")
                             main_tokens_found.append(direct_data[0])
                             break
                         else:
-                            logging.warning(f"Fetched {token_id} but it was excluded: {reason}")
+                            logging.info(f"Fetched {token_id} but not supported on Pionex")
                 except requests.exceptions.RequestException as e:
                     logging.error(f"Direct fetch attempt {attempt + 1} for {token_id} failed: {e}")
                     if attempt < 2:
@@ -240,7 +265,7 @@ def fetch_market_data():
     # Combine main tokens and smaller tokens
     final_tokens = main_tokens_found + smaller_tokens
     
-    logging.info(f"Final token breakdown:")
+    logging.info(f"Final Pionex-compatible token breakdown:")
     logging.info(f"  Main tokens: {len(main_tokens_found)} - {[coin['symbol'] for coin in main_tokens_found]}")
     logging.info(f"  Smaller tokens: {len(smaller_tokens)}")
     logging.info(f"  Total tokens: {len(final_tokens)}")
@@ -304,6 +329,7 @@ def get_enhanced_grid_setup(coin, rsi):
     - Trading volume
     - RSI signals
     - Recent price action
+    - Pionex-specific optimizations
     """
     current_price = coin['current_price']
     sparkline = coin['sparkline_in_7d']['price'][-20:]  # Use more data points
@@ -314,10 +340,10 @@ def get_enhanced_grid_setup(coin, rsi):
     volatility = calculate_volatility(sparkline)
     market_tier = get_market_cap_tier(market_cap)
     
-    # Base parameters by market cap tier
+    # Base parameters by market cap tier (optimized for Pionex)
     tier_params = {
-        "mega": {"base_spacing": 0.003, "safety_buffer": 0.08, "max_grids": 150},
-        "large": {"base_spacing": 0.004, "safety_buffer": 0.10, "max_grids": 120},
+        "mega": {"base_spacing": 0.003, "safety_buffer": 0.08, "max_grids": 200},
+        "large": {"base_spacing": 0.004, "safety_buffer": 0.10, "max_grids": 150},
         "mid": {"base_spacing": 0.006, "safety_buffer": 0.12, "max_grids": 100},
         "small": {"base_spacing": 0.008, "safety_buffer": 0.15, "max_grids": 80}
     }
@@ -408,7 +434,7 @@ def get_enhanced_grid_setup(coin, rsi):
     # Calculate expected daily cycles based on volatility
     daily_cycles = int(volatility * 100 * 2)  # Rough estimate
     
-    # Advanced settings
+    # Pionex-specific settings
     trailing_enabled = "Yes" if market_tier in ["mega", "large"] and direction != "Neutral" else "No"
     stop_loss = "5%" if market_tier == "small" and direction != "Neutral" else "Disabled"
     
@@ -429,7 +455,7 @@ def get_enhanced_grid_setup(coin, rsi):
 
 def main():
     try:
-        logging.info("Starting enhanced grid analysis...")
+        logging.info("Starting Pionex-enhanced grid analysis...")
         market_data = fetch_market_data()
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
@@ -437,9 +463,12 @@ def main():
         small_alerts = []
 
         if not market_data:
-            logging.info("No market data available, sending empty alert")
-            send_telegram(f"🤖 ENHANCED GRID TRADING ALERT — {ts}\nNo suitable grid trading opportunities this hour.")
+            logging.info("No Pionex-compatible market data available, sending empty alert")
+            send_telegram(f"🤖 PIONEX GRID TRADING ALERT — {ts}\n❌ No suitable Pionex-compatible grid trading opportunities this hour.\n💡 Check back later for new opportunities!")
             return
+
+        # Get count of supported tokens for context
+        supported_count = len(get_pionex_supported_tokens())
 
         for coin in market_data:
             id_ = coin['id']
@@ -458,12 +487,12 @@ def main():
             low_fmt = format_price(grid_params['min_price'])
             high_fmt = format_price(grid_params['max_price'])
             
-            # Create comprehensive alert without markdown escaping
+            # Create comprehensive alert
             confidence_emoji = "🔥" if grid_params['direction_confidence'] == "High" else "⚡"
             direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
             
             alert = f"{direction_emoji} {symbol} RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
-            alert += f"📊 COMPLETE GRID SETUP\n"
+            alert += f"📊 PIONEX GRID SETUP\n"
             alert += f"• Price Range: {low_fmt} - {high_fmt}\n"
             alert += f"• Grid Count: {grid_params['grids']} grids\n"
             alert += f"• Grid Mode: {grid_params['mode']}\n"
@@ -471,7 +500,7 @@ def main():
             alert += f"• Trailing: {grid_params['trailing']}\n"
             alert += f"• Stop Loss: {grid_params['stop_loss']}\n"
             alert += f"• Expected Cycles/Day: ~{grid_params['expected_daily_cycles']}\n"
-            alert += f"• Volatility: {grid_params['volatility']:.1%} ({grid_params['mode']} recommended)\n"
+            alert += f"• Volatility: {grid_params['volatility']:.1%}\n"
             
             # Add reasoning
             if rsi <= 35:
@@ -488,8 +517,9 @@ def main():
             else:
                 small_alerts.append(alert)
 
-        # Compose final message without markdown
-        message = f"🤖 ENHANCED GRID TRADING ALERTS — {ts}\n\n"
+        # Compose final message
+        message = f"🤖 PIONEX GRID TRADING ALERTS — {ts}\n"
+        message += f"📊 Analyzed {supported_count} Pionex-supported tokens\n\n"
         
         if main_alerts:
             message += "🏆 MAIN TOKENS\n" + '\n\n'.join(main_alerts) + '\n\n'
@@ -499,18 +529,19 @@ def main():
         
         if not main_alerts and not small_alerts:
             message += '❌ No suitable grid trading opportunities this hour.\n'
-            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.'
+            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.\n'
+            message += f'💡 Monitoring {supported_count} Pionex tokens for next opportunity.'
 
-        logging.info(f"Sending enhanced Telegram message: {message[:100]}...")
+        logging.info(f"Sending Pionex-enhanced Telegram message: {message[:100]}...")
         send_telegram(message)
-        logging.info("Enhanced grid analysis completed")
+        logging.info("Pionex-enhanced grid analysis completed")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"API Error: {e}")
-        send_telegram(f"API Error: {e}")
+        send_telegram(f"🚨 Pionex Grid Bot API Error: {e}")
     except Exception as e:
         logging.error(f"Unexpected Error: {e}")
-        send_telegram(f"Unexpected Error: {e}")
+        send_telegram(f"🚨 Pionex Grid Bot Unexpected Error: {e}")
 
 if __name__ == "__main__":
     main()
