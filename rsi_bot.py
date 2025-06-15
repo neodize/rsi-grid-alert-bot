@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-Pionex Futures‑Grid Scanner  (rsi_bot.py)
-
-• Data source: Pionex REST API (PERP pairs only)
-• Main tokens: BTC, ETH, SOL, HYPE
-• Telegram output:
-    🏆 MAIN TOKENS          – all main tokens that pass filters
-    💎 SMALLER OPPORTUNITIES – highest‑scoring non‑main pairs (max 5)
-
-Author  : ChatGPT
-Updated : 2025‑06‑16
-"""
-
 import os
 import logging
 from datetime import datetime, timezone
@@ -290,9 +276,26 @@ def build_alert(an, meta):
     # Market cap category
     market_cap = an.get_market_cap_category()
     
+    # Grid parameters
+    grid_params = an.get_grid_params(rsi_val, volatility_pct)
+    
+    # Stop loss for small tokens
+    is_main = an.symbol.upper() in MAIN_TOKENS
+    stop_loss = "Disabled" if is_main else "5%"
+    trailing = "Yes" if is_main else "No"
+    
     # Build the alert
     text = f"{direction_emoji} *{an.symbol}* RSI {rsi_val:.1f} | {market_cap}\n"
-    text += f"💡 *Analysis:* {direction_desc}. Recommended for {direction} bias grid.\n"
+    text += f"📊 *GRID SETUP*\n\n"
+    text += f"*Price Range:* {fmt_price(grid_params['lower_bound'])} - {fmt_price(grid_params['upper_bound'])}\n"
+    text += f"*Grid Count:* {grid_params['grid_count']} grids\n"
+    text += f"*Grid Mode:* {grid_params['grid_mode']}\n"
+    text += f"*Direction:* {direction} {quality}\n"
+    text += f"*Trailing:* {trailing}\n"
+    text += f"*Stop Loss:* {stop_loss}\n"
+    text += f"*Expected Cycles/Day:* ~{grid_params['cycles_per_day']}\n"
+    text += f"*Volatility:* {volatility_pct:.1f}% ({grid_params['grid_mode']} recommended)\n\n"
+    text += f"💡 *Analysis:* {direction_desc}. Recommended for {direction} bias grid."
     
     return text
 
