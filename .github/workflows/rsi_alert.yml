@@ -1,0 +1,93 @@
+name: Grid Trading Scanner
+on:
+  schedule:
+    # Every 4 hours for opportunity detection
+    - cron: '0 */4 * * *'  # Runs at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+    # Daily summary at 8 AM UTC
+    - cron: '0 8 * * *'    # Daily at 8:00 AM UTC
+  workflow_dispatch:  # Allows manual triggering
+    inputs:
+      force_summary:
+        description: 'Force daily summary regardless of opportunities'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  opportunity-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Cancel job if it takes >10 minutes
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'  # Specific version for consistency
+          
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+            
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          
+      - name: Check secrets
+        run: |
+          if [ -z "${{ secrets.TELEGRAM_TOKEN }}" ] || [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set in repository secrets"
+            exit 1
+          else
+            echo "Secrets are properly configured"
+          fi
+          
+      - name: Run opportunity scanner
+        run: python rsi_bot.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_DAILY_SUMMARY: ${{ github.event.inputs.force_summary || 'false' }}
+          
+      - name: Notify on failure
+        if: failure()
+        run: |
+          curl -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          -d text="⚠️ Grid Trading Scanner workflow failed! Check GitHub Actions logs for details." || true
+        continue-on-error: true
+
+  # Optional: Weekly deep analysis job
+  weekly-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Run every Sunday at 10 AM UTC
+    if: github.event.schedule == '0 10 * * 0'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          
+      - name: Run weekly analysis
+        run: python rsi_bot.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_DAILY_SUMMARY: 'true'  # Always send summary for weekly analysis
