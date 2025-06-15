@@ -3,102 +3,108 @@ import time
 from datetime import datetime, timezone
 import os
 import re
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Configuration
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
-TOP_COINS_LIMIT = 50  # Number of top coins by market cap to scan
-MIN_VOLUME = 10_000_000  # Minimum daily trading volume in USD
-MIN_PRICE = 0.01  # Minimum price to filter out micro-cap tokens
-TOP_COINS_TO_EXCLUDE = 20  # Exclude top 20 coins to focus on smaller tokens
-MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']  # Prioritized tokens
-HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']  # Possible ID variants for HYPE
+TOP_COINS_LIMIT = 50
+MIN_VOLUME = 10_000_000
+MIN_PRICE = 0.01
+TOP_COINS_TO_EXCLUDE = 20
+MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']
+HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']
 
 def send_telegram(message):
+    token_source = "GitHub Secrets" if os.getenv('TELEGRAM_TOKEN') else "fallback"
+    chat_id_source = "GitHub Secrets" if os.getenv('TELEGRAM_CHAT_ID') else "fallback"
+    logging.info(f"Attempting to send Telegram message using token from {token_source} and chat_id from {chat_id_source}")
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Warning: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set, skipping Telegram message: {message[:50]}...")
+        logging.warning(f"TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set, skipping message: {message[:50]}...")
         return
-    
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
         response = requests.post(url, data=payload, timeout=10)
         response.raise_for_status()
-        print(f"Telegram sent successfully: {message[:50]}...")
+        logging.info(f"Telegram sent successfully: {message[:50]}...")
     except requests.exceptions.RequestException as e:
         error_details = f"Telegram send failed: {e}, status: {getattr(e.response, 'status_code', 'N/A')}"
         if hasattr(e.response, 'text'):
             error_details += f", response: {e.response.text}"
         error_details += f", token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
-        print(error_details)
-        time.sleep(60)  # Retry after 1 minute
+        logging.error(error_details)
+        time.sleep(60)
         try:
             response = requests.post(url, data=payload, timeout=10)
             response.raise_for_status()
-            print(f"Telegram retry succeeded: {message[:50]}...")
+            logging.info(f"Telegram retry succeeded: {message[:50]}...")
         except requests.exceptions.RequestException as e2:
             error_details = f"Telegram retry failed: {e2}, status: {getattr(e2.response, 'status_code', 'N/A')}"
             if hasattr(e2.response, 'text'):
                 error_details += f", response: {e2.response.text}"
             error_details += f", token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
-            print(error_details)
-            print(f"Warning: Skipping Telegram message due to persistent failure: {message[:50]}...")
+            logging.error(error_details)
+            logging.warning(f"Skipping Telegram message due to persistent failure: {message[:50]}...")
             return
 
 def fetch_market_data():
-    print("Fetching market data from CoinGecko...")
+    logging.info("Fetching market data from CoinGecko...")
     url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={TOP_COINS_LIMIT}&page=1&sparkline=true"
     response = requests.get(url, timeout=10)
     response.raise_for_status()
     data = [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
-    print(f"Filtered data count: {len(data)}")
-    # Exclude table coins (e.g., BTC3L, ETH3S)
+    logging.info(f"Filtered data count: {len(data)}")
     filtered_data = [coin for coin in data if not re.search(r'(\d+[LS])$', coin['symbol'].upper())]
-    print(f"After table coin filter: {len(filtered_data)}")
-    # Exclude top 20 coins but ensure main tokens are included
+    logging.info(f"After table coin filter: {len(filtered_data)}")
     smaller_tokens = [coin for coin in filtered_data if filtered_data.index(coin) >= TOP_COINS_TO_EXCLUDE]
-    print(f"After top 20 exclusion: {len(smaller_tokens)}")
-    # Add main tokens if not already in the list
+    logging.info(f"After top 20 exclusion: {len(smaller_tokens)}")
     for token_id in MAIN_TOKENS:
         if not any(coin['id'] == token_id for coin in smaller_tokens):
             main_coin = next((coin for coin in data if coin['id'] == token_id), None)
             if main_coin:
-                print(f"Adding main token from initial data: {token_id}")
+                logging.info(f"Adding main token from initial data: {token_id}")
                 smaller_tokens.append(main_coin)
             else:
-                # Handle HYPE specifically with variants and retries
                 if token_id == 'hyperliquid':
                     for variant in HYPE_VARIANTS:
-                        for attempt in range(3):  # Retry up to 3 times
+                        for attempt in range(3):
                             try:
                                 direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={variant}&sparkline=true"
                                 direct_response = requests.get(direct_url, timeout=10)
                                 direct_response.raise_for_status()
                                 direct_data = direct_response.json()
                                 if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
-                                    print(f"Direct fetch success for {variant}")
+                                    logging.info(f"Direct fetch success for {variant}")
                                     smaller_tokens.append(direct_data[0])
                                     break
                             except requests.exceptions.RequestException as e:
-                                print(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
-                                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                                logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
+                                time.sleep(2 ** attempt)
                                 if attempt == 2:
-                                    print(f"Failed to fetch {variant} after 3 attempts")
+                                    logging.error(f"Failed to fetch {variant} after 3 attempts")
                 else:
-                    # Direct fetch for other main tokens
                     direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
-                    direct_response = requests.get(direct_url, timeout=10)
-                    direct_response.raise_for_status()
-                    direct_data = direct_response.json()
-                    if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
-                        print(f"Direct fetch success for {token_id}")
-                        smaller_tokens.append(direct_data[0])
-    print(f"Final market data count: {len(smaller_tokens)}")
+                    try:
+                        direct_response = requests.get(direct_url, timeout=10)
+                        direct_response.raise_for_status()
+                        direct_data = direct_response.json()
+                        if direct_data and direct_data[0]['total_volume'] > MIN_VOLUME and direct_data[0]['current_price'] > MIN_PRICE:
+                            logging.info(f"Direct fetch success for {token_id}")
+                            smaller_tokens.append(direct_data[0])
+                    except requests.exceptions.RequestException as e:
+                        logging.error(f"Direct fetch failed for {token_id}: {e}")
+    logging.info(f"Final market data count: {len(smaller_tokens)}")
     return smaller_tokens
 
 def calc_rsi(prices):
-    if len(prices) < 15:  # Need at least 15 points for 14-period RSI
+    if len(prices) < 15:
         return None
     gains = []
     losses = []
@@ -126,13 +132,13 @@ def format_price(value):
 def get_grid_setup(price, sparkline):
     min_price = min(sparkline) * 0.95
     max_price = max(sparkline) * 1.05
-    interval = price * 0.005  # 0.5% of current price
+    interval = price * 0.005
     grids = max(10, min(500, round((max_price - min_price) / interval)))
     return min_price, max_price, grids
 
 def main():
     try:
-        print("Starting scan...")
+        logging.info("Starting scan...")
         market_data = fetch_market_data()
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
@@ -140,7 +146,7 @@ def main():
         small_alerts = []
 
         if not market_data:
-            print("No market data available, sending empty alert")
+            logging.info("No market data available, sending empty alert")
             send_telegram(f"*HOURLY GRID TRADING ALERT — {ts}*\nNo suitable grid trading opportunities this hour.")
             return
 
@@ -148,7 +154,7 @@ def main():
             id_ = coin['id']
             current_price = coin['current_price']
             symbol = coin['symbol'].upper()
-            sparkline = coin['sparkline_in_7d']['price'][-15:]  # Last 15 points
+            sparkline = coin['sparkline_in_7d']['price'][-15:]
             rsi = calc_rsi(sparkline)
 
             if rsi is None:
@@ -186,15 +192,15 @@ def main():
         if not main_alerts and not small_alerts:
             message += '\nNo suitable grid trading opportunities this hour.'
 
-        print(f"Sending Telegram message: {message[:50]}...")
+        logging.info(f"Sending Telegram message: {message[:50]}...")
         send_telegram(message)
-        print("Scan completed")
+        logging.info("Scan completed")
 
     except requests.exceptions.RequestException as e:
-        print(f"API Error: {e}")
+        logging.error(f"API Error: {e}")
         send_telegram(f"API Error: {e}")
     except Exception as e:
-        print(f"Unexpected Error: {e}")
+        logging.error(f"Unexpected Error: {e}")
         send_telegram(f"Unexpected Error: {e}")
 
 if __name__ == "__main__":
