@@ -297,7 +297,9 @@ def format_price(value):
 
 def escape_markdown(text):
     """Escape special characters for Telegram markdown"""
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    # Only escape characters that actually need escaping in Telegram MarkdownV2
+    # For price formatting, we don't need to escape dots and dashes
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '=', '|', '{', '}', '!']
     for char in special_chars:
         text = text.replace(char, f'\\{char}')
     return text
@@ -486,24 +488,24 @@ def main():
             confidence_emoji = "🔥" if grid_params['direction_confidence'] == "High" else "⚡"
             direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
             
-            alert = f"{direction_emoji} *{symbol}* RSI {rsi:.1f} \\| {grid_params['market_tier'].upper()}\\-CAP\n"
+            alert = f"{direction_emoji} *{symbol}* RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
             alert += f"📊 *COMPLETE GRID SETUP*\n"
-            alert += f"• Price Range: `{escape_markdown(low_fmt)} - {escape_markdown(high_fmt)}`\n"
+            alert += f"• Price Range: `{low_fmt} - {high_fmt}`\n"
             alert += f"• Grid Count: `{grid_params['grids']} grids`\n"
             alert += f"• Grid Mode: `{grid_params['mode']}`\n"
             alert += f"• Direction: `{grid_params['direction']}` {confidence_emoji}\n"
             alert += f"• Trailing: `{grid_params['trailing']}`\n"
             alert += f"• Stop Loss: `{grid_params['stop_loss']}`\n"
             alert += f"• Expected Cycles/Day: `~{grid_params['expected_daily_cycles']}`\n"
-            alert += f"• Volatility: `{grid_params['volatility']:.1%}` \\({grid_params['mode']} recommended\\)\n"
+            alert += f"• Volatility: `{grid_params['volatility']:.1%}` ({grid_params['mode']} recommended)\n"
             
             # Add reasoning
             if rsi <= 35:
-                reason = f"Oversold conditions suggest potential rebound\\. Recommended for Long bias grid\\."
+                reason = f"Oversold conditions suggest potential rebound. Recommended for Long bias grid."
             elif rsi >= 65:
-                reason = f"Overbought conditions suggest potential decline\\. Recommended for Short bias grid\\."
+                reason = f"Overbought conditions suggest potential decline. Recommended for Short bias grid."
             else:
-                reason = f"Neutral RSI perfect for range\\-bound grid trading\\. High profit potential from volatility\\."
+                reason = f"Neutral RSI perfect for range-bound grid trading. High profit potential from volatility."
             
             alert += f"\n💡 *Analysis*: {reason}"
             
@@ -519,11 +521,12 @@ def main():
             message += "*🏆 MAIN TOKENS*\n" + '\n\n'.join(main_alerts) + '\n\n'
         
         if small_alerts:
-            message += "*💎 SMALLER OPPORTUNITIES*\n" + '\n\n'.join(small_alerts[:2])  # Limit to 2 for message size
+            # Show more small opportunities (up to 5 instead of just 2)
+            message += "*💎 SMALLER OPPORTUNITIES*\n" + '\n\n'.join(small_alerts[:5])
         
         if not main_alerts and not small_alerts:
-            message += '❌ No suitable grid trading opportunities this hour\\.\n'
-            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading\\.'
+            message += '❌ No suitable grid trading opportunities this hour.\n'
+            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.'
 
         logging.info(f"Sending enhanced Telegram message: {message[:100]}...")
         send_telegram(message)
