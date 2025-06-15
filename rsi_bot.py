@@ -114,7 +114,7 @@ def get_grid_setup(price, sparkline):
     max_price = max(sparkline) * 1.05
     interval = price * 0.005  # 0.5% of current price
     grids = max(10, min(500, round((max_price - min_price) / interval)))
-    return min_price, grid_high, grids
+    return min_price, max_price, grids
 
 def main():
     try:
