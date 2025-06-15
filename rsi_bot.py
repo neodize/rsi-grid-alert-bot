@@ -2,87 +2,73 @@ import requests
 import time
 from datetime import datetime, timezone
 import os
+import re
 import logging
 import math
 
-# ────────────────────────────────────
-# Logging
-# ────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ────────────────────────────────────
 # Configuration
-# ────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN',
-                           '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')
-
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
-PIONEX_API    = 'https://api.pionex.com/api/v1'
-
+PIONEX_API = 'https://api.pionex.com/api/v1'
 MIN_VOLUME = 10_000_000
-MIN_PRICE  = 0.01
-
-# Main tokens, now INCLUDING HYPE
-MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana',
-               'hyperliquid', 'hyperliquid-hype']
-
-# Variants we try when pulling Hyperliquid data directly
+MIN_PRICE = 0.01
+MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']
 HYPE_VARIANTS = ['hyperliquid', 'hyperliquid-hype']
 
-# Cache for Pionex‑supported base symbols
+# Cache for Pionex supported tokens
 PIONEX_SUPPORTED_TOKENS = set()
 
-# ────────────────────────────────────
-# Helpers
-# ────────────────────────────────────
 def get_pionex_supported_tokens():
     """
-    Fetch PERP/USDT bases that are enabled on Pionex.
-    Spot pairs are counted for logging but NOT whitelisted.
+    Fetch all supported trading pairs from Pionex API and extract base currencies
     """
     global PIONEX_SUPPORTED_TOKENS
-    if PIONEX_SUPPORTED_TOKENS:
+    
+    if PIONEX_SUPPORTED_TOKENS:  # Return cached data if available
         return PIONEX_SUPPORTED_TOKENS
-
+    
     try:
-        logging.info("Fetching supported tokens from Pionex API…")
+        logging.info("Fetching supported tokens from Pionex API...")
         url = f"{PIONEX_API}/common/symbols"
-        r   = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
         if 'data' not in data or 'symbols' not in data['data']:
             logging.error("Unexpected Pionex API response format")
             return set()
-
+        
         supported_tokens = set()
         spot_pairs = 0
         perp_pairs = 0
-
-        for s in data['data']['symbols']:
-            if not s.get('enable', False):
+        
+        for symbol_info in data['data']['symbols']:
+            # Only consider enabled trading pairs
+            if not symbol_info.get('enable', False):
                 continue
-
-            symbol_type    = s.get('type', '')
-            base_currency  = s.get('baseCurrency', '').upper()
-            quote_currency = s.get('quoteCurrency', '').upper()
-
-            # --- PERP focus -------------------------------------------------
-            if symbol_type == 'PERP' and quote_currency == 'USDT' and base_currency:
+                
+            symbol_type = symbol_info.get('type', '')
+            base_currency = symbol_info.get('baseCurrency', '').upper()
+            quote_currency = symbol_info.get('quoteCurrency', '').upper()
+            
+            # Focus on SPOT pairs with USDT as quote currency for grid trading
+            if symbol_type == 'SPOT' and quote_currency == 'USDT' and base_currency:
                 supported_tokens.add(base_currency)
-                perp_pairs += 1
-            # ----------------------------------------------------------------
-            elif symbol_type == 'SPOT':
                 spot_pairs += 1
-
+            elif symbol_type == 'PERP':
+                perp_pairs += 1
+        
         PIONEX_SUPPORTED_TOKENS = supported_tokens
-        logging.info(f"Pionex supports {len(supported_tokens)} PERP tokens with USDT pairs")
+        logging.info(f"Pionex supports {len(supported_tokens)} SPOT tokens with USDT pairs")
         logging.info(f"Found {spot_pairs} SPOT pairs and {perp_pairs} PERP pairs")
-        logging.info(f"Sample PERP bases: {list(supported_tokens)[:10]}")
+        logging.info(f"Sample supported tokens: {list(supported_tokens)[:10]}")
+        
         return supported_tokens
-
+        
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to fetch Pionex supported tokens: {e}")
         return set()
@@ -90,110 +76,211 @@ def get_pionex_supported_tokens():
         logging.error(f"Error processing Pionex API response: {e}")
         return set()
 
-def map_coingecko_to_pionex_symbol(sym):
-    """Translate CoinGecko symbol → Pionex base symbol if needed."""
-    mappings = {'WBTC': 'BTC', 'WETH': 'ETH'}
-    return mappings.get(sym.upper(), sym.upper())
+def map_coingecko_to_pionex_symbol(coingecko_symbol):
+    """
+    Map CoinGecko symbol to Pionex symbol format
+    Some tokens might have different symbols between platforms
+    """
+    # Common mappings
+    symbol_mappings = {
+        'WBTC': 'BTC',  # Wrapped Bitcoin might be listed as BTC on Pionex
+        'WETH': 'ETH',  # Wrapped Ethereum might be listed as ETH on Pionex
+        # Add more mappings as needed
+    }
+    
+    return symbol_mappings.get(coingecko_symbol.upper(), coingecko_symbol.upper())
 
-def is_token_supported_on_pionex(symbol, cg_id):
-    tok_set = get_pionex_supported_tokens()
-    if not tok_set:
-        logging.warning("No Pionex supported tokens cached—allowing all tokens")
+def is_token_supported_on_pionex(coingecko_symbol, coingecko_id):
+    """
+    Check if a token from CoinGecko is supported on Pionex
+    """
+    supported_tokens = get_pionex_supported_tokens()
+    if not supported_tokens:
+        logging.warning("No Pionex supported tokens available, allowing all tokens")
         return True
-    return map_coingecko_to_pionex_symbol(symbol) in tok_set
+    
+    # Map the symbol to Pionex format
+    pionex_symbol = map_coingecko_to_pionex_symbol(coingecko_symbol)
+    
+    # Check if the token is supported
+    is_supported = pionex_symbol in supported_tokens
+    
+    if not is_supported:
+        logging.debug(f"Token {coingecko_symbol} ({coingecko_id}) not supported on Pionex")
+    
+    return is_supported
 
-def send_telegram(msg):
+def send_telegram(message):
+    token_source = "GitHub Secrets" if os.getenv('TELEGRAM_TOKEN') else "fallback"
+    chat_id_source = "GitHub Secrets" if os.getenv('TELEGRAM_CHAT_ID') else "fallback"
+    logging.info(f"Attempting to send Telegram message using token from {token_source} and chat_id from {chat_id_source}")
+    logging.info(f"Token (partial): {TELEGRAM_TOKEN[:10]}..., Chat ID: {TELEGRAM_CHAT_ID}")
+
     if not TELEGRAM_TOKEN.strip() or not TELEGRAM_CHAT_ID.strip():
-        logging.warning("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID empty—skip Telegram")
+        logging.warning(f"TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is empty or unset, skipping message: {message[:50]}...")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': msg}
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
     try:
-        requests.post(url, data=payload, timeout=10).raise_for_status()
-        logging.info("Telegram message sent")
+        response = requests.post(url, data=payload, timeout=10)
+        response.raise_for_status()
+        logging.info(f"Telegram sent successfully: {message[:50]}...")
     except requests.exceptions.RequestException as e:
-        logging.error(f"Telegram send failed: {e}")
-        # single retry after 60 s
+        error_details = f"Telegram send failed: {e}, status: {getattr(e.response, 'status_code', 'N/A')}"
+        if hasattr(e.response, 'text'):
+            error_details += f", response: {e.response.text}"
+        error_details += f", token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
+        logging.error(error_details)
         time.sleep(60)
         try:
-            requests.post(url, data=payload, timeout=10).raise_for_status()
-            logging.info("Telegram retry succeeded")
-        except Exception as e2:
-            logging.error(f"Telegram retry failed: {e2}")
+            response = requests.post(url, data=payload, timeout=10)
+            response.raise_for_status()
+            logging.info(f"Telegram retry succeeded: {message[:50]}...")
+        except requests.exceptions.RequestException as e2:
+            error_details = f"Telegram retry failed: {e2}, status: {getattr(e2.response, 'status_code', 'N/A')}"
+            if hasattr(e2.response, 'text'):
+                error_details += f", response: {e2.response.text}"
+            error_details += f", token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
+            logging.error(error_details)
+            logging.warning(f"Skipping Telegram message due to persistent failure: {message[:50]}...")
+            return
 
-# ────────────────────────────────────
-# Market‑data fetch & filtering
-# ────────────────────────────────────
 def fetch_market_data():
-    logging.info("Fetching market data from CoinGecko…")
-    url = (f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc"
-           "&per_page=250&page=1&sparkline=true")
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-
-    # Ensure PERP support list is cached first
-    get_pionex_supported_tokens()
-
+    logging.info("Fetching market data from CoinGecko...")
+    url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=true"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    
+    # Get Pionex supported tokens first
+    get_pionex_supported_tokens()  # This will populate the cache
+    
+    # Initial filtering by volume, price, and Pionex support
     data = []
-    pionex_filtered = 0
-    vol_price_filtered = 0
-
-    for coin in r.json():
+    pionex_filtered_count = 0
+    volume_filtered_count = 0
+    
+    for coin in response.json():
+        # Check volume and price first
         if coin['total_volume'] <= MIN_VOLUME or coin['current_price'] <= MIN_PRICE:
-            vol_price_filtered += 1
+            volume_filtered_count += 1
             continue
+            
+        # Check if token is supported on Pionex
         if not is_token_supported_on_pionex(coin['symbol'], coin['id']):
-            pionex_filtered += 1
+            pionex_filtered_count += 1
             continue
+            
         data.append(coin)
-
-    logging.info("Filtering results:")
-    logging.info(f"  • Volume/price filtered: {vol_price_filtered}")
-    logging.info(f"  • Not PERP‑supported on Pionex: {pionex_filtered}")
-    logging.info(f"  • Remaining tokens: {len(data)}")
-
-    # Separate into main tokens & smaller opportunities
-    main_tokens = [c for c in data if c['id'] in MAIN_TOKENS]
+    
+    logging.info(f"Filtering results:")
+    logging.info(f"  - Volume/price filtered: {volume_filtered_count}")
+    logging.info(f"  - Not supported on Pionex: {pionex_filtered_count}")
+    logging.info(f"  - Remaining tokens: {len(data)}")
+    
+    # Separate main tokens from smaller tokens
+    main_tokens_found = []
+    smaller_tokens = []
+    
+    # Find main tokens in the filtered data
+    for coin in data:
+        if coin['id'] in MAIN_TOKENS:
+            main_tokens_found.append(coin)
+            logging.info(f"Found main token supported on Pionex: {coin['symbol']} ({coin['id']})")
+    
+    # Get smaller tokens (excluding top 20 by market cap)
     sorted_data = sorted(data, key=lambda x: x['market_cap'], reverse=True)
-    smaller_tokens = [c for i, c in enumerate(sorted_data)
-                      if i >= 20 and c['id'] not in MAIN_TOKENS]
-
-    # Try to fetch any missing main tokens directly (handles HYPE variants)
-    missing = [t for t in MAIN_TOKENS if t not in {c['id'] for c in main_tokens}]
-    for token_id in missing:
-        logging.info(f"Attempting direct fetch for main token: {token_id}")
-        variants = HYPE_VARIANTS if token_id == 'hyperliquid' else [token_id]
-        for variant in variants:
-            try:
-                d_url = (f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids="
-                         f"{variant}&sparkline=true")
-                d = requests.get(d_url, timeout=10).json()
-                if (d and d[0]['total_volume'] > MIN_VOLUME
-                        and d[0]['current_price'] > MIN_PRICE
-                        and is_token_supported_on_pionex(d[0]['symbol'], d[0]['id'])):
-                    main_tokens.append(d[0])
+    for i, coin in enumerate(sorted_data):
+        if i >= 20 and coin['id'] not in MAIN_TOKENS:  # Skip top 20 by market cap
+            smaller_tokens.append(coin)
+    
+    logging.info(f"Main tokens found on Pionex: {len(main_tokens_found)}")
+    logging.info(f"Smaller tokens after top 20 exclusion: {len(smaller_tokens)}")
+    
+    # Try to fetch missing main tokens directly if they're supported on Pionex
+    missing_main_tokens = [token_id for token_id in MAIN_TOKENS 
+                          if not any(coin['id'] == token_id for coin in main_tokens_found)]
+    
+    for token_id in missing_main_tokens:
+        logging.info(f"Attempting to fetch missing main token: {token_id}")
+        
+        if token_id == 'hyperliquid':
+            # Special handling for hyperliquid variants
+            for variant in HYPE_VARIANTS:
+                for attempt in range(3):
+                    try:
+                        direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={variant}&sparkline=true"
+                        direct_response = requests.get(direct_url, timeout=10)
+                        direct_response.raise_for_status()
+                        direct_data = direct_response.json()
+                        
+                        if (direct_data and len(direct_data) > 0 and 
+                            direct_data[0]['total_volume'] > MIN_VOLUME and 
+                            direct_data[0]['current_price'] > MIN_PRICE):
+                            
+                            # Check if this variant is supported on Pionex
+                            if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
+                                logging.info(f"Successfully fetched {variant} (Pionex supported): {direct_data[0]['symbol']}")
+                                main_tokens_found.append(direct_data[0])
+                                break
+                            else:
+                                logging.info(f"Fetched {variant} but not supported on Pionex")
+                    except requests.exceptions.RequestException as e:
+                        logging.error(f"Fetch attempt {attempt + 1} for {variant} failed: {e}")
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                        else:
+                            logging.error(f"Failed to fetch {variant} after 3 attempts")
+                
+                # If successful, break out of variant loop
+                if any(coin['id'] == variant for coin in main_tokens_found):
                     break
-            except Exception as e:
-                logging.error(f"Direct fetch for {variant} failed: {e}")
-
-    final_tokens = main_tokens + smaller_tokens
-    logging.info("Final PERP‑compatible breakdown:")
-    logging.info(f"  Main tokens: {len(main_tokens)} — {[c['symbol'] for c in main_tokens]}")
+        else:
+            # Direct fetch for other main tokens
+            for attempt in range(3):
+                try:
+                    direct_url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_id}&sparkline=true"
+                    direct_response = requests.get(direct_url, timeout=10)
+                    direct_response.raise_for_status()
+                    direct_data = direct_response.json()
+                    
+                    if (direct_data and len(direct_data) > 0 and 
+                        direct_data[0]['total_volume'] > MIN_VOLUME and 
+                        direct_data[0]['current_price'] > MIN_PRICE):
+                        
+                        # Check if this token is supported on Pionex
+                        if is_token_supported_on_pionex(direct_data[0]['symbol'], direct_data[0]['id']):
+                            logging.info(f"Successfully fetched {token_id} (Pionex supported): {direct_data[0]['symbol']}")
+                            main_tokens_found.append(direct_data[0])
+                            break
+                        else:
+                            logging.info(f"Fetched {token_id} but not supported on Pionex")
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Direct fetch attempt {attempt + 1} for {token_id} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    else:
+                        logging.error(f"Failed to fetch {token_id} after 3 attempts")
+    
+    # Combine main tokens and smaller tokens
+    final_tokens = main_tokens_found + smaller_tokens
+    
+    logging.info(f"Final Pionex-compatible token breakdown:")
+    logging.info(f"  Main tokens: {len(main_tokens_found)} - {[coin['symbol'] for coin in main_tokens_found]}")
     logging.info(f"  Smaller tokens: {len(smaller_tokens)}")
     logging.info(f"  Total tokens: {len(final_tokens)}")
+    
     return final_tokens
 
-# ────────────────────────────────────
-# Technical‑indicator helpers
-# ────────────────────────────────────
 def calc_rsi(prices):
     if len(prices) < 15:
         return None
-    gains, losses = [], []
+    gains = []
+    losses = []
     for i in range(1, 15):
-        delta = prices[-i] - prices[-(i+1)]
-        gains.append(max(delta, 0))
-        losses.append(max(-delta, 0))
+        delta = prices[-i] - prices[-(i + 1)]
+        gains.append(max(0, delta))
+        losses.append(max(0, -delta))
     avg_gain = sum(gains) / 14
     avg_loss = sum(losses) / 14
     if avg_loss == 0:
@@ -202,164 +289,252 @@ def calc_rsi(prices):
     return 100 - (100 / (1 + rs))
 
 def calculate_volatility(prices):
+    """Calculate rolling volatility from price array"""
     if len(prices) < 5:
-        return 0.05
-    returns = [abs(prices[i]/prices[i-1]-1) for i in range(1, len(prices))
-               if prices[i-1] > 0]
-    return sum(returns)/len(returns) if returns else 0.05
+        return 0.05  # Default low volatility
+    
+    returns = []
+    for i in range(1, len(prices)):
+        if prices[i-1] > 0:
+            returns.append(abs(prices[i] / prices[i-1] - 1))
+    
+    return sum(returns) / len(returns) if returns else 0.05
 
-def get_market_cap_tier(mcap):
-    return ("mega" if mcap >= 50_000_000_000 else
-            "large" if mcap >= 10_000_000_000 else
-            "mid"   if mcap >=  1_000_000_000 else
-            "small")
+def get_market_cap_tier(market_cap):
+    """Classify market cap into tiers"""
+    if market_cap >= 50_000_000_000:
+        return "mega"      # $50B+
+    elif market_cap >= 10_000_000_000:
+        return "large"     # $10B-50B
+    elif market_cap >= 1_000_000_000:
+        return "mid"       # $1B-10B
+    else:
+        return "small"     # <$1B
 
-def format_price(v):
-    return (f"${v:.2f}"   if v >= 100 else
-            f"${v:.4f}"   if v >=   1 else
-            f"${v:.6f}"   if v >= 0.01 else
-            f"${v:.10f}")
+def format_price(value):
+    if value >= 100:
+        return f"${value:.2f}"
+    elif value >= 1:
+        return f"${value:.4f}"
+    elif value >= 0.01:
+        return f"${value:.6f}"
+    else:
+        return f"${value:.10f}"
 
-# ────────────────────────────────────
-# Grid‑parameter calculator (unchanged)
-# ────────────────────────────────────
 def get_enhanced_grid_setup(coin, rsi):
+    """
+    Calculate optimal grid parameters based on:
+    - Price volatility
+    - Market cap tier
+    - Trading volume
+    - RSI signals
+    - Recent price action
+    - Pionex-specific optimizations
+    """
     current_price = coin['current_price']
-    sparkline     = coin['sparkline_in_7d']['price'][-20:]
-    mcap          = coin['market_cap']
-    volume        = coin['total_volume']
-
-    vol = calculate_volatility(sparkline)
-    tier = get_market_cap_tier(mcap)
-
+    sparkline = coin['sparkline_in_7d']['price'][-20:]  # Use more data points
+    market_cap = coin['market_cap']
+    volume = coin['total_volume']
+    
+    # Calculate volatility
+    volatility = calculate_volatility(sparkline)
+    market_tier = get_market_cap_tier(market_cap)
+    
+    # Base parameters by market cap tier (optimized for Pionex)
     tier_params = {
-        "mega":  {"base_spacing": 0.003, "safety_buffer": 0.08, "max_grids": 200},
+        "mega": {"base_spacing": 0.003, "safety_buffer": 0.08, "max_grids": 200},
         "large": {"base_spacing": 0.004, "safety_buffer": 0.10, "max_grids": 150},
-        "mid":   {"base_spacing": 0.006, "safety_buffer": 0.12, "max_grids": 100},
-        "small": {"base_spacing": 0.008, "safety_buffer": 0.15, "max_grids":  80},
+        "mid": {"base_spacing": 0.006, "safety_buffer": 0.12, "max_grids": 100},
+        "small": {"base_spacing": 0.008, "safety_buffer": 0.15, "max_grids": 80}
     }
-    p = tier_params[tier]
-
-    # Spacing & mode
-    if   vol > 0.20: mult, mode = 2.0, "Geometric"
-    elif vol > 0.15: mult, mode = 1.6, "Arithmetic"
-    elif vol > 0.08: mult, mode = 1.2, "Arithmetic"
-    else:            mult, mode = 0.8, "Arithmetic"
-    spacing_pct = p["base_spacing"] * mult
-
-    recent_min, recent_max = min(sparkline), max(sparkline)
-    sb = p["safety_buffer"]
-    if   rsi <= 25: lb, ub = sb*0.6, sb*1.4
-    elif rsi <= 35: lb, ub = sb*0.8, sb*1.2
-    elif rsi >= 75: lb, ub = sb*1.4, sb*0.6
-    elif rsi >= 65: lb, ub = sb*1.2, sb*0.8
-    else:           lb = ub = sb
-
-    min_p = recent_min * (1-lb)
-    max_p = recent_max * (1+ub)
-
-    # Ensure range wide enough for ≥20 grids
-    req_range = current_price * spacing_pct * 20
-    if (max_p - min_p) < req_range:
-        adj = (req_range - (max_p - min_p))/2
-        min_p -= adj
-        max_p += adj
-
-    grid_spacing = current_price * spacing_pct
-    grids_theory = (max_p - min_p) / grid_spacing
-    max_grids = p["max_grids"]
-    if volume > 100_000_000:
+    
+    params = tier_params[market_tier]
+    
+    # Adjust spacing based on volatility
+    base_spacing = params["base_spacing"]
+    if volatility > 0.20:  # Very high volatility
+        spacing_multiplier = 2.0
+        grid_mode = "Geometric"
+    elif volatility > 0.15:  # High volatility
+        spacing_multiplier = 1.6
+        grid_mode = "Arithmetic"
+    elif volatility > 0.08:  # Medium volatility
+        spacing_multiplier = 1.2
+        grid_mode = "Arithmetic"
+    else:  # Low volatility
+        spacing_multiplier = 0.8
+        grid_mode = "Arithmetic"
+    
+    adjusted_spacing = base_spacing * spacing_multiplier
+    
+    # Calculate price range with enhanced logic
+    recent_min = min(sparkline)
+    recent_max = max(sparkline)
+    recent_range = recent_max - recent_min
+    
+    # Adjust range based on RSI and volatility
+    safety_buffer = params["safety_buffer"]
+    if rsi <= 25:  # Extremely oversold
+        lower_buffer = safety_buffer * 0.6  # Tighter lower bound
+        upper_buffer = safety_buffer * 1.4  # Wider upper bound
+    elif rsi <= 35:  # Oversold
+        lower_buffer = safety_buffer * 0.8
+        upper_buffer = safety_buffer * 1.2
+    elif rsi >= 75:  # Extremely overbought
+        lower_buffer = safety_buffer * 1.4
+        upper_buffer = safety_buffer * 0.6
+    elif rsi >= 65:  # Overbought
+        lower_buffer = safety_buffer * 1.2
+        upper_buffer = safety_buffer * 0.8
+    else:  # Neutral
+        lower_buffer = upper_buffer = safety_buffer
+    
+    # Calculate final range
+    min_price = recent_min * (1 - lower_buffer)
+    max_price = recent_max * (1 + upper_buffer)
+    
+    # Ensure minimum range for grid spacing
+    price_range = max_price - min_price
+    min_required_range = current_price * adjusted_spacing * 20  # At least 20 grids
+    if price_range < min_required_range:
+        center_adjustment = (min_required_range - price_range) / 2
+        min_price -= center_adjustment
+        max_price += center_adjustment
+    
+    # Calculate optimal grid count
+    grid_spacing = current_price * adjusted_spacing
+    theoretical_grids = (max_price - min_price) / grid_spacing
+    
+    # Apply grid count limits
+    max_grids = params["max_grids"]
+    if volume > 100_000_000:  # High volume allows more grids
         max_grids = int(max_grids * 1.3)
-    elif volume < 20_000_000:
+    elif volume < 20_000_000:  # Low volume needs fewer grids
         max_grids = int(max_grids * 0.7)
-    grids = max(15, min(max_grids, int(grids_theory)))
-
-    if   rsi <= 30: direction, conf = "Long",  "High"
-    elif rsi <= 40: direction, conf = "Long",  "Medium"
-    elif rsi >= 70: direction, conf = "Short", "High"
-    elif rsi >= 60: direction, conf = "Short", "Medium"
-    else:           direction, conf = "Neutral","High"
-
-    daily_cycles = int(vol * 100 * 2)
-    trailing  = "Yes" if tier in ["mega","large"] and direction!="Neutral" else "No"
-    stop_loss = "5%"  if tier=="small" and direction!="Neutral" else "Disabled"
-
+    
+    optimal_grids = max(15, min(max_grids, int(theoretical_grids)))
+    
+    # Determine direction based on RSI
+    if rsi <= 30:
+        direction = "Long"
+        direction_confidence = "High"
+    elif rsi <= 40:
+        direction = "Long"
+        direction_confidence = "Medium"
+    elif rsi >= 70:
+        direction = "Short"
+        direction_confidence = "High"
+    elif rsi >= 60:
+        direction = "Short"
+        direction_confidence = "Medium"
+    else:
+        direction = "Neutral"
+        direction_confidence = "High"
+    
+    # Calculate expected daily cycles based on volatility
+    daily_cycles = int(volatility * 100 * 2)  # Rough estimate
+    
+    # Pionex-specific settings
+    trailing_enabled = "Yes" if market_tier in ["mega", "large"] and direction != "Neutral" else "No"
+    stop_loss = "5%" if market_tier == "small" and direction != "Neutral" else "Disabled"
+    
     return {
-        'min_price': min_p,
-        'max_price': max_p,
-        'grids': grids,
-        'mode': mode,
+        'min_price': min_price,
+        'max_price': max_price,
+        'grids': optimal_grids,
+        'mode': grid_mode,
         'direction': direction,
-        'direction_confidence': conf,
+        'direction_confidence': direction_confidence,
         'spacing': grid_spacing,
-        'volatility': vol,
-        'market_tier': tier,
-        'trailing': trailing,
+        'volatility': volatility,
+        'market_tier': market_tier,
+        'trailing': trailing_enabled,
         'stop_loss': stop_loss,
         'expected_daily_cycles': daily_cycles
     }
 
-# ────────────────────────────────────
-# Main loop
-# ────────────────────────────────────
 def main():
     try:
-        logging.info("Starting PERP‑only grid analysis…")
-        data = fetch_market_data()
-        ts   = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        logging.info("Starting Pionex-enhanced grid analysis...")
+        market_data = fetch_market_data()
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-        if not data:
-            send_telegram(f"🤖 PIONEX GRID ALERT — {ts}\n❌ No suitable PERP grid "
-                          "opportunities right now.\n💡 Check back later!")
+        main_alerts = []
+        small_alerts = []
+
+        if not market_data:
+            logging.info("No Pionex-compatible market data available, sending empty alert")
+            send_telegram(f"🤖 PIONEX GRID TRADING ALERT — {ts}\n❌ No suitable Pionex-compatible grid trading opportunities this hour.\n💡 Check back later for new opportunities!")
             return
 
-        supported_cnt = len(get_pionex_supported_tokens())
-        main_alerts, small_alerts = [], []
+        # Get count of supported tokens for context
+        supported_count = len(get_pionex_supported_tokens())
 
-        for coin in data:
-            prices15 = coin['sparkline_in_7d']['price'][-15:]
-            rsi = calc_rsi(prices15)
+        for coin in market_data:
+            id_ = coin['id']
+            current_price = coin['current_price']
+            symbol = coin['symbol'].upper()
+            sparkline = coin['sparkline_in_7d']['price'][-15:]
+            rsi = calc_rsi(sparkline)
+
             if rsi is None:
                 continue
 
-            gp = get_enhanced_grid_setup(coin, rsi)
-            sym = coin['symbol'].upper()
-
-            alert = (f"{ {'Long':'🟢','Short':'🔴','Neutral':'🟡'}[gp['direction']] } "
-                     f"{sym} RSI {rsi:.1f} | {gp['market_tier'].upper()}‑CAP\n"
-                     f"📊 PIONEX GRID SETUP\n"
-                     f"• Price Range: {format_price(gp['min_price'])}"
-                     f"‑{format_price(gp['max_price'])}\n"
-                     f"• Grid Count: {gp['grids']} grids\n"
-                     f"• Grid Mode: {gp['mode']}\n"
-                     f"• Direction: {gp['direction']} "
-                     f"{'🔥' if gp['direction_confidence']=='High' else '⚡'}\n"
-                     f"• Trailing: {gp['trailing']}\n"
-                     f"• Stop Loss: {gp['stop_loss']}\n"
-                     f"• Expected Cycles/Day: ~{gp['expected_daily_cycles']}\n"
-                     f"• Volatility: {gp['volatility']:.1%}\n")
-
-            reason = ("Oversold → Long grid" if rsi <= 35 else
-                      "Overbought → Short grid" if rsi >= 65 else
-                      "Neutral RSI → range‑bound grid")
+            # Get enhanced grid parameters
+            grid_params = get_enhanced_grid_setup(coin, rsi)
+            
+            price_fmt = format_price(current_price)
+            low_fmt = format_price(grid_params['min_price'])
+            high_fmt = format_price(grid_params['max_price'])
+            
+            # Create comprehensive alert
+            confidence_emoji = "🔥" if grid_params['direction_confidence'] == "High" else "⚡"
+            direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
+            
+            alert = f"{direction_emoji} {symbol} RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
+            alert += f"📊 PIONEX GRID SETUP\n"
+            alert += f"• Price Range: {low_fmt} - {high_fmt}\n"
+            alert += f"• Grid Count: {grid_params['grids']} grids\n"
+            alert += f"• Grid Mode: {grid_params['mode']}\n"
+            alert += f"• Direction: {grid_params['direction']} {confidence_emoji}\n"
+            alert += f"• Trailing: {grid_params['trailing']}\n"
+            alert += f"• Stop Loss: {grid_params['stop_loss']}\n"
+            alert += f"• Expected Cycles/Day: ~{grid_params['expected_daily_cycles']}\n"
+            alert += f"• Volatility: {grid_params['volatility']:.1%}\n"
+            
+            # Add reasoning
+            if rsi <= 35:
+                reason = f"Oversold conditions suggest potential rebound. Recommended for Long bias grid."
+            elif rsi >= 65:
+                reason = f"Overbought conditions suggest potential decline. Recommended for Short bias grid."
+            else:
+                reason = f"Neutral RSI perfect for range-bound grid trading. High profit potential from volatility."
+            
             alert += f"\n💡 Analysis: {reason}"
+            
+            if id_ in MAIN_TOKENS:
+                main_alerts.append(alert)
+            else:
+                small_alerts.append(alert)
 
-            (main_alerts if coin['id'] in MAIN_TOKENS else small_alerts).append(alert)
-
-        msg = (f"🤖 PIONEX GRID TRADING ALERTS — {ts}\n"
-               f"📊 Analyzed {supported_cnt} PERP bases on Pionex\n\n")
-
+        # Compose final message
+        message = f"🤖 PIONEX GRID TRADING ALERTS — {ts}\n"
+        message += f"📊 Analyzed {supported_count} Pionex-supported tokens\n\n"
+        
         if main_alerts:
-            msg += "🏆 MAIN TOKENS\n" + '\n\n'.join(main_alerts) + '\n\n'
+            message += "🏆 MAIN TOKENS\n" + '\n\n'.join(main_alerts) + '\n\n'
+        
         if small_alerts:
-            msg += "💎 SMALLER OPPORTUNITIES\n" + '\n\n'.join(small_alerts[:2])
-
+            message += "💎 SMALLER OPPORTUNITIES\n" + '\n\n'.join(small_alerts[:2])  # Limit to 2 for message size
+        
         if not main_alerts and not small_alerts:
-            msg += ("❌ No suitable grid opportunities this hour.\n"
-                    "⏳ Market may be too stable/volatile.\n")
+            message += '❌ No suitable grid trading opportunities this hour.\n'
+            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.\n'
+            message += f'💡 Monitoring {supported_count} Pionex tokens for next opportunity.'
 
-        send_telegram(msg)
-        logging.info("PERP‑only grid analysis completed")
+        logging.info(f"Sending Pionex-enhanced Telegram message: {message[:100]}...")
+        send_telegram(message)
+        logging.info("Pionex-enhanced grid analysis completed")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"API Error: {e}")
