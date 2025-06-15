@@ -5,8 +5,8 @@ import os
 import re
 
 # Configuration
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
 TOP_COINS_LIMIT = 50  # Number of top coins by market cap to scan
 MIN_VOLUME = 10_000_000  # Minimum daily trading volume in USD
@@ -27,17 +27,24 @@ def send_telegram(message):
         response.raise_for_status()
         print(f"Telegram sent successfully: {message[:50]}...")
     except requests.exceptions.RequestException as e:
-        error_msg = f"Telegram send failed: {e}, status: {getattr(e.response, 'status_code', 'N/A')}, token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
-        print(error_msg)
+        error_details = f"Telegram send failed: {e}, status: {getattr(e.response, 'status_code', 'N/A')}"
+        if hasattr(e.response, 'text'):
+            error_details += f", response: {e.response.text}"
+        error_details += f", token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
+        print(error_details)
         time.sleep(60)  # Retry after 1 minute
         try:
             response = requests.post(url, data=payload, timeout=10)
             response.raise_for_status()
             print(f"Telegram retry succeeded: {message[:50]}...")
         except requests.exceptions.RequestException as e2:
-            error_msg = f"Telegram retry failed: {e2}, status: {getattr(e2.response, 'status_code', 'N/A')}, token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
-            print(error_msg)
-            raise
+            error_details = f"Telegram retry failed: {e2}, status: {getattr(e2.response, 'status_code', 'N/A')}"
+            if hasattr(e2.response, 'text'):
+                error_details += f", response: {e2.response.text}"
+            error_details += f", token (partial): {TELEGRAM_TOKEN[:10]}..., chat_id: {TELEGRAM_CHAT_ID}"
+            print(error_details)
+            print(f"Warning: Skipping Telegram message due to persistent failure: {message[:50]}...")
+            return
 
 def fetch_market_data():
     print("Fetching market data from CoinGecko...")
