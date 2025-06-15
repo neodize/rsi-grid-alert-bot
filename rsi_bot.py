@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import os
 import re
 import logging
+import math
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -120,6 +121,29 @@ def calc_rsi(prices):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+def calculate_volatility(prices):
+    """Calculate rolling volatility from price array"""
+    if len(prices) < 5:
+        return 0.05  # Default low volatility
+    
+    returns = []
+    for i in range(1, len(prices)):
+        if prices[i-1] > 0:
+            returns.append(abs(prices[i] / prices[i-1] - 1))
+    
+    return sum(returns) / len(returns) if returns else 0.05
+
+def get_market_cap_tier(market_cap):
+    """Classify market cap into tiers"""
+    if market_cap >= 50_000_000_000:
+        return "mega"      # $50B+
+    elif market_cap >= 10_000_000_000:
+        return "large"     # $10B-50B
+    elif market_cap >= 1_000_000_000:
+        return "mid"       # $1B-10B
+    else:
+        return "small"     # <$1B
+
 def format_price(value):
     if value >= 100:
         return f"${value:.2f}"
@@ -130,16 +154,140 @@ def format_price(value):
     else:
         return f"${value:.10f}"
 
-def get_grid_setup(price, sparkline):
-    min_price = min(sparkline) * 0.95
-    max_price = max(sparkline) * 1.05
-    interval = price * 0.005
-    grids = max(10, min(500, round((max_price - min_price) / interval)))
-    return min_price, max_price, grids
+def get_enhanced_grid_setup(coin, rsi):
+    """
+    Calculate optimal grid parameters based on:
+    - Price volatility
+    - Market cap tier
+    - Trading volume
+    - RSI signals
+    - Recent price action
+    """
+    current_price = coin['current_price']
+    sparkline = coin['sparkline_in_7d']['price'][-20:]  # Use more data points
+    market_cap = coin['market_cap']
+    volume = coin['total_volume']
+    
+    # Calculate volatility
+    volatility = calculate_volatility(sparkline)
+    market_tier = get_market_cap_tier(market_cap)
+    
+    # Base parameters by market cap tier
+    tier_params = {
+        "mega": {"base_spacing": 0.003, "safety_buffer": 0.08, "max_grids": 150},
+        "large": {"base_spacing": 0.004, "safety_buffer": 0.10, "max_grids": 120},
+        "mid": {"base_spacing": 0.006, "safety_buffer": 0.12, "max_grids": 100},
+        "small": {"base_spacing": 0.008, "safety_buffer": 0.15, "max_grids": 80}
+    }
+    
+    params = tier_params[market_tier]
+    
+    # Adjust spacing based on volatility
+    base_spacing = params["base_spacing"]
+    if volatility > 0.20:  # Very high volatility
+        spacing_multiplier = 2.0
+        grid_mode = "Geometric"
+    elif volatility > 0.15:  # High volatility
+        spacing_multiplier = 1.6
+        grid_mode = "Arithmetic"
+    elif volatility > 0.08:  # Medium volatility
+        spacing_multiplier = 1.2
+        grid_mode = "Arithmetic"
+    else:  # Low volatility
+        spacing_multiplier = 0.8
+        grid_mode = "Arithmetic"
+    
+    adjusted_spacing = base_spacing * spacing_multiplier
+    
+    # Calculate price range with enhanced logic
+    recent_min = min(sparkline)
+    recent_max = max(sparkline)
+    recent_range = recent_max - recent_min
+    
+    # Adjust range based on RSI and volatility
+    safety_buffer = params["safety_buffer"]
+    if rsi <= 25:  # Extremely oversold
+        lower_buffer = safety_buffer * 0.6  # Tighter lower bound
+        upper_buffer = safety_buffer * 1.4  # Wider upper bound
+    elif rsi <= 35:  # Oversold
+        lower_buffer = safety_buffer * 0.8
+        upper_buffer = safety_buffer * 1.2
+    elif rsi >= 75:  # Extremely overbought
+        lower_buffer = safety_buffer * 1.4
+        upper_buffer = safety_buffer * 0.6
+    elif rsi >= 65:  # Overbought
+        lower_buffer = safety_buffer * 1.2
+        upper_buffer = safety_buffer * 0.8
+    else:  # Neutral
+        lower_buffer = upper_buffer = safety_buffer
+    
+    # Calculate final range
+    min_price = recent_min * (1 - lower_buffer)
+    max_price = recent_max * (1 + upper_buffer)
+    
+    # Ensure minimum range for grid spacing
+    price_range = max_price - min_price
+    min_required_range = current_price * adjusted_spacing * 20  # At least 20 grids
+    if price_range < min_required_range:
+        center_adjustment = (min_required_range - price_range) / 2
+        min_price -= center_adjustment
+        max_price += center_adjustment
+    
+    # Calculate optimal grid count
+    grid_spacing = current_price * adjusted_spacing
+    theoretical_grids = (max_price - min_price) / grid_spacing
+    
+    # Apply grid count limits
+    max_grids = params["max_grids"]
+    if volume > 100_000_000:  # High volume allows more grids
+        max_grids = int(max_grids * 1.3)
+    elif volume < 20_000_000:  # Low volume needs fewer grids
+        max_grids = int(max_grids * 0.7)
+    
+    optimal_grids = max(15, min(max_grids, int(theoretical_grids)))
+    
+    # Determine direction based on RSI
+    if rsi <= 30:
+        direction = "Long"
+        direction_confidence = "High"
+    elif rsi <= 40:
+        direction = "Long"
+        direction_confidence = "Medium"
+    elif rsi >= 70:
+        direction = "Short"
+        direction_confidence = "High"
+    elif rsi >= 60:
+        direction = "Short"
+        direction_confidence = "Medium"
+    else:
+        direction = "Neutral"
+        direction_confidence = "High"
+    
+    # Calculate expected daily cycles based on volatility
+    daily_cycles = int(volatility * 100 * 2)  # Rough estimate
+    
+    # Advanced settings
+    trailing_enabled = "Yes" if market_tier in ["mega", "large"] and direction != "Neutral" else "No"
+    stop_loss = "5%" if market_tier == "small" and direction != "Neutral" else "Disabled"
+    
+    return {
+        'min_price': min_price,
+        'max_price': max_price,
+        'grids': optimal_grids,
+        'mode': grid_mode,
+        'direction': direction,
+        'direction_confidence': direction_confidence,
+        'spacing': grid_spacing,
+        'volatility': volatility,
+        'market_tier': market_tier,
+        'trailing': trailing_enabled,
+        'stop_loss': stop_loss,
+        'expected_daily_cycles': daily_cycles
+    }
 
 def main():
     try:
-        logging.info("Starting scan...")
+        logging.info("Starting enhanced grid analysis...")
         market_data = fetch_market_data()
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
@@ -148,7 +296,7 @@ def main():
 
         if not market_data:
             logging.info("No market data available, sending empty alert")
-            send_telegram(f"*HOURLY GRID TRADING ALERT — {ts}*\nNo suitable grid trading opportunities this hour.")
+            send_telegram(f"*ENHANCED GRID TRADING ALERT — {ts}*\nNo suitable grid trading opportunities this hour.")
             return
 
         for coin in market_data:
@@ -161,43 +309,68 @@ def main():
             if rsi is None:
                 continue
 
-            grid_low, grid_high, grids = get_grid_setup(current_price, sparkline)
+            # Get enhanced grid parameters
+            grid_params = get_enhanced_grid_setup(coin, rsi)
+            
             price_fmt = format_price(current_price)
-            low_fmt = format_price(grid_low)
-            high_fmt = format_price(grid_high)
-
-            suggestion = f"\n📊 {symbol} Grid Bot Suggestion\n• Price Range: {low_fmt} – {high_fmt}\n• Grids: {grids}\n• Mode: Arithmetic\n• Trailing: Disabled\n• Direction: "
-            reason = ""
-
+            low_fmt = format_price(grid_params['min_price'])
+            high_fmt = format_price(grid_params['max_price'])
+            
+            # Create comprehensive alert
+            confidence_emoji = "🔥" if grid_params['direction_confidence'] == "High" else "⚡"
+            direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params['direction']]
+            
+            alert = f"{direction_emoji} *{symbol}* RSI {rsi:.1f} | {grid_params['market_tier'].upper()}-CAP\n"
+            alert += f"📊 *COMPLETE GRID SETUP*\n"
+            alert += f"• Price Range: `{low_fmt} - {high_fmt}`\n"
+            alert += f"• Grid Count: `{grid_params['grids']} grids`\n"
+            alert += f"• Grid Mode: `{grid_params['mode']}`\n"
+            alert += f"• Direction: `{grid_params['direction']}` {confidence_emoji}\n"
+            alert += f"• Trailing: `{grid_params['trailing']}`\n"
+            alert += f"• Stop Loss: `{grid_params['stop_loss']}`\n"
+            alert += f"• Expected Cycles/Day: `~{grid_params['expected_daily_cycles']}`\n"
+            alert += f"• Volatility: `{grid_params['volatility']:.1%}` ({grid_params['mode']} recommended)\n"
+            
+            # Add reasoning
             if rsi <= 35:
-                suggestion += "Long"
-                reason = f"Oversold with RSI {rsi:.2f}, suggesting potential rebound."
+                reason = f"Oversold conditions suggest potential rebound. Recommended for Long bias grid."
             elif rsi >= 65:
-                suggestion += "Short"
-                reason = f"Overbought with RSI {rsi:.2f}, suggesting potential decline."
+                reason = f"Overbought conditions suggest potential decline. Recommended for Short bias grid."
             else:
-                suggestion += "Neutral"
-                reason = f"Neutral with RSI {rsi:.2f}, indicating a ranging market."
-
-            alert = f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}"
+                reason = f"Neutral RSI perfect for range-bound grid trading. High profit potential from volatility."
+            
+            alert += f"\n💡 *Analysis*: {reason}"
+            
             if id_ in MAIN_TOKENS:
                 main_alerts.append(alert)
             else:
                 small_alerts.append(alert)
 
-        message = f"*HOURLY GRID TRADING ALERT — {ts}*\n"
+        # Compose final message
+        message = f"*🤖 ENHANCED GRID TRADING ALERTS — {ts}*\n\n"
+        
         if main_alerts:
-            # FIXED: Show ALL main tokens, not just first 3
-            message += "*Main Tokens*\n" + '\n\n'.join(main_alerts) + '\n'
+            message += "*🏆 MAIN TOKENS*\n" + '\n\n'.join(main_alerts) + '\n\n'
+        
         if small_alerts:
-            # Still limit smaller tokens to 3 to keep message manageable
-            message += "====\n*Smaller Tokens*\n" + '\n\n'.join(small_alerts[:3]) if small_alerts else ''
+            message += "*💎 SMALLER OPPORTUNITIES*\n" + '\n\n'.join(small_alerts[:2])  # Limit to 2 for message size
+        
         if not main_alerts and not small_alerts:
-            message += '\nNo suitable grid trading opportunities this hour.'
+            message += '❌ No suitable grid trading opportunities this hour.\n'
+            message += '⏳ Market conditions may be too stable or volatile for optimal grid trading.'
 
-        logging.info(f"Sending Telegram message: {message[:50]}...")
+        # Add footer with tips
+        message += f"\n\n*📝 QUICK SETUP GUIDE:*\n"
+        message += f"1. Copy price range exactly as shown\n"
+        message += f"2. Set grid count as recommended\n"  
+        message += f"3. Choose Arithmetic/Geometric mode\n"
+        message += f"4. Set direction (Long/Short/Neutral)\n"
+        message += f"5. Enable/disable trailing as suggested\n"
+        message += f"\n⚠️ *Always use proper risk management!*"
+
+        logging.info(f"Sending enhanced Telegram message: {message[:100]}...")
         send_telegram(message)
-        logging.info("Scan completed")
+        logging.info("Enhanced grid analysis completed")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"API Error: {e}")
