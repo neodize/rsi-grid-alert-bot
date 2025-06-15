@@ -2,6 +2,7 @@ import requests
 import time
 from datetime import datetime, timezone
 import logging
+import re
 
 # Configuration
 TELEGRAM_TOKEN = '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8'  # Provided Telegram bot token
@@ -10,6 +11,8 @@ COINGECKO_API = 'https://api.coingecko.com/api/v3'
 TOP_COINS_LIMIT = 50  # Number of top coins by market cap to scan
 MIN_VOLUME = 10_000_000  # Minimum daily trading volume in USD
 MIN_PRICE = 0.01  # Minimum price to filter out micro-cap tokens
+TOP_COINS_TO_EXCLUDE = 20  # Exclude top 20 coins to focus on smaller tokens
+MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']  # Prioritized tokens
 
 # Logging setup
 logging.basicConfig(filename='grid_scanner.log', level=logging.INFO)
@@ -27,7 +30,16 @@ def fetch_market_data():
     url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={TOP_COINS_LIMIT}&page=1&sparkline=true"
     response = requests.get(url)
     response.raise_for_status()
-    return [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
+    data = [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
+    # Exclude table coins (e.g., BTC3L, ETH3S) and top 20 coins, but include main tokens
+    filtered_data = [coin for coin in data if not re.search(r'(\d+[LS])$', coin['symbol'].upper()) and data.index(coin) >= TOP_COINS_TO_EXCLUDE]
+    # Add main tokens if not already included
+    for token in MAIN_TOKENS:
+        if not any(coin['id'] == token for coin in filtered_data):
+            main_coin = next((coin for coin in data if coin['id'] == token), None)
+            if main_coin and not re.search(r'(\d+[LS])$', main_coin['symbol'].upper()):
+                filtered_data.append(main_coin)
+    return filtered_data
 
 def calc_rsi(prices):
     if len(prices) < 15:  # Need at least 15 points for 14-period RSI
