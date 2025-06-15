@@ -1,671 +1,369 @@
-import requests
-import time
-from datetime import datetime, timezone
+#!/usr/bin/env python3
+"""
+Pionex Futures‑Grid Scanner
+—————————————
+• Pulls every PERP pair from Pionex.
+• Filters out wrapped / stable / junk symbols.
+• Runs quick TA (ATR, BB width, SMA trend, RSI).
+• Scores each pair for grid‑trading suitability.
+• Sends the five best to Telegram.
+
+Author: ChatGPT — 2025‑06‑15
+"""
+
 import os
-import logging
+import time
 import math
+import logging
+from datetime import datetime, timezone
+
+import requests
 import numpy as np
-from scipy import stats
+from scipy import stats   # used in volatility calcs — keep import
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ─────────────────────────  CONFIG  ─────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+PIONEX_API       = "https://api.pionex.com"
 
-# Configuration
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7998783762:AAHvT55g8H-4UlXdGLCchfeEiryUjTF7jk8')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '7588547693')
-PIONEX_API = 'https://api.pionex.com'
-MIN_VOLUME = 10_000_000
-MIN_PRICE = 0.01
-MAX_RECOMMENDATIONS = 5
+MIN_VOLUME       = 10_000_000         # 24 h notional in quote currency
+MIN_PRICE        = 0.01               # skip sub‑cent coins
+MAX_RECOMMEND    = 5                  # how many alerts to send
 
-# Comprehensive exclusion lists
+# Tags for quick filtering
 WRAPPED_TOKENS = {
-    'WBTC', 'WETH', 'WBNB', 'WMATIC', 'WAVAX', 'WFTM', 'WONE', 'WROSE',
-    'CBBTC', 'CBETH', 'RETH', 'STETH', 'WSTETH', 'FRXETH', 'SFRXETH',
-    'WSOL', 'MSOL', 'STSOL', 'JSOL', 'BSOL', 'BONK', 'WIF'
+    "WBTC","WETH","WBNB","WMATIC","WAVAX","WFTM","WSOL",
+    "MSOL","STSOL","JSOL","BSOL","CBBTC","CBETH","RETH",
+    "STETH","WSTETH","FRXETH","SFRXETH"
 }
-
 STABLECOINS = {
-    'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'USDD', 'FRAX', 'LUSD',
-    'GUSD', 'USDC.E', 'USDT.E', 'FDUSD', 'PYUSD', 'USDB', 'USDE', 'CRVUSD',
-    'SUSD', 'DUSD', 'OUSD', 'USTC', 'USDK', 'USDN', 'USDS', 'USDY'
+    "USDT","USDC","BUSD","DAI","TUSD","USDP","USDD","FRAX",
+    "FDUSD","PYUSD","USDE","USDB","LUSD","SUSD","DUSD","OUSD",
 }
-
 EXCLUDED_TOKENS = {
-    'ETHUP', 'ETHDOWN', 'BTCUP', 'BTCDOWN', 'ADAUP', 'ADADOWN',
-    'SYNTH', 'PERP', 'SHIB', 'DOGE', 'PEPE', 'FLOKI', 'BABYDOGE',
-    'LUNA', 'LUNC', 'USTC'
+    "BTCUP","BTCDOWN","ETHUP","ETHDOWN","ADAUP","ADADOWN",
+    "LUNA","LUNC","USTC","SHIB","DOGE","PEPE","FLOKI","BABYDOGE"
 }
 
-def is_excluded_token(symbol, name=""):
-    """Check if a token should be excluded"""
-    symbol_upper = symbol.upper()
-    name_upper = name.upper() if name else ""
-    
-    if symbol_upper in WRAPPED_TOKENS:
-        return True, "wrapped"
-    if symbol_upper in STABLECOINS:
-        return True, "stablecoin"
-    if symbol_upper in EXCLUDED_TOKENS:
-        return True, "excluded"
-    if symbol_upper.endswith(('UP', 'DOWN', '3L', '3S')):
-        return True, "leveraged"
-    if (symbol_upper.startswith('W') and len(symbol_upper) > 1 and 
-        symbol_upper[1:] in ['BTC', 'ETH', 'SOL', 'BNB', 'MATIC', 'AVAX']):
-        return True, "wrapped_pattern"
-    if any(pattern in name_upper for pattern in ['USD COIN', 'TETHER', 'BINANCE USD', 'DAI STABLECOIN']):
-        return True, "stablecoin_name"
-    if any(pattern in name_upper for pattern in ['WRAPPED', 'WORMHOLE', 'BRIDGE']):
-        return True, "wrapped_name"
-    
-    return False, None
+# ────────────────────────  LOGGING  ────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-def send_telegram(message):
-    """Send Telegram message"""
-    token_source = "GitHub Secrets" if os.getenv('TELEGRAM_TOKEN') else "fallback"
-    chat_id_source = "GitHub Secrets" if os.getenv('TELEGRAM_CHAT_ID') else "fallback"
-    logging.info(f"Attempting to send Telegram message using token from {token_source} and chat_id from {chat_id_source}")
-
-    if not TELEGRAM_TOKEN.strip() or not TELEGRAM_CHAT_ID.strip():
-        logging.warning(f"TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is empty or unset, skipping message: {message[:50]}...")
+# ──────────────────────  TELEGRAM  ─────────────────────────
+def send_telegram(msg: str) -> None:
+    """Send plain‑markdown text to Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram credentials missing; skip send.")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
-    
-    try:
-        response = requests.post(url, data=payload, timeout=10)
-        response.raise_for_status()
-        logging.info(f"Telegram sent successfully: {message[:50]}...")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Telegram send failed: {e}")
-        time.sleep(60)
-        try:
-            response = requests.post(url, data=payload, timeout=10)
-            response.raise_for_status()
-            logging.info(f"Telegram retry succeeded: {message[:50]}...")
-        except requests.exceptions.RequestException as e2:
-            logging.error(f"Telegram retry failed: {e2}")
-            return
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
 
-def fetch_pionex_market_data():
-    """Fetch market data from Pionex API using correct endpoints"""
-    logging.info("Fetching market data from Pionex API...")
-    
     try:
-        # First, get all available symbols with PERP type
-        symbols_url = f"{PIONEX_API}/api/v1/common/symbols"
-        params = {'type': 'PERP'}
-        
-        logging.info(f"Fetching symbols from: {symbols_url}")
-        response = requests.get(symbols_url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        symbols_data = response.json()
-        if not symbols_data.get('result', False):
-            logging.error(f"Pionex symbols API error: {symbols_data}")
-            return []
-        
-        perp_symbols = symbols_data.get('data', {}).get('symbols', [])
-        logging.info(f"Retrieved {len(perp_symbols)} PERP symbols from Pionex")
-        
-        if not perp_symbols:
-            logging.warning("No PERP symbols found")
-            return []
-        
-        # Get 24hr ticker data for all symbols
-        tickers_url = f"{PIONEX_API}/api/v1/market/tickers"
-        response = requests.get(tickers_url, timeout=10)
-        response.raise_for_status()
-        
-        tickers_data = response.json()
-        if not tickers_data.get('result', False):
-            logging.error(f"Pionex tickers API error: {tickers_data}")
-            return []
-        
-        all_tickers = tickers_data.get('data', [])
-        logging.info(f"Retrieved {len(all_tickers)} total tickers from Pionex")
-        
-        # Create a map of PERP symbols for filtering
-        perp_symbol_set = {symbol['symbol'] for symbol in perp_symbols}
-        
-        # Filter and process tickers for PERP contracts only
-        perp_tickers = []
-        for ticker in all_tickers:
-            symbol = ticker.get('symbol', '')
-            
-            if symbol not in perp_symbol_set:
-                continue
-            
-            # Extract base symbol (remove PERP suffix if present)
-            base_symbol = symbol.replace('PERP', '').strip('_')
-            if base_symbol.endswith('_USDT'):
-                base_symbol = base_symbol.replace('_USDT', '')
-            
-            # Convert Pionex format to our expected format
-            market_data = {
-                'symbol': base_symbol,
-                'name': base_symbol,
-                'current_price': float(ticker.get('price', 0)),
-                'price_change_percentage_24h': float(ticker.get('dailyChange', 0)) * 100,
-                'total_volume': float(ticker.get('quoteVolume', 0)),
-                'market_cap': float(ticker.get('quoteVolume', 0)) * 24,  # Approximate market cap
-                'high_24h': float(ticker.get('high', 0)),
-                'low_24h': float(ticker.get('low', 0)),
-                'raw_symbol': symbol
-            }
-            
-            # Apply filters
-            if (market_data['total_volume'] > MIN_VOLUME and 
-                market_data['current_price'] > MIN_PRICE):
-                
-                is_excluded, reason = is_excluded_token(base_symbol)
-                if not is_excluded:
-                    perp_tickers.append(market_data)
-                    logging.debug(f"Added PERP: {base_symbol} (${market_data['current_price']:.4f})")
-        
-        logging.info(f"After filtering: {len(perp_tickers)} perpetual contracts")
-        
-        # Sort by volume and return top candidates
-        perp_tickers.sort(key=lambda x: x['total_volume'], reverse=True)
-        return perp_tickers[:50]  # Get top 50 by volume for analysis
-        
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching Pionex market data: {e}")
-        # Try alternative endpoint structure
-        try:
-            logging.info("Trying alternative endpoint structure...")
-            alt_url = f"{PIONEX_API}/api/v1/market/24hrs"
-            response = requests.get(alt_url, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            if data.get('result', False):
-                logging.info("Alternative endpoint worked!")
-                # Process alternative data format here if needed
-                return []
-            else:
-                logging.error(f"Alternative endpoint also failed: {data}")
-                return []
-                
-        except Exception as alt_e:
-            logging.error(f"Alternative endpoint also failed: {alt_e}")
-            return []
-            
-    except Exception as e:
-        logging.error(f"Unexpected error in fetch_pionex_market_data: {e}")
-        return []
+        requests.post(url, data=data, timeout=10).raise_for_status()
+        logging.info("Telegram message sent.")
+    except requests.RequestException as exc:
+        logging.error(f"Telegram send failed: {exc}")
 
-def fetch_kline_data(symbol, interval='1h', limit=100):
-    """Fetch historical kline data from Pionex"""
-    try:
-        url = f"{PIONEX_API}/api/v1/market/klines"
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'limit': limit
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        if not data.get('result', False):
-            logging.debug(f"Kline API error for {symbol}: {data}")
-            return None
-            
-        klines = data.get('data', [])
-        
-        # Convert kline data to price arrays
-        prices = []
-        volumes = []
-        highs = []
-        lows = []
-        
-        for kline in klines:
-            # Pionex kline format: [timestamp, open, high, low, close, volume, quoteVolume]
-            if len(kline) >= 7:
-                prices.append(float(kline[4]))  # Close price
-                volumes.append(float(kline[6]))  # Quote Volume
-                highs.append(float(kline[2]))    # High price
-                lows.append(float(kline[3]))     # Low price
-        
-        return {
-            'prices': prices,
-            'volumes': volumes,
-            'highs': highs,
-            'lows': lows
-        }
-        
-    except Exception as e:
-        logging.debug(f"Error fetching kline data for {symbol}: {e}")
-        return None
+# ───────────────────────  HELPERS  ─────────────────────────
+def is_excluded(symbol: str) -> bool:
+    s = symbol.upper()
+    if s in WRAPPED_TOKENS or s in STABLECOINS or s in EXCLUDED_TOKENS:
+        return True
+    if s.endswith(("UP","DOWN","3L","3S","5L","5S")):
+        return True
+    return False
 
-# Technical Analysis Functions (keeping the same as before)
 def calculate_sma(prices, period):
-    """Calculate Simple Moving Average"""
-    if len(prices) < period:
-        return None
-    return sum(prices[-period:]) / period
+    return sum(prices[-period:]) / period if len(prices) >= period else None
 
 def calculate_rsi(prices, period=14):
-    """Enhanced RSI calculation"""
     if len(prices) < period + 1:
         return None
-    
-    gains = []
-    losses = []
-    
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
-        gains.append(max(0, change))
-        losses.append(max(0, -change))
-    
-    if len(gains) < period:
-        return None
-    
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    
+    diffs  = np.diff(prices)
+    gains  = np.maximum(diffs, 0)
+    losses = np.maximum(-diffs, 0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
     if avg_loss == 0:
         return 100
-    
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def calculate_atr(highs, lows, closes, period=14):
-    """Calculate Average True Range"""
     if len(highs) < period + 1:
         return None
-    
-    true_ranges = []
+    tr = []
     for i in range(1, len(highs)):
-        high_low = highs[i] - lows[i]
-        high_close_prev = abs(highs[i] - closes[i-1])
-        low_close_prev = abs(lows[i] - closes[i-1])
-        true_range = max(high_low, high_close_prev, low_close_prev)
-        true_ranges.append(true_range)
-    
-    if len(true_ranges) < period:
-        return None
-    
-    return sum(true_ranges[-period:]) / period
+        tr.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i]  - closes[i-1])
+        ))
+    return np.mean(tr[-period:])
 
-def calculate_bollinger_bands(prices, period=20, std_dev=2):
-    """Calculate Bollinger Bands"""
+def calculate_bollinger(prices, period=20, std=2):
     if len(prices) < period:
         return None, None, None
-    
-    sma = sum(prices[-period:]) / period
-    variance = sum([(price - sma) ** 2 for price in prices[-period:]]) / period
-    std = math.sqrt(variance)
-    
-    upper_band = sma + (std * std_dev)
-    lower_band = sma - (std * std_dev)
-    
-    return upper_band, sma, lower_band
+    sma = np.mean(prices[-period:])
+    sd  = np.std(prices[-period:])
+    return sma + std*sd, sma, sma - std*sd
 
+def format_price(p):
+    if p >= 100:
+        return f"${p:,.2f}"
+    if p >= 1:
+        return f"${p:,.4f}"
+    if p >= 0.01:
+        return f"${p:,.6f}"
+    return f"${p:,.10f}"
+
+def md_escape(txt: str) -> str:
+    for ch in "_*[]()~`>#+=|{}.!":
+        txt = txt.replace(ch, f"\\{ch}")
+    return txt
+
+# ──────────────────  PIONEX DATA LAYERS  ───────────────────
+def fetch_perp_tickers():
+    """Return list of dicts: each ticker for a PERP symbol."""
+    url = f"{PIONEX_API}/api/v1/market/tickers"
+    r   = requests.get(url, params={"type": "PERP"}, timeout=10)
+    r.raise_for_status()
+    obj = r.json()
+
+    # Accept both {code:0,data:{tickers:[…]}} and {result:True,data:{tickers:[…]}}
+    tickers = obj.get("data", {}).get("tickers", [])
+    return tickers
+
+def fetch_klines(symbol: str, interval="1h", limit=200):
+    """Return lists: prices, volumes, highs, lows."""
+    url = f"{PIONEX_API}/api/v1/market/klines"
+    r   = requests.get(url, params={
+        "symbol"  : symbol,
+        "interval": interval,
+        "limit"   : limit
+    }, timeout=10)
+    r.raise_for_status()
+    kobj = r.json()
+    kl   = kobj.get("data", {}).get("klines", [])
+
+    prices, vols, highs, lows = [], [], [], []
+    for k in kl:
+        prices.append(float(k["close"]))
+        vols  .append(float(k["volume"]))
+        highs .append(float(k["high"]))
+        lows  .append(float(k["low"]))
+    return prices, vols, highs, lows
+
+# ─────────────────  GRID ANALYSIS OBJECT  ──────────────────
 class GridAnalyzer:
-    def __init__(self, coin_data):
-        self.coin = coin_data
-        self.current_price = coin_data['current_price']
-        self.symbol = coin_data['symbol'].upper()
-        self.raw_symbol = coin_data['raw_symbol']
-        
-        # Fetch historical data from Pionex
-        kline_data = fetch_kline_data(self.raw_symbol)
-        if kline_data and len(kline_data['prices']) > 10:
-            self.prices = kline_data['prices']
-            self.volumes = kline_data['volumes']
-            self.highs = kline_data['highs']
-            self.lows = kline_data['lows']
-        else:
-            # Generate synthetic data as fallback
-            self.prices = self._generate_synthetic_prices()
-            self.volumes = self._approximate_volumes()
-            self.highs = self.prices.copy()
-            self.lows = self.prices.copy()
-    
-    def _generate_synthetic_prices(self):
-        """Generate synthetic price data when API data is unavailable"""
-        change_24h = self.coin.get('price_change_percentage_24h', 0) / 100
-        base_price = self.current_price / (1 + change_24h)
-        
-        prices = []
-        for i in range(50):
-            progress = i / 49
-            noise = np.random.normal(0, 0.02)
-            price = base_price * (1 + change_24h * progress + noise)
-            prices.append(max(0.0001, price))
-        
-        return prices
-    
-    def _approximate_volumes(self):
-        """Approximate volume distribution"""
-        total_volume = self.coin.get('total_volume', 1000000)
-        avg_volume = total_volume / len(self.prices)
-        
-        volumes = []
-        for _ in range(len(self.prices)):
-            volume_multiplier = np.random.uniform(0.5, 1.5)
-            volumes.append(avg_volume * volume_multiplier)
-        
-        return volumes
-    
-    def analyze_volatility(self):
-        """Analyze volatility using ATR and price data"""
+    def __init__(self, info):
+        self.info         = info
+        self.symbol       = info["symbol"]
+        self.raw_symbol   = info["raw_symbol"]
+        self.price        = info["current_price"]
+        # Grab price history
+        prices, vols, highs, lows = fetch_klines(self.raw_symbol)
+        if len(prices) < 20:  # fallback synthetic
+            prices = self._synthetic_prices()
+            vols   = [info["total_volume"]/len(prices)]*len(prices)
+            highs  = prices[:]
+            lows   = prices[:]
+        self.prices, self.vols, self.highs, self.lows = prices, vols, highs, lows
+
+    def _synthetic_prices(self, n=60):
+        pc = self.price
+        return [pc*(1+np.random.normal(0,0.02)) for _ in range(n)]
+
+    # ───── metrics ─────
+    def volatility(self):
+        upper, mid, lower = calculate_bollinger(self.prices)
+        if not mid:
+            return "low", None, None
+        width = (upper - lower)/mid
+        regime = "medium"
+        if width < 0.05: regime = "low"
+        if width > 0.15: regime = "high"
         atr = calculate_atr(self.highs, self.lows, self.prices)
-        upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(self.prices)
-        
-        bb_width = ((upper_bb - lower_bb) / middle_bb) if all(x is not None for x in [upper_bb, lower_bb, middle_bb]) else None
-        
-        if bb_width and bb_width > 0.15:
-            regime = "high"
-        elif bb_width and bb_width < 0.05:
-            regime = "low"
+        return regime, width, atr
+
+    def trend(self):
+        sma20 = calculate_sma(self.prices, 20)
+        sma50 = calculate_sma(self.prices, 50)
+        if not sma20 or not sma50:
+            return "neutral", 0.5
+        if sma20 > sma50*1.02:
+            return "bullish", 0.7
+        if sma20 < sma50*0.98:
+            return "bearish", 0.7
+        return "neutral", 0.3
+
+    def rsi_signal(self):
+        rsi = calculate_rsi(self.prices) or 50
+        if rsi <= 30: return rsi, "oversold"
+        if rsi >= 70: return rsi, "overbought"
+        if rsi <= 35: return rsi, "approaching_oversold"
+        if rsi >= 65: return rsi, "approaching_overbought"
+        return rsi, "neutral"
+
+    # ───── score ─────
+    def score(self):
+        vol_regime, width, atr = self.volatility()
+        trend_dir, trend_str   = self.trend()
+        rsi, rsi_sig           = self.rsi_signal()
+
+        score, reasons = 0, []
+
+        # volatility
+        if vol_regime == "medium":
+            score += 30; reasons.append("Medium volatility ideal for grids")
+        elif vol_regime == "low":
+            score += 15; reasons.append("Low volatility still OK for tight grids")
         else:
-            regime = "medium"
-        
+            score += 5;  reasons.append("High volatility → wide grids")
+
+        # trend
+        if trend_dir == "neutral":
+            score += 25; reasons.append("Sideways trend beneficial")
+        elif trend_str < 0.6:
+            score += 15; reasons.append("Weak trend acceptable")
+
+        # rsi
+        if rsi_sig in {"oversold","overbought"}:
+            score += 20; reasons.append(f"RSI {rsi_sig}")
+        elif rsi_sig.startswith("approaching"):
+            score += 10; reasons.append(f"RSI {rsi_sig.replace('_',' ')}")
+
+        # volume
+        vol24 = self.info["total_volume"]
+        if vol24 > 50_000_000:
+            score += 15; reasons.append("High liquidity")
+        elif vol24 > MIN_VOLUME:
+            score += 10; reasons.append("Adequate liquidity")
+
+        # price stability
+        if abs(self.info["price_change_percentage_24h"]) < 5:
+            score += 10; reasons.append("Stable price")
+
+        tier = "small"
+        mc   = self.info["market_cap"]
+        if mc >= 10_000_000_000:
+            tier = "large"
+        elif mc >= 1_000_000_000:
+            tier = "mid"
+
+        suit = "poor"
+        if score >= 70: suit = "excellent"
+        elif score >= 50: suit = "good"
+        elif score >= 30: suit = "moderate"
+
         return {
-            "regime": regime,
-            "atr": atr,
-            "atr_pct": (atr / self.current_price * 100) if atr else None,
-            "bb_width": bb_width
-        }
-    
-    def analyze_trend(self):
-        """Analyze trend using moving averages"""
-        if len(self.prices) < 50:
-            return {"trend": "neutral", "strength": 0.5}
-        
-        sma_20 = calculate_sma(self.prices, 20)
-        sma_50 = calculate_sma(self.prices, 50)
-        
-        if sma_20 and sma_50:
-            if sma_20 > sma_50 * 1.02:
-                trend, strength = "bullish", 0.7
-            elif sma_20 < sma_50 * 0.98:
-                trend, strength = "bearish", 0.7
-            else:
-                trend, strength = "neutral", 0.3
-        else:
-            trend, strength = "neutral", 0.5
-        
-        return {"trend": trend, "strength": strength}
-    
-    def analyze_rsi_signals(self):
-        """Analyze RSI for entry signals"""
-        rsi = calculate_rsi(self.prices)
-        if rsi is None:
-            return {"rsi": None, "signal": "neutral"}
-        
-        if rsi <= 30:
-            signal = "oversold"
-        elif rsi >= 70:
-            signal = "overbought"
-        elif rsi <= 35:
-            signal = "approaching_oversold"
-        elif rsi >= 65:
-            signal = "approaching_overbought"
-        else:
-            signal = "neutral"
-        
-        return {"rsi": rsi, "signal": signal}
-    
-    def calculate_grid_suitability(self):
-        """Calculate grid trading suitability score"""
-        volatility = self.analyze_volatility()
-        trend = self.analyze_trend()
-        rsi = self.analyze_rsi_signals()
-        
-        score = 0
-        reasons = []
-        
-        # Volatility factor
-        if volatility["regime"] == "medium":
-            score += 30
-            reasons.append("Optimal volatility for grid trading")
-        elif volatility["regime"] == "low":
-            score += 15
-            reasons.append("Low volatility suitable for tight grids")
-        else:
-            score += 5
-            reasons.append("High volatility requires careful management")
-        
-        # Trend factor
-        if trend["trend"] == "neutral":
-            score += 25
-            reasons.append("Sideways trend ideal for grid strategy")
-        elif trend["strength"] < 0.6:
-            score += 15
-            reasons.append("Weak trend allows grid opportunities")
-        
-        # RSI factor
-        if rsi["signal"] in ["oversold", "overbought"]:
-            score += 20
-            reasons.append(f"RSI shows {rsi['signal']} conditions")
-        elif rsi["signal"] in ["approaching_oversold", "approaching_overbought"]:
-            score += 10
-            reasons.append("RSI approaching extreme levels")
-        
-        # Volume factor
-        volume_24h = self.coin.get('total_volume', 0)
-        if volume_24h > 50_000_000:
-            score += 15
-            reasons.append("High trading volume ensures liquidity")
-        elif volume_24h > MIN_VOLUME:
-            score += 10
-            reasons.append("Adequate trading volume")
-        
-        # Price stability (based on 24h change)
-        price_change_24h = abs(self.coin.get('price_change_percentage_24h', 0))
-        if price_change_24h < 5:
-            score += 10
-            reasons.append("Stable price movement")
-        
-        if score >= 70:
-            suitability = "excellent"
-        elif score >= 50:
-            suitability = "good"
-        elif score >= 30:
-            suitability = "moderate"
-        else:
-            suitability = "poor"
-        
-        return {
-            "score": score,
-            "suitability": suitability,
-            "reasons": reasons,
-            "volatility": volatility,
-            "trend": trend,
-            "rsi": rsi
-        }
-    
-    def calculate_optimal_grid_parameters(self):
-        """Calculate optimal grid parameters"""
-        analysis = self.calculate_grid_suitability()
-        
-        if analysis["suitability"] == "poor":
-            return None
-        
-        # Base parameters
-        market_cap = self.coin.get('market_cap', 0)
-        if market_cap >= 10_000_000_000:
-            base_params = {"spacing": 0.004, "max_grids": 120, "tier": "large"}
-        elif market_cap >= 1_000_000_000:
-            base_params = {"spacing": 0.006, "max_grids": 100, "tier": "mid"}
-        else:
-            base_params = {"spacing": 0.008, "max_grids": 80, "tier": "small"}
-        
-        # Adjust for volatility
-        vol_regime = analysis["volatility"]["regime"]
-        if vol_regime == "high":
-            spacing_multiplier = 2.0
-            grid_mode = "Geometric"
-        elif vol_regime == "medium":
-            spacing_multiplier = 1.2
-            grid_mode = "Arithmetic"
-        else:
-            spacing_multiplier = 0.8
-            grid_mode = "Arithmetic"
-        
-        # Calculate price range
-        volatility_pct = analysis["volatility"]["atr_pct"] or 5
-        min_price = self.current_price * (1 - volatility_pct * 0.01 * 2)
-        max_price = self.current_price * (1 + volatility_pct * 0.01 * 2)
-        
-        final_spacing = base_params["spacing"] * spacing_multiplier
-        price_range = max_price - min_price
-        optimal_grids = min(base_params["max_grids"], max(15, int(price_range / (self.current_price * final_spacing))))
-        
-        # Determine direction
-        rsi_signal = analysis["rsi"]["signal"]
-        trend_direction = analysis["trend"]["trend"]
-        
-        if rsi_signal in ["oversold", "approaching_oversold"] and trend_direction != "bearish":
-            direction = "Long"
-            confidence = "High" if rsi_signal == "oversold" else "Medium"
-        elif rsi_signal in ["overbought", "approaching_overbought"] and trend_direction != "bullish":
-            direction = "Short"
-            confidence = "High" if rsi_signal == "overbought" else "Medium"
-        else:
-            direction = "Neutral"
-            confidence = "Medium"
-        
-        return {
-            "min_price": min_price,
-            "max_price": max_price,
-            "grid_count": optimal_grids,
-            "grid_mode": grid_mode,
-            "direction": direction,
-            "confidence": confidence,
-            "spacing_pct": final_spacing * 100,
-            "market_tier": base_params["tier"],
-            "analysis": analysis
+            "score"     : score,
+            "suitability": suit,
+            "reasons"   : reasons,
+            "vol_regime": vol_regime,
+            "bb_width"  : width,
+            "atr_pct"   : (atr/self.price*100) if atr else None,
+            "trend"     : (trend_dir, trend_str),
+            "rsi"       : (rsi, rsi_sig),
+            "tier"      : tier
         }
 
-def format_price(value):
-    """Format price with appropriate decimal places"""
-    if value >= 100:
-        return f"${value:.2f}"
-    elif value >= 1:
-        return f"${value:.4f}"
-    elif value >= 0.01:
-        return f"${value:.6f}"
-    else:
-        return f"${value:.10f}"
+# ────────────────────  MAIN WORKFLOW  ─────────────────────
+def fetch_market_candidates():
+    tickers = fetch_perp_tickers()
+    out = []
+    for tk in tickers:
+        sym = tk["symbol"]          # e.g. BTC_USDT
+        base = sym.split("_")[0]
 
-def escape_markdown(text):
-    """Escape special characters for Telegram markdown"""
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '=', '|', '{', '}', '!']
-    for char in special_chars:
-        text = text.replace(char, f'\\{char}')
-    return text
+        if is_excluded(base):
+            continue
 
-def create_grid_alert(analyzer, grid_params):
-    """Create grid trading alert"""
-    symbol = analyzer.symbol
-    current_price = analyzer.current_price
-    analysis = grid_params["analysis"]
-    
-    suitability_emoji = {
-        "excellent": "🔥", "good": "⚡", "moderate": "⚠️"
-    }[analysis["suitability"]]
-    
-    direction_emoji = {"Long": "🟢", "Short": "🔴", "Neutral": "🟡"}[grid_params["direction"]]
-    
-    alert = f"{direction_emoji} *{symbol}* PERP {suitability_emoji} | {grid_params['market_tier'].upper()}-CAP\n"
-    alert += f"💰 *Current Price:* `{format_price(current_price)}`\n"
-    alert += f"📊 *GRID PARAMETERS*\n"
-    alert += f"• Range: `{format_price(grid_params['min_price'])} - {format_price(grid_params['max_price'])}`\n"
-    alert += f"• Grids: `{grid_params['grid_count']} ({grid_params['grid_mode']})`\n"
-    alert += f"• Direction: `{grid_params['direction']}` ({grid_params['confidence']} confidence)\n"
-    alert += f"• Spacing: `{grid_params['spacing_pct']:.2f}%`\n"
-    
-    # Technical analysis
-    alert += f"\n🔍 *TECHNICAL SIGNALS*\n"
-    
-    rsi_data = analysis["rsi"]
-    if rsi_data["rsi"]:
-        alert += f"• RSI: `{rsi_data['rsi']:.1f}` ({rsi_data['signal']})\n"
-    
-    trend = analysis["trend"]
-    alert += f"• Trend: `{trend['trend'].title()}`\n"
-    
-    vol = analysis["volatility"]
-    alert += f"• Volatility: `{vol['regime'].title()}`\n"
-    if vol["atr_pct"]:
-        alert += f"• ATR: `{vol['atr_pct']:.2f}%`\n"
-    
-    # Key reasons
-    alert += f"\n💡 *KEY FACTORS*\n"
-    for i, reason in enumerate(analysis["reasons"][:3], 1):
-        alert += f"{i}. {reason}\n"
-    
-    alert += f"\n📈 *Score:* `{analysis['score']}/100`"
-    
-    return alert
+        price  = float(tk["close"])
+        vol24  = float(tk["amount"])
+        if price < MIN_PRICE or vol24 < MIN_VOLUME:
+            continue
+
+        open_px = float(tk["open"])
+        change  = (price - open_px) / open_px * 100 if open_px else 0
+
+        out.append({
+            "symbol"         : base,
+            "raw_symbol"     : sym,
+            "current_price"  : price,
+            "total_volume"   : vol24,
+            "price_change_percentage_24h": change,
+            "market_cap"     : vol24*24,   # rough proxy
+        })
+    logging.info(f"Filtered to {len(out)} PERP candidates")
+    return out
+
+def build_alert(analyzer, meta):
+    score = meta["score"]
+    suit  = meta["suitability"]
+    emoji = {"excellent":"🔥","good":"⚡","moderate":"⚠️","poor":"❌"}[suit]
+    dir_emoji = {"Long":"🟢","Short":"🔴","Neutral":"🟡"}
+
+    # quick grid params
+    spacing = 0.006 if meta["vol_regime"]=="medium" else 0.012
+    grids   = 100 if meta["tier"]!="small" else 80
+    direction = "Neutral"
+    conf      = "Medium"
+    rsi_val, rsi_sig = meta["rsi"]
+    if rsi_sig in {"oversold","approaching_oversold"}:
+        direction = "Long"
+        conf      = "High" if rsi_sig=="oversold" else "Medium"
+    elif rsi_sig in {"overbought","approaching_overbought"}:
+        direction = "Short"
+        conf      = "High" if rsi_sig=="overbought" else "Medium"
+
+    msg  = f"{dir_emoji[direction]} *{analyzer.symbol}* PERP {emoji}\n"
+    msg += f"Price: `{format_price(analyzer.price)}`\n"
+    msg += f"Grids: `{grids}` • Spacing: `{spacing*100:.2f}%` • Dir: `{direction}` ({conf})\n"
+    msg += f"Score: `{score}/100` ({suit})\n"
+    msg += "Reasons:\n"
+    for r in meta["reasons"][:3]:
+        msg += f"• {r}\n"
+    return msg
 
 def main():
-    """Main function using corrected Pionex API"""
+    logging.info("Starting Pionex futures grid scan …")
     try:
-        logging.info("Starting Pionex-only grid analysis for futures...")
-        market_data = fetch_pionex_market_data()
-        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        cands = fetch_market_candidates()
+    except Exception as exc:
+        logging.error(f"Pionex API error: {exc}")
+        send_telegram(f"*GRID SCAN ERROR*\n{md_escape(str(exc))}")
+        return
 
-        if not market_data:
-            logging.info("No market data available from Pionex")
-            send_telegram(f"*PIONEX FUTURES GRID ANALYSIS -- {ts}*\n\n❌ No market data available. Possible issues:\n• API endpoints may have changed\n• Network connectivity issues\n• Rate limiting")
-            return
-
-        suitable_alerts = []
-        processed_count = 0
-
-        for coin in market_data:
-            processed_count += 1
-            
-            try:
-                analyzer = GridAnalyzer(coin)
-                grid_params = analyzer.calculate_optimal_grid_parameters()
-                
-                if grid_params is None:
-                    continue
-                
-                alert = create_grid_alert(analyzer, grid_params)
-                suitable_alerts.append((alert, grid_params["analysis"]["score"]))
-                
-                logging.info(f"Added alert: {coin['symbol']} (Score: {grid_params['analysis']['score']})")
-                
-            except Exception as e:
-                logging.error(f"Error analyzing {coin['symbol']}: {e}")
+    alerts = []
+    for info in cands:
+        try:
+            ga   = GridAnalyzer(info)
+            meta = ga.score()
+            if meta["suitability"] == "poor":
                 continue
+            alerts.append((meta["score"], build_alert(ga, meta)))
+        except Exception as exc:
+            logging.debug(f"{info['symbol']} analysis failed: {exc}")
 
-        # Sort by score and take top 5
-        suitable_alerts.sort(key=lambda x: x[1], reverse=True)
-        top_alerts = [alert[0] for alert in suitable_alerts[:MAX_RECOMMENDATIONS]]
+    alerts.sort(key=lambda x: x[0], reverse=True)
+    top = alerts[:MAX_RECOMMEND]
 
-        # Compose final message
-        message = f"*🚀 PIONEX FUTURES GRID OPPORTUNITIES -- {escape_markdown(ts)}*\n\n"
-        message += f"📊 Analyzed: {processed_count} PERP contracts | Top: {len(top_alerts)}\n\n"
-        
-        if top_alerts:
-            message += "*🎯 TOP 5 FUTURES GRID SETUPS*\n\n" + '\n\n'.join(top_alerts)
-        else:
-            message += '❌ No suitable futures grid opportunities found.\n'
-            message += '📈 Current market conditions may not favor grid trading.'
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    header = f"*🚀 PIONEX FUTURES GRID SCAN  —  {md_escape(ts)}*\n"
+    header+= f"Analyzed `{len(cands)}` pairs • Showing top `{len(top)}`\n\n"
 
-        message += '\n\n*📚 DATA SOURCE*\n'
-        message += 'Analysis powered by Pionex API - Real-time perpetual contract data'
+    if not top:
+        header += "❌ No suitable opportunities right now."
+    else:
+        header += "\n\n".join(a for _, a in top)
 
-        logging.info(f"Sending Pionex analysis message ({len(top_alerts)} opportunities)")
-        send_telegram(message)
-        logging.info("Pionex futures grid analysis completed successfully")
+    send_telegram(header)
+    logging.info("Scan complete.")
 
-    except Exception as e:
-        logging.error(f"Error in main(): {e}")
-        send_telegram(f"*PIONEX GRID ANALYSIS ERROR*\nError: {str(e)[:100]}...")
-
+# ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
