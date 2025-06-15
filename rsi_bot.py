@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""
-Pionex Futures‑Grid Scanner  (rsi_bot.py)
-
-FIXED: Main tokens now bypass volume filter to ensure they always appear
-"""
-
 import os
 import logging
 from datetime import datetime, timezone
@@ -160,6 +153,52 @@ class GridAnalyzer:
         if r>=65: return r,"approaching_overbought"
         return r,"neutral"
 
+    def get_market_cap_category(self):
+        """Determine market cap category based on volume and token"""
+        vol = self.info["total_volume"]
+        if self.symbol.upper() in {"BTC", "ETH"}: return "MEGA-CAP"
+        if self.symbol.upper() in {"SOL"}: return "LARGE-CAP"
+        if self.symbol.upper() in {"HYPE"}: return "MID-CAP"
+        if vol > 50_000_000: return "LARGE-CAP"
+        if vol > 20_000_000: return "MID-CAP"
+        return "SMALL-CAP"
+
+    def get_grid_params(self, rsi_val, volatility_pct):
+        """Calculate grid parameters based on RSI and volatility"""
+        # Price range calculation
+        if rsi_val <= 30:  # Oversold
+            lower_bound = self.px * 0.97
+            upper_bound = self.px * 1.06
+        elif rsi_val >= 70:  # Overbought
+            lower_bound = self.px * 0.94
+            upper_bound = self.px * 1.03
+        else:  # Neutral
+            lower_bound = self.px * 0.95
+            upper_bound = self.px * 1.05
+
+        # Grid count based on volatility and market cap
+        is_main = self.symbol.upper() in MAIN_TOKENS
+        if volatility_pct > 15:
+            grid_count = 150 if is_main else 65
+        elif volatility_pct > 10:
+            grid_count = 120 if is_main else 85
+        else:
+            grid_count = 85 if is_main else 55
+
+        # Grid mode based on volatility
+        grid_mode = "Geometric" if volatility_pct > 15 else "Arithmetic"
+        
+        # Expected cycles based on volatility
+        cycles_per_day = int(volatility_pct * 2)
+        
+        return {
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "grid_count": grid_count,
+            "grid_mode": grid_mode,
+            "cycles_per_day": cycles_per_day
+        }
+
     # -------- scoring --------
     def score(self):
         vol_reg, width, _atr = self.volatility()
@@ -195,47 +234,85 @@ class GridAnalyzer:
         # More lenient scoring for main tokens
         suit="poor"
         if is_main:
-            if score>=50: suit="excellent"
-            elif score>=35: suit="good"
-            elif score>=20: suit="moderate"
+            if score>=40: suit="excellent"
+            elif score>=25: suit="good"
+            elif score>=15: suit="moderate"
         else:
             if score>=70: suit="excellent"
             elif score>=50: suit="good"
             elif score>=30: suit="moderate"
 
         return {"score":score,"suit":suit,"vol_reg":vol_reg,"rsi_sig":rsi_sig,
-                "trend":tr_dir,"reasons":reasons}
+                "rsi_val":rsi_val,"trend":tr_dir,"reasons":reasons,
+                "volatility_pct": width*100 if width else 10}
 
 # ───────────── ALERT BUILDER ──────────────────────
 def build_alert(an, meta):
-    suit_e = {"excellent":"🔥","good":"⚡","moderate":"⚠️","poor":"❌"}[meta["suit"]]
-    dir_e  = {"Long":"🟢","Short":"🔴","Neutral":"🟡"}
-
-    direction="Neutral"; conf="Medium"
-    if meta["rsi_sig"] in {"oversold","approaching_oversold"}:
-        direction="Long"; conf="High" if meta["rsi_sig"]=="oversold" else "Medium"
-    elif meta["rsi_sig"] in {"overbought","approaching_overbought"}:
-        direction="Short"; conf="High" if meta["rsi_sig"]=="overbought" else "Medium"
-
-    spacing=0.006 if meta["vol_reg"]=="medium" else 0.012
-    grids=100
-
-    # Add volume indicator for context
-    vol_str = f"${an.info['total_volume']/1_000_000:.1f}M"
+    rsi_val = meta["rsi_val"]
+    volatility_pct = meta["volatility_pct"]
     
-    text  = f"{dir_e[direction]} *{an.symbol}* PERP {suit_e}\n"
-    text += f"Price `{fmt_price(an.px)}` • Score `{meta['score']}` • Vol `{vol_str}`\n"
-    text += f"Grids `{grids}` • Spacing `{spacing*100:.2f}%` • Dir `{direction}` ({conf})\n"
-    text += "Reasons:\n" + "\n".join(f"• {r}" for r in meta["reasons"][:3])
+    # Direction and emoji
+    if rsi_val <= 30:
+        direction = "Long"
+        direction_emoji = "🟢"
+        direction_desc = "Oversold conditions suggest potential rebound"
+    elif rsi_val >= 70:
+        direction = "Short"
+        direction_emoji = "🔴"
+        direction_desc = "Overbought conditions suggest potential decline"
+    else:
+        direction = "Neutral"
+        direction_emoji = "🟡"
+        direction_desc = "Neutral RSI perfect for range-bound grid trading"
+
+    # Quality indicator
+    if meta["suit"] == "excellent":
+        quality = "🔥"
+    elif meta["suit"] == "good":
+        quality = "⚡"
+    else:
+        quality = "⚠️"
+
+    # Market cap category
+    market_cap = an.get_market_cap_category()
+    
+    # Grid parameters
+    grid_params = an.get_grid_params(rsi_val, volatility_pct)
+    
+    # Stop loss for small tokens
+    is_main = an.symbol.upper() in MAIN_TOKENS
+    stop_loss = "Disabled" if is_main else "5%"
+    trailing = "Yes" if is_main else "No"
+    
+    # Build the alert
+    text = f"{direction_emoji} *{an.symbol}* RSI {rsi_val:.1f} | {market_cap}\n"
+    text += f"📊 *COMPLETE GRID SETUP*\n\n"
+    text += f"*Price Range:* {fmt_price(grid_params['lower_bound'])} - {fmt_price(grid_params['upper_bound'])}\n"
+    text += f"*Grid Count:* {grid_params['grid_count']} grids\n"
+    text += f"*Grid Mode:* {grid_params['grid_mode']}\n"
+    text += f"*Direction:* {direction} {quality}\n"
+    text += f"*Trailing:* {trailing}\n"
+    text += f"*Stop Loss:* {stop_loss}\n"
+    text += f"*Expected Cycles/Day:* ~{grid_params['cycles_per_day']}\n"
+    text += f"*Volatility:* {volatility_pct:.1f}% ({grid_params['grid_mode']} recommended)\n\n"
+    text += f"💡 *Analysis:* {direction_desc}\\. Recommended for {direction} bias grid\\."
+    
     return text
 
 # ────────────── MARKET FETCH ──────────────────────
 def fetch_candidates():
     out=[]
     for tk in fetch_perp_tickers():
-        sym_full = tk["symbol"]           # BTC_USDT  or  HYPE_USDT_PERP
-        raw_base = sym_full.split("_")[0] # BTC   or  HYPE
-        base     = raw_base.split(".")[0] # BTC   or  HYPE
+        # Handle different symbol formats
+        sym_full = tk["symbol"]
+        if "_PERP" in sym_full:
+            # Format: HYPE_USDT_PERP
+            parts = sym_full.split("_")
+            base = parts[0]
+        else:
+            # Format: BTC_USDT or HYPE.PERP_USDT
+            raw_base = sym_full.split("_")[0]
+            base = raw_base.split(".")[0]
 
         if is_excluded(base):
             continue
@@ -277,7 +354,7 @@ def main():
     for info in cands:
         try:
             ga=GridAnalyzer(info); meta=ga.score()
-            # FIXED: Don't filter out "poor" main tokens - let them show with warning
+            # FIXED: Don't filter out main tokens regardless of score
             is_main = info["symbol"].upper() in MAIN_TOKENS
             if meta["suit"]=="poor" and not is_main: 
                 continue
@@ -290,15 +367,19 @@ def main():
     main_alerts  =[a for sc,a,sym in scored if sym.upper() in MAIN_TOKENS]
     small_alerts =[a for sc,a,sym in scored if sym.upper() not in MAIN_TOKENS][:MAX_SMALL_ALERTS]
 
-    msg  = f"*🚀 PIONEX FUTURES GRID SCAN — {md_escape(ts)}*\n"
-    msg += f"Analyzed `{len(cands)}` pairs • Main `{len(main_alerts)}` • Small `{len(small_alerts)}`\n\n"
-
+    # Build message with original formatting
+    msg = f"🤖 *ENHANCED GRID TRADING ALERTS — {md_escape(ts)}*\n"
+    
     if main_alerts:
-        msg += "*🏆 MAIN TOKENS*\n" + "\n\n".join(main_alerts) + "\n\n"
+        msg += "*🏆 MAIN TOKENS*\n"
+        msg += "\n".join(main_alerts) + "\n"
+    
     if small_alerts:
-        msg += "*💎 TOP 5 SMALL TOKENS*\n" + "\n\n".join(small_alerts)
+        msg += "*💎 SMALLER OPPORTUNITIES*\n"
+        msg += "\n".join(small_alerts)
+    
     if not main_alerts and not small_alerts:
-        msg += "❌ No suitable opportunities."
+        msg += "❌ No suitable opportunities found\\."
 
     send_telegram(msg)
     logging.info("Scan complete.")
