@@ -63,57 +63,54 @@ def get_grid_setup(price, sparkline):
     return min_price, max_price, grids
 
 def main():
-    while True:
-        try:
-            market_data = fetch_market_data()
-            ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    try:
+        market_data = fetch_market_data()
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-            alerts = []
+        alerts = []
 
-            for coin in market_data:
-                id_ = coin['id']
-                current_price = coin['current_price']
-                symbol = coin['symbol'].upper()
-                sparkline = coin['sparkline_in_7d']['price'][-15:]  # Last 15 points
-                rsi = calc_rsi(sparkline)
+        for coin in market_data:
+            id_ = coin['id']
+            current_price = coin['current_price']
+            symbol = coin['symbol'].upper()
+            sparkline = coin['sparkline_in_7d']['price'][-15:]  # Last 15 points
+            rsi = calc_rsi(sparkline)
 
-                if rsi is None:
-                    continue
+            if rsi is None:
+                continue
 
-                grid_low, grid_high, grids = get_grid_setup(current_price, sparkline)
-                price_fmt = format_price(current_price)
-                low_fmt = format_price(grid_low)
-                high_fmt = format_price(grid_high)
+            grid_low, grid_high, grids = get_grid_setup(current_price, sparkline)
+            price_fmt = format_price(current_price)
+            low_fmt = format_price(grid_low)
+            high_fmt = format_price(grid_high)
 
-                suggestion = f"\n📊 {symbol} Grid Bot Suggestion\n• Price Range: {low_fmt} – {high_fmt}\n• Grids: {grids}\n• Mode: Arithmetic\n• Trailing: Disabled\n• Direction: "
-                reason = ""
+            suggestion = f"\n📊 {symbol} Grid Bot Suggestion\n• Price Range: {low_fmt} – {high_fmt}\n• Grids: {grids}\n• Mode: Arithmetic\n• Trailing: Disabled\n• Direction: "
+            reason = ""
 
-                if rsi <= 35:
-                    suggestion += "Long"
-                    reason = f"Oversold with RSI {rsi:.2f}, suggesting potential rebound."
-                elif rsi >= 65:
-                    suggestion += "Short"
-                    reason = f"Overbought with RSI {rsi:.2f}, suggesting potential decline."
-                else:
-                    suggestion += "Neutral"
-                    reason = f"Neutral with RSI {rsi:.2f}, indicating a ranging market."
+            if rsi <= 35:
+                suggestion += "Long"
+                reason = f"Oversold with RSI {rsi:.2f}, suggesting potential rebound."
+            elif rsi >= 65:
+                suggestion += "Short"
+                reason = f"Overbought with RSI {rsi:.2f}, suggesting potential decline."
+            else:
+                suggestion += "Neutral"
+                reason = f"Neutral with RSI {rsi:.2f}, indicating a ranging market."
 
-                alerts.append(f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}")
+            alerts.append(f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}")
 
-            message = f"*HOURLY GRID TRADING ALERT — {ts}*\n"
-            message += '\n\n'.join(alerts[:5]) if alerts else 'No suitable grid trading opportunities this hour.'
+        message = f"*HOURLY GRID TRADING ALERT — {ts}*\n"
+        message += '\n\n'.join(alerts[:5]) if alerts else 'No suitable grid trading opportunities this hour.'
 
-            send_telegram(message)
-            logging.info(f"Scan completed at {ts}")
+        send_telegram(message)
+        logging.info(f"Scan completed at {ts}")
 
-        except requests.exceptions.RequestException as e:
-            logging.error(f"API error: {e}")
-            send_telegram(f"API Error: {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error: {e}")
-            send_telegram(f"Unexpected Error: {e}")
-
-        time.sleep(3600)  # Wait 1 hour
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API error: {e}")
+        send_telegram(f"API Error: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        send_telegram(f"Unexpected Error: {e}")
 
 if __name__ == "__main__":
     main()
