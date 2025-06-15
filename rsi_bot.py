@@ -85,3 +85,103 @@ def fetch_market_data():
 
 def calc_rsi(prices):
     if len(prices) < 15:  # Need at least 15 points for 14-period RSI
+        return None
+    gains = []
+    losses = []
+    for i in range(1, 15):
+        delta = prices[-i] - prices[-(i + 1)]
+        gains.append(max(0, delta))
+        losses.append(max(0, -delta))
+    avg_gain = sum(gains) / 14
+    avg_loss = sum(losses) / 14
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def format_price(value):
+    if value >= 100:
+        return f"${value:.2f}"
+    elif value >= 1:
+        return f"${value:.4f}"
+    elif value >= 0.01:
+        return f"${value:.6f}"
+    else:
+        return f"${value:.10f}"
+
+def get_grid_setup(price, sparkline):
+    min_price = min(sparkline) * 0.95
+    max_price = max(sparkline) * 1.05
+    interval = price * 0.005  # 0.5% of current price
+    grids = max(10, min(500, round((max_price - min_price) / interval)))
+    return min_price, grid_high, grids
+
+def main():
+    try:
+        print("Starting scan...")
+        market_data = fetch_market_data()
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        main_alerts = []
+        small_alerts = []
+
+        if not market_data:
+            print("No market data available, sending empty alert")
+            send_telegram(f"*HOURLY GRID TRADING ALERT — {ts}*\nNo suitable grid trading opportunities this hour.")
+            return
+
+        for coin in market_data:
+            id_ = coin['id']
+            current_price = coin['current_price']
+            symbol = coin['symbol'].upper()
+            sparkline = coin['sparkline_in_7d']['price'][-15:]  # Last 15 points
+            rsi = calc_rsi(sparkline)
+
+            if rsi is None:
+                continue
+
+            grid_low, grid_high, grids = get_grid_setup(current_price, sparkline)
+            price_fmt = format_price(current_price)
+            low_fmt = format_price(grid_low)
+            high_fmt = format_price(grid_high)
+
+            suggestion = f"\n📊 {symbol} Grid Bot Suggestion\n• Price Range: {low_fmt} – {high_fmt}\n• Grids: {grids}\n• Mode: Arithmetic\n• Trailing: Disabled\n• Direction: "
+            reason = ""
+
+            if rsi <= 35:
+                suggestion += "Long"
+                reason = f"Oversold with RSI {rsi:.2f}, suggesting potential rebound."
+            elif rsi >= 65:
+                suggestion += "Short"
+                reason = f"Overbought with RSI {rsi:.2f}, suggesting potential decline."
+            else:
+                suggestion += "Neutral"
+                reason = f"Neutral with RSI {rsi:.2f}, indicating a ranging market."
+
+            alert = f"{'🔻' if rsi <= 35 else '🔺' if rsi >= 65 else '📈'} {symbol} RSI {rsi:.2f}{suggestion}\nReason: {reason}"
+            if id_ in MAIN_TOKENS:
+                main_alerts.append(alert)
+            else:
+                small_alerts.append(alert)
+
+        message = f"*HOURLY GRID TRADING ALERT — {ts}*\n"
+        if main_alerts:
+            message += "*Main Tokens*\n" + '\n\n'.join(main_alerts[:3]) + '\n'
+        if small_alerts:
+            message += "====\n*Smaller Tokens*\n" + '\n\n'.join(small_alerts[:3]) if small_alerts else ''
+        if not main_alerts and not small_alerts:
+            message += '\nNo suitable grid trading opportunities this hour.'
+
+        print(f"Sending Telegram message: {message[:50]}...")
+        send_telegram(message)
+        print("Scan completed")
+
+    except requests.exceptions.RequestException as e:
+        print(f"API Error: {e}")
+        send_telegram(f"API Error: {e}")
+    except Exception as e:
+        print(f"Unexpected Error: {e}")
+        send_telegram(f"Unexpected Error: {e}")
+
+if __name__ == "__main__":
+    main()
