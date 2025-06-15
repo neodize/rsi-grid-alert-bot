@@ -15,7 +15,7 @@ TOP_COINS_TO_EXCLUDE = 20  # Exclude top 20 coins to focus on smaller tokens
 MAIN_TOKENS = ['bitcoin', 'ethereum', 'solana', 'hyperliquid']  # Prioritized tokens
 
 # Logging setup
-logging.basicConfig(filename='grid_scanner.log', level=logging.INFO)
+logging.basicConfig(filename='grid_scanner.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -31,16 +31,22 @@ def fetch_market_data():
     response = requests.get(url)
     response.raise_for_status()
     data = [coin for coin in response.json() if coin['total_volume'] > MIN_VOLUME and coin['current_price'] > MIN_PRICE]
+    logging.info(f"Raw data count: {len(data)}")
     # Exclude table coins (e.g., BTC3L, ETH3S)
     filtered_data = [coin for coin in data if not re.search(r'(\d+[LS])$', coin['symbol'].upper())]
+    logging.info(f"After table coin filter: {len(filtered_data)}")
     # Exclude top 20 coins but ensure main tokens are included
     smaller_tokens = [coin for coin in filtered_data if filtered_data.index(coin) >= TOP_COINS_TO_EXCLUDE]
+    logging.info(f"After top 20 exclusion: {len(smaller_tokens)}")
     # Add main tokens if not already in the list
     for token_id in MAIN_TOKENS:
         if not any(coin['id'] == token_id for coin in smaller_tokens):
-            main_coin = next((coin for coin in filtered_data if coin['id'] == token_id), None)
+            main_coin = next((coin for coin in data if coin['id'] == token_id), None)
             if main_coin:
+                logging.info(f"Adding main token: {token_id}, price: {main_coin['current_price']}, volume: {main_coin['total_volume']}")
                 smaller_tokens.append(main_coin)
+            else:
+                logging.warning(f"Main token {token_id} not found in data")
     return smaller_tokens
 
 def calc_rsi(prices):
