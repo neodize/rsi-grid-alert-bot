@@ -15,7 +15,7 @@ MAIN_TOKENS      = {"BTC", "ETH", "SOL", "HYPE"}
 MIN_VOLUME       = 10_000_000      # 24 h notional (quote currency) - ONLY for small tokens
 MIN_VOLUME_MAIN  = 1_000_000       # Lower threshold for main tokens
 MIN_PRICE        = 0.01
-MAX_SMALL_ALERTS = 5
+MAX_SMALL_ALERTS = 10
 
 WRAPPED_TOKENS = {
     "WBTC","WETH","WSOL","WBNB","WMATIC","WAVAX","WFTM","CBBTC","CBETH",
