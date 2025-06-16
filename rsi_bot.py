@@ -185,6 +185,15 @@ def convert_symbol_for_klines(symbol: str) -> str:
         # Remove _PERP suffix
         base_symbol = symbol.replace("_PERP", "")
         
+        # Handle cross-pair perpetuals (e.g., AAVE_ETH_PERP, ADA_BTC_PERP)
+        # These likely don't have corresponding spot pairs, skip them
+        if "_ETH" in base_symbol or "_BTC" in base_symbol:
+            if not base_symbol.endswith("_USDT"):
+                # For cross pairs, we'll try to use the base asset with USDT
+                # e.g., AAVE_ETH -> AAVE_USDT
+                base_asset = base_symbol.split("_")[0]
+                return f"{base_asset}_USDT"
+        
         # If it already ends with _USDT, use as-is
         if base_symbol.endswith("_USDT"):
             return base_symbol
@@ -194,7 +203,7 @@ def convert_symbol_for_klines(symbol: str) -> str:
     
     return symbol
 
-def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> Tuple[List[float], List[float], List[float]]:
+def fetch_klines(symbol: str, interval: str = "60M", limit: int = 200) -> Tuple[List[float], List[float], List[float]]:
     """Fetch kline data with improved error handling and conversion"""
     spot_symbol = convert_symbol_for_klines(symbol)
     url = f"{PIONEX_API}/api/v1/market/klines"
@@ -352,7 +361,7 @@ def analyze_symbol(ticker: Dict) -> Optional[Dict]:
         volume_24h = float(ticker.get("turnover", 0))
         
         # Fetch price history
-        closes, highs, lows = fetch_klines(symbol, "1h", 200)
+        closes, highs, lows = fetch_klines(symbol, "60M", 200)
         
         # Calculate Bollinger Bands
         upper_band, middle_band, lower_band = bollinger_bands(closes)
