@@ -203,9 +203,17 @@ def convert_symbol_for_klines(symbol: str) -> str:
     
     return symbol
 
+# Cache for invalid symbols to avoid repeated API calls
+INVALID_SYMBOLS = set()
+
 def fetch_klines(symbol: str, interval: str = "60M", limit: int = 200) -> Tuple[List[float], List[float], List[float]]:
     """Fetch kline data with improved error handling and conversion"""
     spot_symbol = convert_symbol_for_klines(symbol)
+    
+    # Skip if we know this symbol is invalid
+    if spot_symbol in INVALID_SYMBOLS:
+        raise RuntimeError(f"Skipping known invalid symbol: {spot_symbol}")
+    
     url = f"{PIONEX_API}/api/v1/market/klines"
     
     logger.debug(f"Fetching klines for {symbol} -> {spot_symbol}")
@@ -222,8 +230,15 @@ def fetch_klines(symbol: str, interval: str = "60M", limit: int = 200) -> Tuple[
     # Validate response
     if data.get("code", 0) != 0:
         error_msg = data.get("message", "Unknown error")
+        
+        # Cache invalid symbols to avoid future attempts
+        if "invalid symbol" in error_msg.lower() or "symbol error" in error_msg.lower():
+            INVALID_SYMBOLS.add(spot_symbol)
+            if spot_symbol != symbol:
+                INVALID_SYMBOLS.add(symbol)
+        
         # Try without conversion if original conversion failed
-        if "symbol error" in error_msg.lower() and spot_symbol != symbol:
+        if ("symbol error" in error_msg.lower() or "invalid symbol" in error_msg.lower()) and spot_symbol != symbol and symbol not in INVALID_SYMBOLS:
             logger.debug(f"Symbol conversion failed for {symbol}, trying original symbol")
             try:
                 data = make_api_request(url, {
@@ -232,8 +247,10 @@ def fetch_klines(symbol: str, interval: str = "60M", limit: int = 200) -> Tuple[
                     "limit": limit
                 })
                 if data.get("code", 0) != 0:
+                    INVALID_SYMBOLS.add(symbol)
                     raise RuntimeError(f"Klines API error for {symbol}: {data.get('message', 'Unknown error')}")
             except Exception:
+                INVALID_SYMBOLS.add(symbol)
                 raise RuntimeError(f"Klines API error for {symbol} (tried both {spot_symbol} and {symbol}): {error_msg}")
         else:
             raise RuntimeError(f"Klines API error for {symbol}: {error_msg}")
