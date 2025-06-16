@@ -1,190 +1,103 @@
-"""Enhanced Grid Scanner – v3.2
-================================
-Fixes & diagnostics:
-1. **Correct ticker endpoint** → `/api/v1/market/tickers?type=PERP`.
-2. **Proper symbol conversion** for klines (`BTC_PERP` → `BTC_USDT`).
-3. **Detailed logging** for every rejection (width, volume, cycles).
-4. Adds third fallback mode `loose` (width 2‑30 %, vol ≥ 500k, cycles ≥ 0.2).
-5. Keeps multi‑message Telegram output (3 coins per chunk).
-6. 🔧 Now uses correct `turnover` field for USDT volume.
-7. 🔧 Reduced filter volume thresholds to increase matches.
-
-Adjust filters easily via `.env`:
-```
-SCAN_MODE=conservative   # conservative → aggressive → loose
-```
-If conservative returns zero, script auto‑tries aggressive; if still zero,
-it tries loose.
-"""
-
-from __future__ import annotations
-
-import os
 import requests
 import logging
-import time
-from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
-
-# ───────────────────── CONFIG ──────────────────────
 PIONEX_API = "https://api.pionex.com"
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SCAN_MODE        = os.getenv("SCAN_MODE", "conservative").lower()
-TOP_N_RESULTS    = 10
-CHUNK_SIZE       = 3800  # telegram safe
+TIMEFRAME = "1h"
+LIMIT = 24
+MIN_VOLUME_M_USDT = 1.5
+MIN_WIDTH_PCT = 0.75
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ─────────────── TELEGRAM HELPERS ──────────────────
 
-def tg_send(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram creds missing – skip send")
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        ).raise_for_status()
-    except Exception as exc:
-        logging.error(f"Telegram send failed: {exc}")
+def fetch_perp_universe() -> set[str]:
+    url = f"{PIONEX_API}/api/v1/common/symbols"
+    js = requests.get(url, params={"type": "PERP"}, timeout=10).json()
+    return {s["symbol"] for s in js.get("data", [])}
 
-# ─────────────── DATA FETCHERS ────────────────────
 
-def fetch_perp_tickers() -> List[Dict]:
+def fetch_perp_tickers() -> list[dict]:
     url = f"{PIONEX_API}/api/v1/market/tickers"
-    try:
-        rsp = requests.get(url, params={"type": "PERP"}, timeout=10)
-        rsp.raise_for_status()
-        js = rsp.json()
-    except Exception as exc:
-        raise RuntimeError(f"Ticker fetch error: {exc}") from exc
-
-    if js.get("code", 0) != 0 or "data" not in js or "tickers" not in js["data"]:
-        raise RuntimeError(f"Unexpected ticker payload: {js}")
-    return js["data"]["tickers"]
+    js = requests.get(url, params={"type": "PERP"}, timeout=10).json()
+    return js.get("data", [])
 
 
-def fetch_klines(sym_full: str, interval: str = "1h", limit: int = 200):
-    if sym_full.endswith("_PERP"):
-        spot_sym = sym_full.replace("_PERP", "_USDT")
-    else:
-        spot_sym = sym_full
+def fetch_klines(symbol: str, interval: str = TIMEFRAME, limit: int = LIMIT) -> list[dict]:
     url = f"{PIONEX_API}/api/v1/market/klines"
-    rsp = requests.get(url, params={"symbol": spot_sym, "interval": interval, "limit": limit}, timeout=10)
-    rsp.raise_for_status()
-    js = rsp.json()
-    if js.get("code", 0) != 0 or "data" not in js or "klines" not in js["data"]:
-        raise RuntimeError(f"Kline fetch failed {sym_full}: {js}")
-    closes = [float(k["close"]) for k in js["data"]["klines"]]
-    highs  = [float(k["high"])  for k in js["data"]["klines"]]
-    lows   = [float(k["low"])   for k in js["data"]["klines"]]
-    return closes, highs, lows
-
-# ─────────────── UTILS ────────────────────────────
-
-def bollinger(prices: List[float], n: int = 20, k: float = 2.0):
-    if len(prices) < n:
-        return None, None, None
-    ma = np.mean(prices[-n:])
-    sd = np.std(prices[-n:])
-    return ma + k * sd, ma, ma - k * sd
-
-def est_cycles(width_pct: float) -> float:
-    return width_pct * 2 / 100  # rough 2 cycles per 1% width
-
-# ─────────────── FILTER LOGIC ─────────────────────
-
-FILTERS = {
-    "conservative": dict(width=(5, 15), vol=3_000_000, cycles=1.0),
-    "aggressive":   dict(width=(3, 25), vol=1_000_000,  cycles=0.5),
-    "loose":        dict(width=(2, 30), vol=500_000,    cycles=0.2),
-}
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        res = requests.get(url, params=params, timeout=10).json()
+        if not res.get("data"):
+            return []
+        return res["data"]
+    except Exception:
+        return []
 
 
-def passes_filters(width_pct: float, vol: float, cycles: float, mode: str) -> bool:
-    f = FILTERS[mode]
-    return (f["width"][0] <= width_pct <= f["width"][1] and
-            vol >= f["vol"] and
-            cycles >= f["cycles"])
+def count_price_cycles(prices: list[float]) -> int:
+    if len(prices) < 3:
+        return 0
+    count = 0
+    trend = 0  # +1 up, -1 down
+    for i in range(1, len(prices)):
+        if prices[i] > prices[i - 1] and trend != 1:
+            count += 1
+            trend = 1
+        elif prices[i] < prices[i - 1] and trend != -1:
+            count += 1
+            trend = -1
+    return count // 2
 
-# ─────────────── ANALYSIS ─────────────────────────
 
-def analyse(mode: str) -> List[Dict]:
-    tickers = fetch_perp_tickers()
+def analyse(mode: str = "conservative") -> list[dict]:
+    active = fetch_perp_universe()
+    tickers = [t for t in fetch_perp_tickers() if t["symbol"] in active]
     results = []
-    for tk in tickers:
-        sym = tk["symbol"]
-        price = float(tk["close"])
-        vol24 = float(tk.get("turnover", 0))
-        try:
-            closes, highs, lows = fetch_klines(sym, "1h", 200)
-            ub, mid, lb = bollinger(closes)
-            if mid is None:
-                logging.info(f"{sym} skipped: insufficient klines")
-                continue
-            width_pct = (ub - lb) / mid * 100
-            cycles = est_cycles(width_pct)
-            if passes_filters(width_pct, vol24, cycles, mode):
-                results.append({
-                    "symbol": sym,
-                    "price": price,
-                    "lower": lb,
-                    "upper": ub,
-                    "width": round(width_pct, 2),
-                    "cycles": round(cycles, 2),
-                })
-            else:
-                logging.info(
-                    f"{sym} REJECT {mode} | width: {width_pct:.2f}% | vol: {vol24/1e6:.1f}M | cycles: {cycles:.2f}")
-        except Exception as exc:
-            logging.info(f"{sym} error: {exc}")
+
+    def worker(ticker):
+        symbol = ticker["symbol"]
+        price = float(ticker["price"])
+        volume = float(ticker["baseVolume24h"]) * price / 1e6  # in million USDT
+        if volume < MIN_VOLUME_M_USDT:
+            return None
+
+        klines = fetch_klines(symbol)
+        if len(klines) < LIMIT:
+            return None
+
+        closes = [float(k["close"]) for k in klines]
+        high = max(closes)
+        low = min(closes)
+        width_pct = (high - low) / low * 100
+        cycles = count_price_cycles(closes)
+
+        # Conservative: must meet all 3 filters
+        if mode == "conservative":
+            if width_pct < MIN_WIDTH_PCT or cycles < 4:
+                return None
+        elif mode == "aggressive":
+            if cycles < 2:
+                return None
+
+        logging.info(f"{symbol} ✅ {width_pct:.2f}% range, {volume:.2f}M vol, {cycles} cycles")
+        return {
+            "symbol": symbol,
+            "volume_m": volume,
+            "range_pct": width_pct,
+            "cycles": cycles
+        }
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for res in pool.map(worker, tickers):
+            if res:
+                results.append(res)
+
     return sorted(results, key=lambda x: -x["cycles"])
 
-# ─────────────── FORMAT & SEND ────────────────────
 
-def fmt_alert(d: Dict) -> str:
-    return (
-        f"*{d['symbol']}*  |  {d['width']}% width  |  {d['cycles']} cycles/day\n"
-        f"Range: `${d['lower']:.4f}` – `${d['upper']:.4f}`\n"
-        f"Leverage: 10× Futures\n"
-        "───────────────────\n"
-    )
-
-def chunk_and_send(msgs: List[str]):
-    joined = "".join(msgs)
-    parts, curr = [], ""
-    for line in joined.splitlines(keepends=True):
-        if len(curr) + len(line) < CHUNK_SIZE:
-            curr += line
-        else:
-            parts.append(curr)
-            curr = line
-    if curr:
-        parts.append(curr)
-
-    total = len(parts)
-    for i, part in enumerate(parts, 1):
-        tg_send(f"📊 Grid Bot Picks {i}/{total}\n\n" + part)
-        time.sleep(1.2)
-
-# ─────────────── MAIN FLOW ────────────────────────
-
-def scan_with_fallback():
-    modes = [SCAN_MODE, "aggressive", "loose"] if SCAN_MODE == "conservative" else [SCAN_MODE, "loose"]
-    for mode in modes:
-        logging.info("Scanning in %s mode…", mode)
-        picks = analyse(mode)
-        if picks:
-            chunk_and_send([fmt_alert(p) for p in picks[:TOP_N_RESULTS]])
-            if mode != SCAN_MODE:
-                tg_send(f"⚠️ No candidates found in {SCAN_MODE} mode. Showing {mode} picks instead.")
-            return
-    tg_send("⚠️ No suitable grid candidates found in any mode.")
-
-# ───────────────────────────────────────────────────
-if __name__ == "__main__":
-    scan_with_fallback()
+def format_results(results: list[dict], mode: str) -> str:
+    lines = [f"📊 *Grid Scanner* — _{mode}_ mode"]
+    for r in results[:10]:
+        lines.append(f"• `{r['symbol']}` — {r['range_pct']:.1f}% range, {r['cycles']} swings, {r['volume_m']:.1f}M vol")
+    return "\n".join(lines)
