@@ -67,7 +67,7 @@ def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
 def compute_cooldown(vol_pct, std_dev):
-    base = 300  # 5 minutes
+    base = 300  # 5 minutes in seconds
     extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
     return base + extra
 
@@ -174,5 +174,4 @@ def main():
             tg(buf)
 
 if __name__ == "__main__":
-    tg("✅ Grid scanner script started via GitHub Actions.")
     main()
