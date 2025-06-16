@@ -1,130 +1,160 @@
-import requests
-import logging
-from datetime import datetime
-import numpy as np
+"""
+Enhanced Grid Scanner – Pionex PERP v5.0.1
+"""
 
-TELEGRAM_TOKEN = "<your_telegram_token>"
-TELEGRAM_CHAT_ID = "<your_chat_id>"
+import os, logging, requests
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+PIONEX = "https://api.pionex.com"
+INTERVAL = "60M"
+LIMIT = 200
+TOP_N = 10
+GRID_TARGET_SPACING = 0.75
+GRID_MIN_SPACING = 0.35
 
-API_BASE = "https://api.pionex.com/api/v1"
+TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELE_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+STATE_FILE = "last_symbols.txt"
+HYPE = "HYPE_USDT_PERP"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-EMOJI_ZONE = {
-    "Long": "📈 Entry Zone: 🟢 Long",
-    "Neutral": "➖ Entry Zone: ⚪️ Neutral",
-    "Short": "📉 Entry Zone: 🔴 Short"
-}
+WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
+STABLE = {"USDT", "USDC", "BUSD", "DAI"}
+EXCL = {"LUNA", "LUNC", "USTC"}
 
-def get_top_symbols():
-    url = f"{API_BASE}/market/tickers"
+def good(sym: str) -> bool:
+    u = sym.upper()
+    return (
+        u.split("_")[0] not in WRAPPED | STABLE | EXCL
+        and not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S"))
+    )
+
+def tg(text: str):
+    if not TELE_TOKEN or not TELE_CHAT:
+        return
+    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
     try:
-        res = requests.get(url, headers=HEADERS)
-        res.raise_for_status()
-        tickers = res.json().get("data", [])
-        filtered = [t for t in tickers if t.get("type") == "PERP"]
-        sorted_list = sorted(filtered, key=lambda x: float(x.get("baseVolume24h", 0)), reverse=True)
-        return sorted_list[:10]
+        requests.post(
+            url,
+            json={"chat_id": TELE_CHAT, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        ).raise_for_status()
     except Exception as e:
-        logging.error(f"Failed to get top symbols: {e}")
-        return []
+        logging.error("Telegram error: %s", e)
 
-def fetch_klines(symbol):
-    url = f"{API_BASE}/market/klines?symbol={symbol}&interval=60M&limit=200&type=PERP"
+def top_perp_symbols():
+    url = f"{PIONEX}/api/v1/market/tickers"
+    js = requests.get(url, params={"type": "PERP"}, timeout=10).json()
+    tickers = js.get("data", {}).get("tickers", [])
+    sorted_tk = sorted(tickers, key=lambda x: float(x["amount"]), reverse=True)
+    symbols = [t["symbol"] for t in sorted_tk if good(t["symbol"])]
+    return symbols[:TOP_N]
+
+def fetch_klines(spot: str):
+    url = f"{PIONEX}/api/v1/market/klines"
+    js = requests.get(
+        url,
+        params={
+            "symbol": spot,
+            "interval": INTERVAL,
+            "limit": LIMIT,
+            "type": "PERP",
+        },
+        timeout=10,
+    ).json()
+    kl = js.get("data", {}).get("klines") or js.get("data")
+    if not kl:
+        raise RuntimeError("no klines")
+    closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl]
+    return closes
+
+def analyse(perp: str):
+    spot = perp.replace("_PERP", "")
     try:
-        res = requests.get(url)
-        res.raise_for_status()
-        klines = res.json().get("data", [])
-        if not klines:
-            raise RuntimeError("No klines")
-        closes = [float(k[4]) for k in klines]
-        highs = [float(k[2]) for k in klines]
-        lows = [float(k[3]) for k in klines]
-        return closes, highs, lows
+        closes = fetch_klines(spot)
     except Exception as e:
-        logging.warning(f"Skip {symbol}: {e}")
-        return None, None, None
-
-def analyze(symbol):
-    closes, highs, lows = fetch_klines(symbol)
-    if not closes:
+        logging.warning("Skip %s: %s", perp, e)
         return None
-    
-    current_price = closes[-1]
-    high = max(highs[-50:])
-    low = min(lows[-50:])
-    range_pct = (high - low) / low * 100
-
-    if current_price < low + (high - low) * 0.33:
-        zone = "Long"
-    elif current_price > high - (high - low) * 0.33:
-        zone = "Short"
-    else:
-        zone = "Neutral"
-
-    spacing_pct = 0.5
-    grid_count = int(range_pct / spacing_pct)
-    avg_grid_profit = spacing_pct - 0.12
-    expected_cycle_days = round(200 / grid_count, 1)
-
+    lo, hi = min(closes), max(closes)
+    band = hi - lo
+    now = closes[-1]
+    if band <= 0:
+        return None
+    pos = (now - lo) / band
+    if pos < 0.05 or pos > 0.95:
+        return None
+    zone = "Long" if pos < 0.25 else "Short" if pos > 0.75 else "Neutral"
+    width_pct = band / now * 100
+    spacing = max(GRID_MIN_SPACING, GRID_TARGET_SPACING)
+    grids = max(2, int(width_pct / spacing))
+    cycle_days = round((grids * spacing) / width_pct * 2, 1) if width_pct else "-"
+    fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
     return {
-        "symbol": symbol,
-        "price": round(current_price, 6),
-        "high": round(high, 6),
-        "low": round(low, 6),
-        "range": round(range_pct, 2),
+        "symbol": perp,
+        "range": f"{fmt(lo)} – {fmt(hi)}",
         "zone": zone,
-        "spacing": spacing_pct,
-        "grids": grid_count,
-        "profit": round(avg_grid_profit, 2),
-        "cycle": expected_cycle_days
+        "grids": grids,
+        "spacing": f"{spacing:.2f}%",
+        "vol": f"{width_pct:.1f}%",
+        "cycle": f"{cycle_days} days",
     }
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    except Exception as e:
-        logging.error(f"Telegram send failed: {e}")
+# emoji mapping
+ZONE_EMO = {
+    "Long": "📈 Entry Zone: 🟢 Long",
+    "Neutral": "➖ Entry Zone: ⚪️ Neutral",
+    "Short": "📉 Entry Zone: 🔴 Short",
+}
+
+def build(d):
+    return (
+        f"*{d['symbol']}*\n"
+        f"📊 Range: `{d['range']}`\n"
+        f"{ZONE_EMO[d['zone']]}\n"
+        f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
+        f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']}`"
+    )
+
+def load_last():
+    if not os.path.exists(STATE_FILE):
+        return set()
+    with open(STATE_FILE) as f:
+        return set(map(str.strip, f))
+
+def save_current(s):
+    with open(STATE_FILE, "w") as f:
+        f.write("\n".join(sorted(s)))
 
 def main():
-    top_symbols = get_top_symbols()
-    if not top_symbols:
-        logging.info("No symbols fetched")
+    symbols = top_perp_symbols()
+    if HYPE not in symbols:
+        symbols.append(HYPE)
+    current, msgs = set(), []
+    for sym in symbols:
+        res = analyse(sym)
+        if res:
+            current.add(sym)
+            msgs.append(build(res))
+    dropped = load_last() - current
+    for d in dropped:
+        msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
+    save_current(current)
+
+    if not msgs:
+        logging.info("No valid entries.")
         return
-
-    valid = []
-    for t in top_symbols:
-        symbol = t["symbol"].replace("_PERP", "")
-        result = analyze(symbol)
-        if result:
-            valid.append(result)
-
-    if not valid:
-        logging.info("No valid entries found.")
-        return
-
-    for d in valid:
-        msg = (
-            f"*{d['symbol']}*
-"
-            f"{EMOJI_ZONE[d['zone']]}
-"
-            f"💰 Current Price: `{d['price']}`
-"
-            f"📊 Range: `{d['low']} - {d['high']}` ({d['range']}%)
-"
-            f"🔢 Grids: `{d['grids']}` | 📈 Spacing: `{d['spacing']}%`
-"
-            f"💸 Est. Grid Profit (after fee): `{d['profit']}%`
-"
-            f"📆 Est. Cycle: `{d['cycle']} days`")
-
-        send_telegram(msg)
+    # chunk
+    buf, chunks = "", []
+    for m in msgs:
+        if len(buf) + len(m) + 2 > 4000:
+            chunks.append(buf)
+            buf = m + "\n\n"
+        else:
+            buf += m + "\n\n"
+    if buf:
+        chunks.append(buf)
+    for c in chunks:
+        tg(c)
 
 if __name__ == "__main__":
     main()
