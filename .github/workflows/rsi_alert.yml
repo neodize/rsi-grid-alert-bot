@@ -1,7 +1,7 @@
 name: Grid Trading Scanner
 on:
   schedule:
-   - cron: '0 */4 * * *'      # Every 2 hours during night
+   - cron: '0 */2 * * *'      # Every 2 hours 
 
   workflow_dispatch:
     inputs:
