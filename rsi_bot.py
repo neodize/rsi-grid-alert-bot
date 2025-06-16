@@ -23,7 +23,7 @@ INTERVAL_MAP     = {"1h": "60M", "4h": "4H", "1d": "1D"}
 WRAPPED_TOKENS = {"WBTC", "WETH", "WSOL", "WBNB", "WMATIC", "WAVAX", "WFTM",
                   "CBBTC", "CBETH", "RETH", "STETH", "WSTETH", "FRXETH", "SFRXETH"}
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "USDD", "FRAX",
-              "FDUSD", "PYUSD", "USDE", "USDB", "LUSD", "SUSD", "DUSD", "OUSD"}
+               "FDUSD", "PYUSD", "USDE", "USDB", "LUSD", "SUSD", "DUSD", "OUSD"}
 EXCLUDED_TOKENS = {"BTCUP", "BTCDOWN", "ETHUP", "ETHDOWN", "ADAUP", "ADADOWN",
                    "LUNA", "LUNC", "USTC", "SHIB", "DOGE", "PEPE", "FLOKI", "BABYDOGE"}
 HYPE = "HYPE_USDT_PERP"
@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 def sma(arr, n): return sum(arr[-n:]) / n if len(arr) >= n else None
 
 def atr(highs, lows, closes, n=14):
-    tr = [max(h-l, abs(h-c), abs(l-c)) for h, l, c in zip(highs, lows, closes)]
+    tr = [max(h - l, abs(h - c), abs(l - c)) for h, l, c in zip(highs, lows, closes)]
     return sma(tr, n)
 
 def is_excluded(sym):
@@ -80,6 +80,7 @@ def analyze(symbol):
         pos = (now - lo) / band  # 0 bottom, 1 top
         if pos < 0.05 or pos > 0.95:
             return None  # far extremes – skip
+
         # entry zone & direction
         if pos < 0.25:
             entry = "Long"; direction = "📈 Long"
@@ -87,9 +88,10 @@ def analyze(symbol):
             entry = "Short"; direction = "📉 Short"
         else:
             entry = "Neutral"; direction = "📊 Neutral"
-        # simple cycles estimate
+
         width_pct = band / now * 100
         cycles_per_day = round(width_pct * 2, 1)
+
         return {
             "symbol": symbol,
             "price_range": f"${lo:,.0f} – ${hi:,.0f}",
@@ -97,15 +99,6 @@ def analyze(symbol):
             "cycles": cycles_per_day,
             "entry": entry,
             "direction": direction,
-        }
-    except Exception as e:
-        logging.warning(f"Skip {symbol}: {e}")
-        return None{
-            "symbol": symbol,
-            "price_range": f"${lo:,.0f} – ${hi:,.0f}",
-            "volatility": f"{(volatility/now)*100:.1f}%",
-            "cycles": cycles_per_day,
-            "entry": "\u2705 Mid‑range",
         }
     except Exception as e:
         logging.warning(f"Skip {symbol}: {e}")
@@ -126,15 +119,14 @@ def send_telegram(messages):
             logging.error(f"Telegram error: {e}")
 
 def format_alert(d):
-return (
-    f"*{d['symbol']}*\n"
-    f"Direction: {d['recommendation']}\n"
-    f"💡 Entry Zone: ✅ {d['entry_zone']}\n"
-    f"Price Range: {d['price_range']}\n"
-    f"Grid Count: {d['grid_count']}\n"
-    f"Expected Cycles/Days: {d['cycles']}\n"
-    f"Volatility: {d['volatility']}"
-)
+    return (
+        f"*{d['symbol']}*\n"
+        f"Direction: {d['direction']}\n"
+        f"💡 Entry Zone: ✅ {d['entry']}\n"
+        f"Price Range: {d['price_range']}\n"
+        f"Expected cycles/day: ~{d['cycles']}\n"
+        f"Volatility: {d['volatility']}"
+    )
 
 # ──────────────── MAIN LOOP ─────────────
 def main():
