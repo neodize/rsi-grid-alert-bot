@@ -1,156 +1,152 @@
-import requests
-import numpy as np
-import time
+"""
+rsi_bot.py  –  Enhanced Grid Scanner v5.1-rev1
+✅ Dynamic grids  ✅ Cycle ≤2 d  ✅ Start & Stop alerts  ✅ Pionex-only
+"""
+
+import os, json, math, time, requests, logging, numpy as np
 from datetime import datetime
-import os
-import pytz
-from scipy.signal import argrelextrema
-from telegram import Bot
+from pathlib import Path
 
-# === CONFIGURATION ===
-PIONEX_TICKERS_URL = "https://api.pionex.com/api/v1/market/tickers"
-KLINES_URL = "https://api.pionex.com/api/v1/market/klines?symbol={symbol}&interval=60M&limit=200&type=PERP"
-VOLUME_THRESHOLD = 5_000_000  # minimum 24h volume
-MAX_CYCLE_DAYS = 2.0
-SPACING_TARGET = 0.75  # % per grid
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-MYT = pytz.timezone("Asia/Kuala_Lumpur")
+# ── ENV / TELEGRAM ───────────────────────────────────────────
+TG_TOKEN   = os.getenv("TG_TOKEN")   or os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
+def tg(msg: str):
+    if not (TG_TOKEN and TG_CHAT_ID): return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        ).raise_for_status()
+    except Exception as e:
+        logging.error("Telegram error: %s", e)
 
-bot = Bot(token=TELEGRAM_TOKEN)
+# ── CONSTANTS ────────────────────────────────────────────────
+API = "https://api.pionex.com/api/v1"
+TOP_N           = 100
+MIN_NOTIONAL    = 1_000_000      # 24 h notional to keep small caps
+SPACING_MIN     = 0.3            # % floor
+SPACING_MAX     = 1.2            # % cap
+SPACING_TARGET  = 0.75           # baseline
+CYCLE_MAX       = 2.0            # days
+STOP_BUFFER     = 0.01           # 1 % outside range
+STATE_FILE      = Path("active_grids.json")
 
-# === CORE FUNCTIONS ===
+WRAPPED = {"WBTC","WETH","WSOL","WBNB"}
+STABLE  = {"USDT","USDC","BUSD","DAI"}
+EXCL    = {"LUNA","LUNC","USTC"}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ── HELPERS ──────────────────────────────────────────────────
+def good(sym:str)->bool:
+    u=sym.upper()
+    return (u.split("_")[0] not in WRAPPED|STABLE|EXCL and
+            not u.endswith(("UP","DOWN","3L","3S","5L","5S")))
 
 def fetch_symbols():
-    response = requests.get(PIONEX_TICKERS_URL)
-    try:
-        json_data = response.json()
-        if isinstance(json_data, dict) and "data" in json_data:
-            data = json_data["data"]
-            symbols = [i["symbol"] for i in data if isinstance(i, dict)
-                       and i.get("symbol", "").endswith("_USDT_PERP")
-                       and float(i.get("baseVolume", 0)) * float(i.get("last", 0)) > VOLUME_THRESHOLD]
-            return symbols
-        else:
-            print("Unexpected format from /tickers:", json_data)
-            return []
-    except Exception as e:
-        print(f"Error fetching symbols: {e}")
-        return []
+    r = requests.get(f"{API}/market/tickers", params={"type":"PERP"}, timeout=10)
+    tks = r.json().get("data", {}).get("tickers", [])
+    tks = [t for t in tks
+           if good(t["symbol"]) and float(t.get("amount",0))>MIN_NOTIONAL]
+    tks.sort(key=lambda x: float(x["amount"]), reverse=True)
+    return [t["symbol"] for t in tks][:TOP_N]
 
-def fetch_ohlcv(symbol):
-    url = KLINES_URL.format(symbol=symbol)
-    response = requests.get(url)
-    try:
-        data = response.json()["data"]
-        closes = [float(i[4]) for i in data]
-        highs = [float(i[2]) for i in data]
-        lows = [float(i[3]) for i in data]
-        times = [int(i[0]) for i in data]
-        return closes, highs, lows, times
-    except:
-        return [], [], [], []
+def fetch_closes(sym):
+    r = requests.get(f"{API}/market/klines",
+                     params={"symbol":sym,"interval":"60M","limit":200,"type":"PERP"},
+                     timeout=10)
+    kl = r.json().get("data",{}).get("klines") or []
+    return [float(k[4]) for k in kl] if kl else []
 
-def detect_range(closes):
-    prices = np.array(closes)
-    highs = argrelextrema(prices, np.greater, order=5)[0]
-    lows = argrelextrema(prices, np.less, order=5)[0]
-    if len(highs) < 1 or len(lows) < 1:
-        return None, None
-    return round(prices[lows].min(), 6), round(prices[highs].max(), 6)
-
-def determine_entry_zone(price, low, high):
-    if price < low or price > high:
-        return "🛑 Out of Range"
-    third = (high - low) / 3
-    if price < low + third:
-        return "🟢 Long"
-    elif price > high - third:
-        return "🔴 Short"
-    else:
-        return "🔁 Neutral"
-
-def calculate_cycle(hours, closes):
-    cycles = []
-    for i in range(1, len(closes)):
-        change = abs(closes[i] - closes[i-1]) / closes[i-1]
-        if change > 0.03:
-            cycles.append(hours[i] - hours[i-1])
-    if not cycles:
+# ── ANALYSIS ─────────────────────────────────────────────────
+def analyse(sym):
+    closes = fetch_closes(sym)
+    if len(closes) < 60:
         return None
-    avg_cycle = np.mean(cycles) / 24  # in days
-    return round(avg_cycle, 2)
+    lo, hi = min(closes), max(closes)
+    rng = hi - lo
+    if rng<=0: return None
+    px  = closes[-1]
+    pos = (px - lo)/rng
+    if 0.25<=pos<=0.75: return None             # neutral
+    zone = "Long" if pos<0.25 else "Short"
 
-def dynamic_grid_params(low, high):
-    range_pct = (high - low) / low * 100
-    grids = max(10, min(150, int(range_pct / SPACING_TARGET)))
-    spacing = round(range_pct / grids, 2)
-    return grids, spacing
+    # volatility & grid maths
+    vol_pct = rng/px*100
+    spacing = max(SPACING_MIN,
+                  min(SPACING_MAX, SPACING_TARGET*(30/max(vol_pct,1))))
+    grids   = max(10, min(200, math.floor(rng/(px*spacing/100))))
 
-def format_alert(symbol, low, high, price, zone, grids, spacing, vol, cycle):
-    return f"""{symbol}
-📊 Range: ${low:.4f} – ${high:.4f}
-📈 Entry Zone: {zone}
-🧮 Grids: {grids}  |  📏 Spacing: {spacing}%
-🌪️ Volatility: {vol:.1f}%  |  ⏱️ Cycle: {cycle} days
-"""
+    # cycle est ~ proportional to grid density vs range
+    cycle = round((grids*spacing)/(vol_pct+1e-9)*2,1)
+    if cycle> CYCLE_MAX: return None
 
-def send_telegram(message):
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-    except Exception as e:
-        print("Telegram error:", e)
+    return dict(symbol=sym, zone=zone, low=lo, high=hi, now=px,
+                grids=grids, spacing=round(spacing,2),
+                vol=round(vol_pct,1), cycle=cycle)
 
-# === MAIN WORKFLOW ===
+# ── STATE I/O ────────────────────────────────────────────────
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {}
 
+def save_state(d):
+    STATE_FILE.write_text(json.dumps(d, indent=2))
+
+# ── MESSAGE BUILDERS ────────────────────────────────────────
+ZONE_EMO = {"Long":"🟢 Long","Short":"🔴 Short"}
+def money(p): return f"${p:.8f}" if p<0.1 else f"${p:,.4f}" if p<1 else f"${p:,.2f}"
+def build_start(d):
+    lev = "20x–50x" if d["spacing"]<=0.5 else "10x–25x" if d["spacing"]<=0.75 else "5x–15x"
+    return (f"📈 Start Grid Bot: {d['symbol']}\n"
+            f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
+            f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
+            f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
+            f"🌪️ Volatility: {d['vol']}%  |  ⏱️ Cycle: {d['cycle']} d\n"
+            f"⚙️ Leverage Hint: {lev}")
+
+def build_stop(sym, reason, info):
+    return (f"🛑 Exit Alert: {sym}\n"
+            f"📉 Reason: {reason}\n"
+            f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
+            f"💱 Current Price: {money(info['now'])}")
+
+# ── MAIN RUN ────────────────────────────────────────────────
 def main():
-    symbols = fetch_symbols()
-    if not symbols:
-        print("No valid symbols found.")
-        return
+    prev = load_state()          # {sym:{zone,low,high}}
+    next_state={}
+    start_msgs=[]; stop_msgs=[]
+    for sym in fetch_symbols():
+        res = analyse(sym)
+        if not res: continue
+        next_state[sym]={"zone":res["zone"],"low":res["low"],"high":res["high"]}
+        if sym not in prev:
+            start_msgs.append(build_start(res))
+        else:
+            p = prev[sym]
+            if p["zone"]!=res["zone"]:
+                stop_msgs.append(build_stop(sym, "Trend flip", res))
+            elif res["now"]>p["high"]*(1+STOP_BUFFER) or res["now"]<p["low"]*(1-STOP_BUFFER):
+                stop_msgs.append(build_stop(sym,"Price exited range",res))
+    # any symbols vanished
+    for sym in set(prev)-set(next_state):
+        mid=(prev[sym]["low"]+prev[sym]["high"])/2
+        dummy=dict(low=prev[sym]["low"],high=prev[sym]["high"],now=mid)
+        stop_msgs.append(build_stop(sym,"No longer meets criteria",dummy))
+    save_state(next_state)
 
-    now = datetime.now(MYT).strftime('%Y-%m-%d %H:%M')
-    summary = f"📡 Grid Opportunities @ {now} MYT\n\n"
-    alerts = []
-    
-    for symbol in symbols:
-        closes, highs, lows, times = fetch_ohlcv(symbol)
-        if len(closes) < 50:
-            continue
+    # send telegram chunks
+    for bucket in (start_msgs, stop_msgs):
+        if not bucket: continue
+        buf=""
+        for m in bucket:
+            if len(buf)+len(m)+2>4000:
+                tg(buf); buf=m+"\n\n"
+            else:
+                buf+=m+"\n\n"
+        if buf: tg(buf)
 
-        low, high = detect_range(closes)
-        if not low or not high or high - low <= 0:
-            continue
-
-        price = closes[-1]
-        zone = determine_entry_zone(price, low, high)
-        if zone not in ["🟢 Long", "🔴 Short"]:
-            continue
-
-        cycle = calculate_cycle([t // 3600000 for t in times], closes)
-        if not cycle or cycle > MAX_CYCLE_DAYS:
-            continue
-
-        volatility = np.std(closes[-48:]) / np.mean(closes[-48:]) * 100
-        grids, spacing = dynamic_grid_params(low, high)
-
-        msg = format_alert(symbol, low, high, price, zone, grids, spacing, volatility, cycle)
-        alerts.append(msg)
-
-        # Planned stop alert
-        stop_msg = f"""🛑 Planned Stop Alert for {symbol}
-⏹ Exit conditions:
-• Price exits range (${low:.4f} – ${high:.4f})
-• Entry Zone flips from {zone} to opposite
-"""
-        alerts.append(stop_msg)
-
-        time.sleep(0.5)
-
-    if alerts:
-        send_telegram(summary + "\n".join(alerts[:10]))  # Limit per Telegram limits
-    else:
-        send_telegram(f"No qualifying grid bots found @ {now} MYT.")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
