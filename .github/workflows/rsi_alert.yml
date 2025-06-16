@@ -1,9 +1,11 @@
+
 name: Grid Trading Scanner
+
 on:
   schedule:
-    # Regular scans every 3 hours during 08:00–23:00 MYT (00:00–15:00 UTC)
-    - cron: '0 0,3,6,9,12,15 * * *'
-    # Urgent scans every 1 hour during 08:00–23:00 MYT (00:00–15:00 UTC)
+    # Every 3 hours during Malaysia's day (MYT = UTC+8)
+    - cron: '0 0,3,6,9,12,15 * * *'  # UTC → 08:00–23:00 MYT
+    # Every hour from 08:00 to 23:00 MYT (urgent scan)
     - cron: '0 0-15 * * *'
   workflow_dispatch:
     inputs:
@@ -23,96 +25,71 @@ on:
           - low
 
 jobs:
-  opportunity-scan:
+  grid-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Only run this job for regular scans (every 3 hours)
     if: github.event.schedule == '0 0,3,6,9,12,15 * * *' || github.event_name == 'workflow_dispatch'
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-            
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-dev gcc g++
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy>=1.24.0 scipy>=1.10.0 matplotlib seaborn python-telegram-bot pytz
-      
-      - name: Check secrets
-        run: |
-          if [ -z "${{ secrets.TELEGRAM_TOKEN }}" ] || [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
-            echo "Error: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is not set in repository secrets"
-            exit 1
-          else
-            echo "Secrets are properly configured"
-          fi
-          
-      - name: Run opportunity scanner
+          pip install requests numpy pandas scipy matplotlib seaborn python-telegram-bot pytz
+
+      - name: Run regular opportunity scan
         run: python rsi_bot.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_DAILY_SUMMARY: ${{ github.event.inputs.force_summary || 'false' }}
           SCAN_FREQUENCY: ${{ github.event.inputs.scan_frequency || 'normal' }}
-          
+
       - name: Notify on failure
         if: failure()
         run: |
-          curl -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-          -d text="⚠️ Grid Trading Scanner workflow failed! Check GitHub Actions logs for details." || true
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d text="⚠️ Grid Trading Scanner failed during regular scan!"
         continue-on-error: true
 
-  # Separate job for urgent alerts (runs every hour during market hours)
   urgent-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Only run this job for urgent scans (every hour)
     if: github.event.schedule == '0 0-15 * * *'
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Install dependencies (minimal)
+
+      - name: Install minimal dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests numpy scipy python-telegram-bot
-          
-      - name: Run urgent opportunity scanner
+
+      - name: Run urgent scan
         run: python rsi_bot.py --urgent-only
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           URGENT_SCAN: 'true'
-          
-      - name: Notify on urgent scan failure
+
+      - name: Notify on urgent failure
         if: failure()
         run: |
-          curl -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-          -d text="⚠️ Urgent Grid Trading Scanner failed! Check logs immediately." || true
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d text="⚠️ Urgent scan failed! Check logs ASAP."
         continue-on-error: true
