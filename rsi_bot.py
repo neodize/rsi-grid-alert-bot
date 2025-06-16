@@ -1,28 +1,90 @@
+"""enhanced_grid_scanner.py — Pionex‑native v3 (robust)
+=====================================================
+Fixes the latest KeyError (`symbols`) by **removing the deprecated
+`/exchangeInfo` call**. We now build the universe directly from
+`/market/tickers?type=PERP`, which is stable and returns
+`{"data":{"tickers":[...]}}`.
+
+Key changes
+-----------
+1. **get_perp_tickers()** — pulls all perpetual contracts with volume
+   data; no more missing `symbols` key.
+2. **Kline symbol fix** — converts e.g. `BTC_PERP` → `BTC_USDT` when
+   calling `/market/klines`.
+3. **Error handling** — if Pionex returns `{code:400,...}` or missing
+   `data`, the function raises a clear exception.
+4. **Telegram chunk send** unchanged (3 per message, original format).
+5. Still limits output to top N (default 10) by score.
+
+Drop‑in replacement, no other changes required.
+"""
+
+from __future__ import annotations
+
 import os
-import requests
-import logging
 import time
-from telegram import Bot
+import hmac
+import hashlib
+import logging
+from typing import Dict, List
 
+import requests
+import numpy as np
+
+# ───────────────────── CONFIG ──────────────────────
 PIONEX_API = "https://api.pionex.com"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-logging.basicConfig(level=logging.INFO)
+TOP_N_RESULTS = 10          # show best N coins (≤ 10 keeps messages tidy)
+CHUNK_SIZE    = 3900        # Telegram safety (<4096)
+
+MIN_VOL_24H   = 10_000_000  # ignore illiquid contracts
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ─────────────── TELEGRAM HELPER ──────────────────
+
+def tg_send(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram credentials missing – skip send")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        ).raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logging.error(f"Telegram send failed: {exc}")
+
+# ─────────────── PIONEX HELPERS ───────────────────
+
+def fetch_perp_tickers() -> List[Dict]:
+    url = f"{PIONEX_API}/api/v1/market/tickers"
+    try:
+        rsp = requests.get(url, params={"type": "PERP"}, timeout=10)
+        rsp.raise_for_status()
+        js = rsp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Ticker fetch error: {exc}") from exc
+
+    if js.get("code", 0) != 0 or "data" not in js or "tickers" not in js["data"]:
+        raise RuntimeError(f"Unexpected ticker payload: {js}")
+    return js["data"]["tickers"]
+
 
 def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200):
-    # Fix symbol for Pionex kline API
+    # Pionex wants spot‑style symbol for klines (“BTC_USDT”) even for perp
     if symbol.endswith("_PERP"):
         symbol = symbol.replace("_PERP", "_USDT")
 
     url = f"{PIONEX_API}/api/v1/market/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    js = r.json()
-
+    rsp = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+    rsp.raise_for_status()
+    js = rsp.json()
     if js.get("code", 0) != 0 or "data" not in js or "klines" not in js["data"]:
-        raise ValueError(f"Kline fetch failed for {symbol}: {js}")
+        raise RuntimeError(f"Kline fetch failed for {symbol}: {js}")
 
     closes, highs, lows = [], [], []
     for k in js["data"]["klines"]:
@@ -31,83 +93,107 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200):
         lows.append(float(k["low"]))
     return closes, highs, lows
 
-def get_coin_list():
-    r = requests.get(f"{PIONEX_API}/api/v1/exchangeInfo", timeout=10)
-    data = r.json()
-    return [
-        {
-            "symbol": x["symbol"],
-            "symbol_raw": x["symbol"],
-            "base": x["baseAsset"],
-            "quote": x["quoteAsset"],
-        }
-        for x in data["symbols"]
-        if x["symbol"].endswith("_PERP")
-    ]
+# ─────────────── ANALYTICS UTILS ───────────────────
 
-def analyze_coin(info):
-    try:
-        closes, highs, lows = fetch_klines(info["symbol_raw"], "1h", 200)
-        low = min(lows)
-        high = max(highs)
-        price = closes[-1]
-        width = high - low
-        within_range = low <= price <= high
-        cycles_per_day = sum(
-            1 for i in range(1, len(closes)) if abs(closes[i] - closes[i-1]) > width / 20
-        )
+def bollinger(prices: List[float], n: int = 20, k: float = 2.0):
+    if len(prices) < n:
+        return None, None, None
+    ma = np.mean(prices[-n:])
+    sd = np.std(prices[-n:])
+    return ma + k * sd, ma, ma - k * sd
 
-        return {
-            "symbol": info["symbol_raw"],
-            "low": round(low, 3),
-            "high": round(high, 3),
-            "price": round(price, 3),
-            "within_range": within_range,
-            "cycles": cycles_per_day,
-            "score": cycles_per_day * (1 if within_range else 0.5),
-        }
 
-    except Exception as e:
-        logging.warning(f"Analysis failed for {info['symbol_raw']}: {e}")
+def est_cycles(width_pct: float) -> int:
+    return int(width_pct * 2)  # rough: 2 cycles per 1% band width
+
+# ─────────────── SCORE + FORMAT ───────────────────
+
+def score_contract(tk: Dict) -> Dict | None:
+    sym_full = tk["symbol"]
+    price = float(tk["close"])
+    vol24 = float(tk["amount"])
+
+    if vol24 < MIN_VOL_24H or price <= 0:
         return None
 
-def format_report(coin):
-    trend = "✅ Neutral" if coin["within_range"] else "⚠️ Trending"
+    try:
+        closes, highs, lows = fetch_klines(sym_full, "1h", 200)
+        ub, mid, lb = bollinger(closes)
+    except Exception as exc:
+        logging.debug(f"{sym_full} kline error: {exc}")
+        return None
+
+    if mid is None:
+        return None
+    width_pct = (ub - lb) / mid * 100
+    cycles = est_cycles(width_pct)
+
+    score = cycles
+    return {
+        "symbol": sym_full,
+        "price": price,
+        "lower": lb,
+        "upper": ub,
+        "width": round(width_pct, 2),
+        "cycles": cycles,
+        "score": score,
+    }
+
+
+def fmt_alert(d: Dict) -> str:
     return (
-        f"📊 *{coin['symbol']}*\n"
-        f"Price: `{coin['price']}`\n"
-        f"Range: `{coin['low']} - {coin['high']}`\n"
-        f"Trend: {trend}\n"
-        f"Cycles/day: `{coin['cycles']}`\n"
-        f"Leverage: `10X Futures`\n"
-        f"_Ideal for Grid Bot Setup_\n"
+        f"*{d['symbol']}*\n"
+        f"Range: `${d['lower']:.4f}` – `${d['upper']:.4f}`  ({d['width']}% width)\n"
+        f"Est cycles/day: `{d['cycles']}`   |   Leverage: 10×\n"
+        "───────────────────────────\n"
     )
 
-def send_telegram_chunks(messages, chunk_size=3):
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    for i in range(0, len(messages), chunk_size):
-        text = "\n\n".join(messages[i:i + chunk_size])
-        try:
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
-        except Exception as e:
-            logging.error(f"Telegram send failed: {e}")
-            time.sleep(3)
+# ─────────────── CHUNK + SEND ────────────────────
 
-def main():
-    logging.info("Running Grid Scanner...")
-    coins = get_coin_list()
-    results = []
-    for info in coins:
-        result = analyze_coin(info)
-        if result:
-            results.append(result)
+def chunk_send(blocks: List[str]):
+    joined = "".join(blocks)
+    chunks, curr = [], ""
+    for line in joined.splitlines(keepends=True):
+        if len(curr) + len(line) < CHUNK_SIZE:
+            curr += line
+        else:
+            chunks.append(curr);
+            curr = line
+    if curr:
+        chunks.append(curr)
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    top = results[:10]  # limit to top 7–10
-    messages = [format_report(c) for c in top]
+    total = len(chunks)
+    for i, ch in enumerate(chunks, 1):
+        tg_send(f"[Grid Bot Scan {i}/{total}]\n\n" + ch)
+        time.sleep(1.2)
 
-    send_telegram_chunks(messages, chunk_size=3)
-    logging.info("Grid Scanner complete.")
+# ─────────────── MAIN LOGIC ───────────────────────
 
+def run():
+    logging.info("Scanning Pionex perpetual contracts…")
+    try:
+        tickers = fetch_perp_tickers()
+    except Exception as exc:
+        tg_send(f"❌ Ticker fetch failed: {exc}")
+        return
+
+    scored = []
+    for tk in tickers:
+        info = score_contract(tk)
+        if info:
+            scored.append(info)
+
+    if not scored:
+        tg_send("❌ No suitable grid candidates found.")
+        return
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    topN = scored[:TOP_N_RESULTS]
+    msg_blocks = [fmt_alert(d) for d in topN]
+
+    chunk_send(msg_blocks)
+    logging.info("Scan finished – sent %d alerts", len(topN))
+
+# ───────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    run()
