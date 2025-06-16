@@ -3,7 +3,6 @@ from pathlib import Path
 import numpy as np
 
 # ── TELEGRAM CONFIG ──────────────────────────────
-# Attempt to read from TG_TOKEN/TG_CHAT_ID, fallback to TELEGRAM_TOKEN/TELEGRAM_CHAT_ID
 TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
@@ -32,11 +31,12 @@ STATE_FILE = Path("active_grids.json")
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
+VOL_THRESHOLD = 2.5  # If the 60M analysis shows vol ≥ 2.5, perform a 5M rescan.
 
 last_trade_time = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ── HELPERS ───────────────────────────────────────
+# ── HELPER FUNCTIONS ───────────────────────────────
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and
@@ -90,7 +90,7 @@ def start_msg(d):
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
-            f"🌪️ Volatility: {d['vol']}%  | ⏱️ Cycle: {d['cycle']} d\n"
+            f"🌪️ Volatility: {d['vol']}%  |  ⏱️ Cycle: {d['cycle']} d\n"
             f"⚙️ Leverage Hint: {lev}")
 
 def stop_msg(sym, reason, info):
@@ -132,44 +132,63 @@ def analyse(sym, interval="5M"):
                 grids=grids, spacing=round(spacing, 2),
                 vol=round(vol_pct, 1), std=round(std_dev, 5), cycle=cycle)
 
+# ── HYBRID SCANNING ───────────────────────────────
+def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
+    # Broad/efficient scan with 60M interval
+    res_60m = analyse(sym, interval="60M")
+    if not res_60m:
+        return None
+
+    # If volatility is high, refine the data by scanning using 5M interval
+    if res_60m['vol'] >= vol_threshold:
+        res_5m = analyse(sym, interval="5M")
+        if res_5m and should_trigger(sym, res_5m["vol"], res_5m["std"]):
+            return res_5m
+        else:
+            return None
+    else:
+        # Use the 60M result if it passes cooldown
+        if should_trigger(sym, res_60m["vol"], res_60m["std"]):
+            return res_60m
+        else:
+            return None
+
 # ── MAIN ───────────────────────────────────────────
 def main():
-    interval = "5M"
     prev = load_state()
-    nxt, start, stop = {}, [], []
+    nxt, start_alerts, stop_alerts = {}, [], []
 
     for sym in fetch_symbols():
-        res = analyse(sym, interval)
+        res = scan_with_fallback(sym)
         if not res:
-            continue
-        if not should_trigger(sym, res["vol"], res["std"]):
             continue
         nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
         if sym not in prev:
-            start.append(start_msg(res))
+            start_alerts.append(start_msg(res))
         else:
             p = prev[sym]
             if p["zone"] != res["zone"]:
-                stop.append(stop_msg(sym, "Trend flip", res))
+                stop_alerts.append(stop_msg(sym, "Trend flip", res))
             elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
-                stop.append(stop_msg(sym, "Price exited range", res))
+                stop_alerts.append(stop_msg(sym, "Price exited range", res))
 
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
-        stop.append(stop_msg(gone, "No longer meets criteria",
-                             {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
+        stop_alerts.append(stop_msg(gone, "No longer meets criteria",
+                                     {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
     save_state(nxt)
 
-    for bucket in (start, stop):
-        if not bucket:
+    # Send alerts in batches
+    for alerts in (start_alerts, stop_alerts):
+        if not alerts:
             continue
         buf = ""
-        for m in bucket:
-            if len(buf) + len(m) + 2 > 4000:
+        for msg in alerts:
+            if len(buf) + len(msg) + 2 > 4000:
                 tg(buf)
-                buf = m + "\n\n"
+                buf = msg + "\n\n"
             else:
-                buf += m + "\n\n"
+                buf += msg + "\n\n"
         if buf:
             tg(buf)
 
