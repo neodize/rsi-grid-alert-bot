@@ -126,22 +126,15 @@ def send_telegram(messages):
             logging.error(f"Telegram error: {e}")
 
 def format_alert(d):
-    return (f"*{d['symbol']}*
-"
-            f"Price Range: {d['price_range']}
-"
-            f"Direction: {d['direction']}
-"
-            f"Expected cycles/day: ~{d['cycles']}
-"
-            f"Volatility: {d['volatility']}
-"
-            f"💡 Entry Zone: ✅ {d['entry']}") (f"*{data['symbol']}*\n"
-            f"Price Range: {data['price_range']}\n"
-            f"Direction: Neutral grid\n"
-            f"Expected cycles/day: ~{data['cycles']}\n"
-            f"Volatility: {data['volatility']}\n"
-            f"\U0001F4A1 Entry Zone: {data['entry']}")
+return (
+    f"*{d['symbol']}*\n"
+    f"Direction: {d['recommendation']}\n"
+    f"💡 Entry Zone: ✅ {d['entry_zone']}\n"
+    f"Price Range: {d['price_range']}\n"
+    f"Grid Count: {d['grid_count']}\n"
+    f"Expected Cycles/Days: {d['cycles']}\n"
+    f"Volatility: {d['volatility']}"
+)
 
 # ──────────────── MAIN LOOP ─────────────
 def main():
