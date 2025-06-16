@@ -1,7 +1,11 @@
 name: Grid Trading Scanner
 on:
-  schedule:
-   - cron: '0 */2 * * *'      # Every 2 hours 
+schedule:
+  # Regular scans every 4 hours during 09:00–21:00 MYT (01:00–13:00 UTC)
+  - cron: '0 1,5,9,13 * * *'
+
+  # Urgent scans every 1 hour during 09:00–21:00 MYT (01:00–13:00 UTC)
+  - cron: '0 1-13 * * *'
 
   workflow_dispatch:
     inputs:
