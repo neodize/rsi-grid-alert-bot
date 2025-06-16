@@ -1,9 +1,9 @@
 """
-Enhanced Grid Scanner – PERP‑aware Scanner (v4.1)
+Enhanced Grid Scanner – PERP‑aware Scanner (v4.2)
 =================================================
 - Filters only top 10 PERP tokens by 24h volume (plus HYPE)
 - Excludes wrapped, stable, and undesirable tokens
-- Only includes tokens in mid‑range zone (safe entry)
+- Only includes tokens in safe entry zones (Neutral, Long, Short)
 - Sends Telegram alerts in compact, multi-message format
 """
 
@@ -23,7 +23,7 @@ INTERVAL_MAP     = {"1h": "60M", "4h": "4H", "1d": "1D"}
 WRAPPED_TOKENS = {"WBTC", "WETH", "WSOL", "WBNB", "WMATIC", "WAVAX", "WFTM",
                   "CBBTC", "CBETH", "RETH", "STETH", "WSTETH", "FRXETH", "SFRXETH"}
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "USDD", "FRAX",
-               "FDUSD", "PYUSD", "USDE", "USDB", "LUSD", "SUSD", "DUSD", "OUSD"}
+              "FDUSD", "PYUSD", "USDE", "USDB", "LUSD", "SUSD", "DUSD", "OUSD"}
 EXCLUDED_TOKENS = {"BTCUP", "BTCDOWN", "ETHUP", "ETHDOWN", "ADAUP", "ADADOWN",
                    "LUNA", "LUNC", "USTC", "SHIB", "DOGE", "PEPE", "FLOKI", "BABYDOGE"}
 HYPE = "HYPE_USDT_PERP"
@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 def sma(arr, n): return sum(arr[-n:]) / n if len(arr) >= n else None
 
 def atr(highs, lows, closes, n=14):
-    tr = [max(h - l, abs(h - c), abs(l - c)) for h, l, c in zip(highs, lows, closes)]
+    tr = [max(h-l, abs(h-c), abs(l-c)) for h, l, c in zip(highs, lows, closes)]
     return sma(tr, n)
 
 def is_excluded(sym):
@@ -51,8 +51,9 @@ def fetch_perp_tickers():
 
 def fetch_klines(symbol, interval="1h", limit=200):
     intr = INTERVAL_MAP.get(interval, interval)
-    url = f"{PIONEX_API}/api/v1/market/contract/klines"
-    params = {"symbol": symbol, "interval": intr, "limit": limit}
+    spot_symbol = symbol.replace("_PERP", "")  # BTC_USDT_PERP → BTC_USDT
+    url = f"{PIONEX_API}/api/v1/market/klines"
+    params = {"symbol": spot_symbol, "interval": intr, "limit": limit, "type": "PERP"}
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
     js = r.json()
@@ -81,13 +82,16 @@ def analyze(symbol):
         if pos < 0.05 or pos > 0.95:
             return None  # far extremes – skip
 
-        # entry zone & direction
+        # Entry zone & direction
         if pos < 0.25:
-            entry = "Long"; direction = "📈 Long"
+            entry = "Long"
+            direction = "📈 Long"
         elif pos > 0.75:
-            entry = "Short"; direction = "📉 Short"
+            entry = "Short"
+            direction = "📉 Short"
         else:
-            entry = "Neutral"; direction = "📊 Neutral"
+            entry = "Neutral"
+            direction = "📊 Neutral"
 
         width_pct = band / now * 100
         cycles_per_day = round(width_pct * 2, 1)
@@ -97,8 +101,9 @@ def analyze(symbol):
             "price_range": f"${lo:,.0f} – ${hi:,.0f}",
             "volatility": f"{width_pct:.1f}%",
             "cycles": cycles_per_day,
-            "entry": entry,
-            "direction": direction,
+            "entry_zone": entry,
+            "recommendation": direction,
+            "grid_count": "Auto"
         }
     except Exception as e:
         logging.warning(f"Skip {symbol}: {e}")
@@ -121,10 +126,11 @@ def send_telegram(messages):
 def format_alert(d):
     return (
         f"*{d['symbol']}*\n"
-        f"Direction: {d['direction']}\n"
-        f"💡 Entry Zone: ✅ {d['entry']}\n"
+        f"Direction: {d['recommendation']}\n"
+        f"💡 Entry Zone: ✅ {d['entry_zone']}\n"
         f"Price Range: {d['price_range']}\n"
-        f"Expected cycles/day: ~{d['cycles']}\n"
+        f"Grid Count: {d['grid_count']}\n"
+        f"Expected Cycles/Day: {d['cycles']}\n"
         f"Volatility: {d['volatility']}"
     )
 
@@ -146,7 +152,6 @@ def main():
         logging.info("No valid entries found.")
         return
 
-    # Telegram limit = 4096 chars
     buffer, messages = "", []
     for alert in final:
         if len(buffer) + len(alert) + 2 > 4000:
