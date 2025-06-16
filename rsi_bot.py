@@ -1,8 +1,9 @@
-# Enhanced Grid Scanner – Pionex PERP v5.0.3+
+"""
+Enhanced Grid Scanner – Pionex PERP v5.0.3
+Long/Short Only • Dynamic Grid Count • Neutral Skipped
+"""
 
-import os
-import logging
-import requests
+import os, logging, requests
 
 PIONEX = "https://api.pionex.com"
 INTERVAL = "60M"
@@ -10,6 +11,8 @@ LIMIT = 200
 TOP_N = 10
 GRID_TARGET_SPACING = 0.75
 GRID_MIN_SPACING = 0.35
+GRID_MAX = 200
+GRID_MIN = 10
 
 TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELE_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -49,12 +52,12 @@ def top_perp_symbols():
     symbols = [t["symbol"] for t in sorted_tk if good(t["symbol"])]
     return symbols[:TOP_N]
 
-def fetch_klines(symbol: str):
+def fetch_klines(spot: str):
     url = f"{PIONEX}/api/v1/market/klines"
     js = requests.get(
         url,
         params={
-            "symbol": symbol,
+            "symbol": spot,
             "interval": INTERVAL,
             "limit": LIMIT,
             "type": "PERP",
@@ -68,8 +71,9 @@ def fetch_klines(symbol: str):
     return closes
 
 def analyse(perp: str):
+    spot = perp.replace("_PERP", "")
     try:
-        closes = fetch_klines(perp)
+        closes = fetch_klines(spot)
     except Exception as e:
         logging.warning("Skip %s: %s", perp, e)
         return None
@@ -81,10 +85,12 @@ def analyse(perp: str):
     pos = (now - lo) / band
     if pos < 0.05 or pos > 0.95:
         return None
-    zone = "Long" if pos < 0.25 else "Short" if pos > 0.75 else "Neutral"
+    if 0.25 <= pos <= 0.75:
+        return None  # skip Neutral zone
+    zone = "Long" if pos < 0.25 else "Short"
     width_pct = band / now * 100
     spacing = max(GRID_MIN_SPACING, GRID_TARGET_SPACING)
-    grids = max(2, int(width_pct / spacing))
+    grids = max(GRID_MIN, min(GRID_MAX, int(width_pct / spacing * 1.2)))
     cycle_days = round((grids * spacing) / width_pct * 2, 1) if width_pct else "-"
     fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
     return {
@@ -99,7 +105,6 @@ def analyse(perp: str):
 
 ZONE_EMO = {
     "Long": "📈 Entry Zone: 🟢 Long",
-    "Neutral": "🔁 Entry Zone: ⚪️ Neutral",
     "Short": "📉 Entry Zone: 🔴 Short",
 }
 
