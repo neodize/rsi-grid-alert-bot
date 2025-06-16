@@ -1,173 +1,166 @@
 """
-Enhanced Grid Scanner – PERP‑aware Scanner (v4.2)
-=================================================
-- Filters top 10 PERP tokens by 24h volume (plus HYPE)
-- Skips wrapped, stable, or excluded tokens
-- Recommends Long, Short, or Neutral entries
-- Suggests when to stop grid bots (🛑 alert)
-- Includes grid count & spacing in Telegram message
+Enhanced Grid Scanner – PERP‑only (v4.3)
+========================================
+Finds top‑volume PERP coins that are safe to start Pionex futures
+grid bots, shows Long/Neutral/Short entry zones, grid suggestions,
+and issues 🛑 stop alerts when a coin drops out.
 """
 
 import os
 import logging
 from datetime import datetime
 import requests
-import numpy as np
 
-# ──────────────── CONFIG ────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-PIONEX_API       = "https://api.pionex.com"
-INTERVAL_MAP     = {"1h": "60M"}
+# ─────────────────── CONFIG ───────────────────
+PIONEX_API = "https://api.pionex.com"
+TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELE_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+INTERVAL   = "60M"
+LAST_FILE  = "last_symbols.txt"
 
-GRID_FEE_PCT     = 0.05  # 0.05% fee per transaction
-GRID_TARGET_SPACING = 0.4  # target 0.4% spacing
-GRID_CYCLES_PER_DAY = 8   # average desired cycles/day
+GRID_MIN_SPACING = 0.35           # min spacing % to beat fees
+TARGET_SPACING   = 0.4            # base spacing %
+MAX_MSG_CHARS    = 4000           # telegram safety
+HYPE             = "HYPE_USDT_PERP"
 
-WRAPPED_TOKENS = {"WBTC", "WETH", "WSOL", "WBNB", "WMATIC", "WAVAX", "WFTM",
-                  "CBBTC", "CBETH", "RETH", "STETH", "WSTETH", "FRXETH", "SFRXETH"}
-STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "USDD", "FRAX",
-               "FDUSD", "PYUSD", "USDE", "USDB", "LUSD", "SUSD", "DUSD", "OUSD"}
-EXCLUDED_TOKENS = {"BTCUP", "BTCDOWN", "ETHUP", "ETHDOWN", "ADAUP", "ADADOWN",
-                   "LUNA", "LUNC", "USTC", "SHIB", "DOGE", "PEPE", "FLOKI", "BABYDOGE"}
+# tokens we always skip
+WRAPPED = {"WBTC","WETH","WSOL","WBNB","WMATIC","WAVAX","WFTM","CBBTC","CBETH",
+           "RETH","STETH","WSTETH","FRXETH","SFRXETH"}
+STABLE  = {"USDT","USDC","BUSD","DAI","TUSD","USDP","USDD","FRAX",
+           "FDUSD","PYUSD","USDE","USDB","LUSD","SUSD","DUSD","OUSD"}
+EXCL    = {"BTCUP","BTCDOWN","ETHUP","ETHDOWN","ADAUP","ADADOWN",
+           "LUNA","LUNC","USTC","SHIB","DOGE","PEPE","FLOKI","BABYDOGE"}
 
-HYPE = "HYPE_USDT"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ───────────────── TELEGRAM ────────────────────
+def tg_send(msgs):
+    if not TELE_TOKEN or not TELE_CHAT:
+        return
+    for m in msgs:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
+                          data={"chat_id":TELE_CHAT, "text":m, "parse_mode":"Markdown"}, timeout=10).raise_for_status()
+        except Exception as e:
+            logging.error("Telegram error: %s", e)
 
-# ──────────────── HELPERS ───────────────
-def is_excluded(sym):
-    s = sym.upper()
-    return (s in WRAPPED_TOKENS or s in STABLECOINS or s in EXCLUDED_TOKENS or
-            s.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
+# ───────────────── API HELPERS ────────────────
+def fetch_tickers():
+    js = requests.get(f"{PIONEX_API}/api/v1/market/tickers",
+                      params={"type":"PERP"}, timeout=10).json()
+    return js["data"]["tickers"]
 
-def fetch_perp_tickers():
-    url = f"{PIONEX_API}/api/v1/market/tickers"
-    params = {"type": "PERP"}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()["data"]["tickers"]
-
-def fetch_klines(symbol, interval="1h", limit=200):
-    intr = INTERVAL_MAP.get(interval, interval)
-    url = f"{PIONEX_API}/api/v1/market/contract/klines"
-    params = {"symbol": symbol, "interval": intr, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("data") or "klines" not in data["data"]:
-        raise RuntimeError(f"No klines for {symbol}")
-    closes, highs, lows = [], [], []
-    for k in data["data"]["klines"]:
-        closes.append(float(k["close"]))
-        highs.append(float(k["high"]))
-        lows.append(float(k["low"]))
+def fetch_klines(symbol):
+    """symbol must be ETH_USDT etc. Use type=PERP to get contract data."""
+    url = f"{PIONEX_API}/api/v1/market/klines"
+    js = requests.get(url,
+                      params={"symbol":symbol,"interval":INTERVAL,"limit":200,"type":"PERP"},
+                      timeout=10).json()
+    if not js.get("data") or "klines" not in js["data"]:
+        raise RuntimeError("No klines")
+    closes = [float(k["close"]) for k in js["data"]["klines"]]
+    highs  = [float(k["high"])  for k in js["data"]["klines"]]
+    lows   = [float(k["low"])   for k in js["data"]["klines"]]
     return closes, highs, lows
 
-def analyze(symbol):
-    try:
-        closes, highs, lows = fetch_klines(symbol)
-        if len(closes) < 100:
-            return None
-        hi, lo = max(closes), min(closes)
-        now = closes[-1]
-        band = hi - lo
-        if band <= 0:
-            return None
-        pos = (now - lo) / band
-        if pos < 0.05 or pos > 0.95:
-            return None  # too close to edge
-        # Entry zone
-        if pos < 0.25:
-            entry = "Long"
-        elif pos > 0.75:
-            entry = "Short"
-        else:
-            entry = "Neutral"
-        # Grid suggestion
-        spacing_pct = GRID_TARGET_SPACING
-        grid_count = int((band / now * 100) / spacing_pct)
-        return {
-            "symbol": symbol,
-            "price": now,
-            "price_range": f"${lo:.8f} – ${hi:.8f}" if now < 1 else f"${lo:,.2f} – ${hi:,.2f}",
-            "volatility": f"{(band / now * 100):.1f}%",
-            "entry": entry,
-            "spacing": f"{spacing_pct:.2f}%",
-            "grid_count": grid_count,
-        }
-    except Exception as e:
-        logging.warning(f"Skip {symbol}: {e}")
+def perp_to_spot(perp):
+    """BTC_USDT_PERP -> BTC_USDT"""
+    return perp.replace("_PERP","")
+
+def worth(skipsym):
+    s=skipsym.upper()
+    return not (s in WRAPPED or s in STABLE or s in EXCL or
+                s.endswith(("UP","DOWN","3L","3S","5L","5S")))
+
+# ───────────────── ANALYSIS ───────────────────
+def analyse(pair):
+    spot = perp_to_spot(pair)
+    closes, highs, lows = fetch_klines(spot)
+    if len(closes)<100:
+        return None
+    hi, lo = max(closes), min(closes)
+    band = hi-lo
+    if band<=0: return None
+    now = closes[-1]
+    pos = (now-lo)/band          # 0 bottom …1 top
+    if pos<0.05 or pos>0.95:     # extreme – skip
         return None
 
-def format_alert(d):
-    return (
-        f"*{d['symbol']}*\n"
-        f"💡 Entry Zone: {d['entry']}\n"
-        f"Price Range: {d['price_range']}\n"
-        f"Grid Count: {d['grid_count']}  |  Spacing: {d['spacing']}\n"
-        f"Volatility: {d['volatility']}"
-    )
+    # Entry zone classification
+    if pos<0.25:
+        zone = "Long"
+    elif pos>0.75:
+        zone = "Short"
+    else:
+        zone = "Neutral"
 
-def send_telegram(messages):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    for msg in messages:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-                timeout=10
-            ).raise_for_status()
-        except Exception as e:
-            logging.error(f"Telegram error: {e}")
+    width_pct = band/now*100
+    spacing   = max(GRID_MIN_SPACING, TARGET_SPACING)
+    grids     = max(2,int(width_pct/spacing))
 
-# ──────────────── MAIN LOOP ─────────────
+    def fmt(p):
+        if p>=1:  return f"${p:,.2f}"
+        if p>=0.1:return f"${p:,.4f}"
+        return f"${p:.8f}"
+
+    return {
+        "symbol": pair,
+        "zone":   zone,
+        "range":  f"{fmt(lo)} – {fmt(hi)}",
+        "grids":  grids,
+        "spacing": f"{spacing:.2f}%",
+        "vol":    f"{width_pct:.1f}%"
+    }
+
+def build_msg(d):
+    return (f"*{d['symbol']}*\n"
+            f"💡 Entry Zone: {d['zone']}\n"
+            f"Price Range: {d['range']}\n"
+            f"Grid Count: {d['grids']}  |  Spacing: {d['spacing']}\n"
+            f"Volatility: {d['vol']}")
+
+# ───────────────── MAIN ───────────────────────
 def main():
-    tickers = fetch_perp_tickers()
-    sorted_perps = sorted(tickers, key=lambda t: float(t["amount"]), reverse=True)
-    top10 = [t["symbol"] for t in sorted_perps if not is_excluded(t["symbol"])][:10]
-    if HYPE not in top10:
-        top10.append(HYPE)
+    tick = fetch_tickers()
+    top = [t for t in sorted(tick, key=lambda x: float(x["amount"]), reverse=True)
+           if worth(t["symbol"])][:10]
+    if HYPE not in [t["symbol"] for t in top]:
+        top.append({"symbol":HYPE})
 
-    # Load last symbols to detect drops
-    LAST_FILE = "last_symbols.txt"
-    last_seen = set()
+    msgs, current = [], []
+    for t in top:
+        res = analyse(t["symbol"])
+        if res:
+            current.append(res["symbol"])
+            msgs.append(build_msg(res))
+
+    # ----- stop suggestions -----
+    last=set()
     if os.path.exists(LAST_FILE):
         with open(LAST_FILE) as f:
-            last_seen = set(line.strip() for line in f.readlines())
+            last=set(l.strip() for l in f if l.strip())
+    dropped=[s for s in last if s not in current]
+    for d in dropped:
+        msgs.append(f"🛑 *{d}* dropped out – consider stopping its grid bot.")
 
-    current_valid, messages = [], []
-    for sym in top10:
-        result = analyze(sym)
-        if result:
-            current_valid.append(sym)
-            messages.append(format_alert(result))
+    # save
+    with open(LAST_FILE,"w") as f:
+        f.write("\n".join(current))
 
-    # Compare to last run
-    dropped = sorted(list(last_seen - set(current_valid)))
-    for sym in dropped:
-        messages.append(f"🛑 *{sym}* dropped out of list – consider stopping the bot.")
-
-    # Save current list
-    with open(LAST_FILE, "w") as f:
-        f.write("\n".join(current_valid))
-
-    if not messages:
-        logging.info("No valid entries found.")
+    if not msgs:
+        logging.info("No valid entries.")
         return
 
-    # Chunk messages to fit Telegram limit
-    chunks, buf = [], ""
-    for m in messages:
-        if len(buf) + len(m) + 2 > 4000:
-            chunks.append(buf)
-            buf = m + "\n\n"
+    # split to chunks
+    buf,ch="",""
+    chunks=[]
+    for m in msgs:
+        if len(buf)+len(m)+2>MAX_MSG_CHARS:
+            chunks.append(buf); buf=m+"\n\n"
         else:
-            buf += m + "\n\n"
-    if buf:
-        chunks.append(buf)
-    send_telegram(chunks)
+            buf+=m+"\n\n"
+    if buf: chunks.append(buf)
+    tg_send(chunks)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
