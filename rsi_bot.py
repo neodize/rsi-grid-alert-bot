@@ -1,152 +1,125 @@
-import requests
-import numpy as np
-import logging
+"""
+Enhanced Grid Scanner — Pionex PERP (v5.0)
+"""
+
+import os, json, logging, requests, math
 from datetime import datetime
+from statistics import mean
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ---------- CONFIG ----------
+PIONEX = "https://api.pionex.com"
+INTVL  = "60M"
+LIMIT  = 200
+TOP_N  = 10
+GRID_TARGET_SPACING = 0.75   # %
+GRID_MIN_SPACING    = 0.35   # %
+TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELE_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+STATE_FILE = "last_symbols.txt"
+HYPE       = "HYPE_USDT_PERP"
 
-WEBHOOK_URL = "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/sendMessage"
-CHAT_ID = "<YOUR_CHAT_ID>"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Store last symbols shown
-LAST_SYMBOLS_FILE = "last_symbols.txt"
+# --------- EXCLUDE LISTS ----------
+WRAPPED = {"WBTC","WETH","WSOL","WBNB","WFTM","WMATIC","WAVAX"}
+STABLE  = {"USDT","USDC","BUSD","DAI"}
+EXCLUDED= {"BTCUP","BTCDOWN","ETHUP","ETHDOWN","LUNA","LUNC","USTC"}
 
-def get_top_symbols(limit=15):
-    url = "https://api.pionex.com/api/v1/market/getMarket24hList"
+def good(sym:str)->bool:
+    u=sym.upper()
+    if any(u.endswith(s) for s in ("UP","DOWN","3L","3S","5L","5S")): return False
+    base=u.split("_")[0]
+    return base not in WRAPPED|STABLE|EXCLUDED
+
+# ---------- TELEGRAM ----------
+def tg_send(text:str):
+    if not (TELE_TOKEN and TELE_CHAT): return
+    url=f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
     try:
-        resp = requests.get(url).json()
-        top = sorted(resp, key=lambda x: float(x["amount"]), reverse=True)
-        return [t["symbol"] for t in top if t["symbol"].endswith("_USDT") and "PERP" not in t["symbol"]][:limit]
+        requests.post(url,json={"chat_id":TELE_CHAT,"text":text,"parse_mode":"Markdown"},timeout=10)
     except Exception as e:
-        logging.error(f"Failed to get top symbols: {e}")
-        return []
+        logging.error("Telegram error: %s",e)
 
-def fetch_klines(symbol):
-    url = f"https://api.pionex.com/api/v1/market/klines?symbol={symbol}&interval=60M&limit=200&type=PERP"
+# ---------- API ----------
+def top_perp_symbols()->list[str]:
+    url=f"{PIONEX}/api/v1/market/tickers"
+    js=requests.get(url,params={"type":"PERP"},timeout=10).json()
+    tickers=js.get("data",{}).get("tickers",[])
+    sorted_tk=sorted(tickers,key=lambda x: float(x["amount"]),reverse=True)
+    symbols=[t["symbol"] for t in sorted_tk if good(t["symbol"])]
+    return symbols[:TOP_N]
+
+def fetch_klines(spot:str):
+    url=f"{PIONEX}/api/v1/market/klines"
+    js=requests.get(url,params={"symbol":spot,"interval":INTVL,"limit":LIMIT,"type":"PERP"},timeout=10).json()
+    kl=js.get("data",{}).get("klines") or js.get("data")  # backup structure
+    if not kl: raise RuntimeError("no klines")
+    closes=[float(k["close"]) if isinstance(k,dict) else float(k[4]) for k in kl]
+    highs =[float(k["high"])  if isinstance(k,dict) else float(k[2]) for k in kl]
+    lows  =[float(k["low"])   if isinstance(k,dict) else float(k[3]) for k in kl]
+    return closes,highs,lows
+
+# ---------- ANALYSE ----------
+def analyse(perp:str):
+    spot=perp.replace("_PERP","")
     try:
-        res = requests.get(url).json()
-        if isinstance(res, list) and res:
-            closes = [float(x[4]) for x in res]
-            highs = [float(x[2]) for x in res]
-            lows = [float(x[3]) for x in res]
-            return closes, highs, lows
-        else:
-            raise RuntimeError("No klines")
+        closes,highs,lows=fetch_klines(spot)
     except Exception as e:
-        logging.warning(f"Skip {symbol}: {e}")
-        return None, None, None
+        logging.warning("Skip %s: %s",perp,e); return None
+    if len(closes)<100: return None
+    lo,hi=min(closes),max(closes)
+    band=hi-lo
+    now=closes[-1]
+    if band<=0: return None
+    pos=(now-lo)/band
+    if pos<0.05 or pos>0.95: return None
+    zone="Long" if pos<0.25 else "Short" if pos>0.75 else "Neutral"
+    width_pct=band/now*100
+    spacing=max(GRID_MIN_SPACING, GRID_TARGET_SPACING)
+    grids=max(2,int(width_pct/spacing))
+    cycle_days=round((grids*spacing)/width_pct*2 ,1) if width_pct else "-"
+    fmt=lambda p: f"${p:.8f}" if p<0.1 else f"${p:,.4f}" if p<1 else f"${p:,.2f}"
+    return dict(symbol=perp,range=f"{fmt(lo)} – {fmt(hi)}",zone=zone,
+                grids=grids,spacing=f"{spacing:.2f}%",vol=f"{width_pct:.1f}%",
+                cycle=str(cycle_days))
 
-def calculate_rsi(data, period=14):
-    deltas = np.diff(data)
-    seed = deltas[:period]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi = [100. - 100. / (1. + rs)]
-    for delta in deltas[period:]:
-        upval = max(delta, 0)
-        downval = -min(delta, 0)
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down != 0 else 0
-        rsi.append(100. - 100. / (1. + rs))
-    return rsi
+def build_msg(d):
+    return (f"*{d['symbol']}*\n"
+            f"📊 Range: `{d['range']}`\n"
+            f"🎯 Entry Zone: `{d['zone']}`\n"
+            f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
+            f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']} days`")
 
-def estimate_grid_config(price, grids=30, spacing_pct=0.5, fee_pct=0.05):
-    spacing = price * spacing_pct / 100
-    total_range = spacing * grids
-    low = price - total_range / 2
-    high = price + total_range / 2
-    expected_profit_per_grid = spacing * (1 - fee_pct / 100)
-    expected_cycles = (price - low) / spacing
-    return low, high, expected_profit_per_grid, expected_cycles
+# ---------- STATE ----------
+def load_last()->set[str]:
+    if not os.path.exists(STATE_FILE): return set()
+    with open(STATE_FILE) as f: return set(map(str.strip,f))
+def save_current(s:set[str]): open(STATE_FILE,"w").write("\n".join(sorted(s)))
 
-def send_telegram(message):
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        r = requests.post(WEBHOOK_URL, json=payload)
-        r.raise_for_status()
-    except Exception as e:
-        logging.error(f"Telegram send failed: {e}")
-
-def load_last_symbols():
-    try:
-        with open(LAST_SYMBOLS_FILE, "r") as f:
-            return f.read().splitlines()
-    except:
-        return []
-
-def save_last_symbols(symbols):
-    with open(LAST_SYMBOLS_FILE, "w") as f:
-        f.write("\n".join(symbols))
-
-def analyse(symbol):
-    closes, highs, lows = fetch_klines(symbol)
-    if closes is None:
-        return None
-
-    rsi = calculate_rsi(closes)
-    current_price = closes[-1]
-    rsi_latest = rsi[-1]
-
-    low, high, profit, cycles = estimate_grid_config(current_price)
-
-    decimals = 6 if current_price < 1 else 2
-    return {
-        "symbol": symbol,
-        "rsi": round(rsi_latest, 2),
-        "price": round(current_price, decimals),
-        "entry_low": round(low, decimals),
-        "entry_high": round(high, decimals),
-        "profit_per_grid": round(profit, decimals),
-        "grid_count": 30,
-        "spacing_pct": 0.5,
-        "fee_pct": 0.05,
-        "expected_cycles": round(cycles)
-    }
-
-def format_message(data_list, stop_list):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"📈 *Grid Trading Candidates* — `{now}`\n\n"
-    for d in data_list:
-        msg += (
-            f"*{d['symbol']}*\n"
-            f"Price: `{d['price']}`\n"
-            f"RSI: `{d['rsi']}`\n"
-            f"Entry: `{d['entry_low']} - {d['entry_high']}`\n"
-            f"Grid: `{d['grid_count']} x {d['spacing_pct']}%` (fee: {d['fee_pct']}%)\n"
-            f"Per Grid Profit (est.): `{d['profit_per_grid']}`\n"
-            f"Expected Cycles: `{d['expected_cycles']}`\n\n"
-        )
-    if stop_list:
-        msg += "🛑 *Stop Suggestion*: " + ", ".join(stop_list)
-    return msg
-
+# ---------- MAIN ----------
 def main():
-    symbols = get_top_symbols()
-    if not symbols:
-        logging.info("No symbols fetched")
-        return
-
-    last_symbols = load_last_symbols()
-    stop_symbols = [s for s in last_symbols if s not in symbols]
-
-    results = []
-    for s in symbols:
-        res = analyse(s)
+    symbols=top_perp_symbols()
+    if HYPE not in symbols: symbols.append(HYPE)
+    now_msgs=[]; current=set()
+    for sym in symbols:
+        res=analyse(sym)
         if res:
-            results.append(res)
+            current.add(sym); now_msgs.append(build_msg(res))
+    last=load_last()
+    dropped=sorted(list(last-current))
+    for d in dropped:
+        now_msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
+    save_current(current)
+    if not now_msgs:
+        logging.info("No valid entries.")
+        return
+    # chunk
+    buf=""; chunks=[]
+    for m in now_msgs:
+        if len(buf)+len(m)+2>4000: chunks.append(buf); buf=m+"\n\n"
+        else: buf+=m+"\n\n"
+    if buf: chunks.append(buf)
+    for c in chunks: tg_send(c)
 
-    if results:
-        msg = format_message(results, stop_symbols)
-        send_telegram(msg)
-        save_last_symbols(symbols)
-    else:
-        logging.info("No valid entries found.")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
