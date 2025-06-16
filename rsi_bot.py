@@ -1,3 +1,7 @@
+"""
+Enhanced Grid Scanner – Pionex PERP v5.0.1
+"""
+
 import os, logging, requests
 
 PIONEX = "https://api.pionex.com"
@@ -67,7 +71,7 @@ def fetch_klines(spot: str):
 def analyse(perp: str):
     spot = perp.replace("_PERP", "")
     try:
-        closes = fetch_klines(spot)
+        closes = fetch_klines(perp)
     except Exception as e:
         logging.warning("Skip %s: %s", perp, e)
         return None
@@ -95,10 +99,11 @@ def analyse(perp: str):
         "cycle": f"{cycle_days} days",
     }
 
+# emoji mapping
 ZONE_EMO = {
-    "Long": "💰 Entry Zone: 🟢 Long",
-    "Neutral": "💰 Entry Zone: 🔁 Neutral",
-    "Short": "💰 Entry Zone: 🔴 Short",
+    "Long": "📈 Entry Zone: 🟢 Long",
+    "Neutral": "🔁 Entry Zone: ⚪️ Neutral",
+    "Short": "📉 Entry Zone: 🔴 Short",
 }
 
 def build(d):
@@ -106,7 +111,7 @@ def build(d):
         f"*{d['symbol']}*\n"
         f"📊 Range: `{d['range']}`\n"
         f"{ZONE_EMO[d['zone']]}\n"
-        f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
+        f"💰 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
         f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']}`"
     )
 
@@ -123,7 +128,8 @@ def save_current(s):
 def main():
     symbols = top_perp_symbols()
     if HYPE not in symbols:
-        symbols.insert(0, HYPE)
+        symbols.insert(0, HYPE)  # Always prioritize HYPE on top
+
     current, msgs = set(), []
     for sym in symbols:
         res = analyse(sym)
@@ -131,7 +137,8 @@ def main():
             current.add(sym)
             msgs.append(build(res))
         elif sym == HYPE:
-            msgs.insert(0, f"*{HYPE}* found – but no valid grid setup today.")
+            msgs.append(f"*{HYPE}* – No valid recommendation at the moment.")
+
     dropped = load_last() - current
     for d in dropped:
         msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
@@ -140,7 +147,8 @@ def main():
     if not msgs:
         logging.info("No valid entries.")
         return
-    # chunk
+
+    # split into telegram-sized chunks
     buf, chunks = "", []
     for m in msgs:
         if len(buf) + len(m) + 2 > 4000:
