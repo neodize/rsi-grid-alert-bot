@@ -102,7 +102,7 @@ def analyse(perp: str):
 # emoji mapping
 ZONE_EMO = {
     "Long": "📈 Entry Zone: 🟢 Long",
-    "Neutral": "➖ Entry Zone: ⚪️ Neutral",
+    "Neutral": "🔁 Entry Zone: ⚪️ Neutral",
     "Short": "📉 Entry Zone: 🔴 Short",
 }
 
