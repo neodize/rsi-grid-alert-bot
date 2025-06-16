@@ -1,11 +1,10 @@
 import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
-from datetime import datetime
 
-# ── TELEGRAM ──────────────────────────────────────
-TG_TOKEN   = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+# ── TELEGRAM CONFIG ──────────────────────────────
+TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -18,24 +17,24 @@ def tg(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
-# ── CONSTANTS & STATE ─────────────────────────────
-API             = "https://api.pionex.com/api/v1"
-TOP_N           = 100
-MIN_NOTIONAL_USD= 1_000_000
-SPACING_MIN     = 0.3
-SPACING_MAX     = 1.2
-SPACING_TARGET  = 0.75
-CYCLE_MAX       = 2.0
-STOP_BUFFER     = 0.01
-STATE_FILE      = Path("active_grids.json")
+# ── PARAMETERS ────────────────────────────────────
+API = "https://api.pionex.com/api/v1"
+TOP_N = 100
+MIN_NOTIONAL_USD = 1_000_000
+SPACING_MIN = 0.3
+SPACING_MAX = 1.2
+SPACING_TARGET = 0.75
+CYCLE_MAX = 2.0
+STOP_BUFFER = 0.01
+STATE_FILE = Path("active_grids.json")
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
-STABLE  = {"USDT", "USDC", "BUSD", "DAI"}
-EXCL    = {"LUNA", "LUNC", "USTC"}
-last_trade_time = {}
+STABLE = {"USDT", "USDC", "BUSD", "DAI"}
+EXCL = {"LUNA", "LUNC", "USTC"}
 
+last_trade_time = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ── HELPERS ────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and
@@ -44,13 +43,13 @@ def valid(sym):
 def fetch_symbols():
     r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
     tickers = r.json().get("data", {}).get("tickers", [])
-    pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount",0)) > MIN_NOTIONAL_USD]
+    pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
     pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
     return [p["symbol"] for p in pairs][:TOP_N]
 
 def fetch_closes(sym, interval="5M"):
     r = requests.get(f"{API}/market/klines",
-                     params={"symbol":sym,"interval":interval,"limit":200,"type":"PERP"},
+                     params={"symbol": sym, "interval": interval, "limit": 200, "type": "PERP"},
                      timeout=10)
     payload = r.json().get("data", {})
     kl = payload.get("klines") or payload
@@ -63,12 +62,10 @@ def fetch_closes(sym, interval="5M"):
     return closes
 
 def compute_std_dev(closes, period=30):
-    if len(closes) < period:
-        return 0
-    return float(np.std(closes[-period:]))
+    return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
 def compute_cooldown(vol_pct, std_dev):
-    base = 5 * 60
+    base = 300  # 5 minutes
     extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
     return base + extra
 
@@ -108,13 +105,16 @@ def save_state(d):
 
 def analyse(sym, interval="5M"):
     closes = fetch_closes(sym, interval)
-    if len(closes) < 60: return None
+    if len(closes) < 60:
+        return None
     low, high = min(closes), max(closes)
     px = closes[-1]
     rng = high - low
-    if rng <= 0 or px == 0: return None
+    if rng <= 0 or px == 0:
+        return None
     pos = (px - low) / rng
-    if 0.25 <= pos <= 0.75: return None
+    if 0.25 <= pos <= 0.75:
+        return None
 
     std_dev = compute_std_dev(closes)
     vol_pct = rng / px * 100
@@ -122,14 +122,15 @@ def analyse(sym, interval="5M"):
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(v_factor, 1))))
     grids = max(10, min(200, math.floor(rng / (px * spacing / 100))))
     cycle = round((grids * spacing) / (v_factor + 1e-9) * 2, 1)
-    if cycle > CYCLE_MAX: return None
+    if cycle > CYCLE_MAX:
+        return None
 
     return dict(symbol=sym, zone="Long" if pos < 0.25 else "Short",
                 low=low, high=high, now=px,
-                grids=grids, spacing=round(spacing,2),
-                vol=round(vol_pct,1), std=round(std_dev,5), cycle=cycle)
+                grids=grids, spacing=round(spacing, 2),
+                vol=round(vol_pct, 1), std=round(std_dev, 5), cycle=cycle)
 
-# ── MAIN LOOP ───────────────────────────────────────
+# ── MAIN ───────────────────────────────────────────
 def main():
     interval = "5M"
     prev = load_state()
@@ -137,7 +138,8 @@ def main():
 
     for sym in fetch_symbols():
         res = analyse(sym, interval)
-        if not res: continue
+        if not res:
+            continue
         if not should_trigger(sym, res["vol"], res["std"]):
             continue
         nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
@@ -153,16 +155,22 @@ def main():
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
         stop.append(stop_msg(gone, "No longer meets criteria",
-                    {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
+                             {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
     save_state(nxt)
 
     for bucket in (start, stop):
-        if not bucket: continue
+        if not bucket:
+            continue
         buf = ""
         for m in bucket:
-            if len(buf) + len(m) + 2 > 4000: tg(buf); buf = m + "\n\n"
-            else: buf += m + "\n\n"
-        if buf: tg(buf)
+            if len(buf) + len(m) + 2 > 4000:
+                tg(buf)
+                buf = m + "\n\n"
+            else:
+                buf += m + "\n\n"
+        if buf:
+            tg(buf)
 
 if __name__ == "__main__":
+    tg("✅ Grid scanner script started via GitHub Actions.")
     main()
