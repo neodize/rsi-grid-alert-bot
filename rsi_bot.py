@@ -1,159 +1,107 @@
-"""
-Enhanced Grid Scanner – Pionex PERP v5.0.3
-Long/Short Only • Dynamic Grid Count • Neutral Skipped
-"""
+# Enhanced Grid Scanner v5.0.4 - Small Cap Discovery Edition
+# Description: Scans top 100 volume PERP symbols on Pionex, detects coins with strong Long/Short entry zones and filters for trending small-cap opportunities.
 
-import os, logging, requests
+import requests
+import math
+import time
+import logging
+from datetime import datetime
+from telegram import Bot
 
-PIONEX = "https://api.pionex.com"
+# === CONFIG ===
+TOP_N = 100
 INTERVAL = "60M"
 LIMIT = 200
-TOP_N = 10
-GRID_TARGET_SPACING = 0.75
-GRID_MIN_SPACING = 0.35
-GRID_MAX = 200
-GRID_MIN = 10
+VOLATILITY_THRESHOLD = 5
+SPACING = 0.75
+CHANGE_7D_THRESHOLD = 10
+TELEGRAM_TOKEN = "<YOUR_SECRET_BOT_TOKEN>"
+TELEGRAM_CHAT_ID = "<YOUR_SECRET_CHAT_ID>"
+PIONEX_KLINE_ENDPOINT = "https://api.pionex.com/api/v1/market/klines"
+PIONEX_TICKER_ENDPOINT = "https://api.pionex.com/api/v1/market/tickers"
 
-TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELE_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-STATE_FILE = "last_symbols.txt"
+# === LOGGING ===
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+bot = Bot(token=TELEGRAM_TOKEN)
 
-WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
-STABLE = {"USDT", "USDC", "BUSD", "DAI"}
-EXCL = {"LUNA", "LUNC", "USTC"}
+# === HELPERS ===
+def fetch_symbols():
+    r = requests.get(PIONEX_TICKER_ENDPOINT)
+    data = r.json()
+    symbols = [i['symbol'] for i in data if i['symbol'].endswith('_USDT_PERP')]
+    sorted_data = sorted(data, key=lambda x: -float(x['quoteVolume']))[:TOP_N]
+    return [i['symbol'] for i in sorted_data if i['symbol'] in symbols]
 
-def good(sym: str) -> bool:
-    u = sym.upper()
-    return (
-        u.split("_")[0] not in WRAPPED | STABLE | EXCL
-        and not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S"))
-    )
+def fetch_klines(symbol):
+    url = f"{PIONEX_KLINE_ENDPOINT}?symbol={symbol}&interval={INTERVAL}&limit={LIMIT}&type=PERP"
+    r = requests.get(url)
+    if r.status_code != 200:
+        return []
+    return r.json().get("data", [])
 
-def tg(text: str):
-    if not TELE_TOKEN or not TELE_CHAT:
-        return
-    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
-    try:
-        requests.post(
-            url,
-            json={"chat_id": TELE_CHAT, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        ).raise_for_status()
-    except Exception as e:
-        logging.error("Telegram error: %s", e)
-
-def top_perp_symbols():
-    url = f"{PIONEX}/api/v1/market/tickers"
-    js = requests.get(url, params={"type": "PERP"}, timeout=10).json()
-    tickers = js.get("data", {}).get("tickers", [])
-    sorted_tk = sorted(tickers, key=lambda x: float(x["amount"]), reverse=True)
-    symbols = [t["symbol"] for t in sorted_tk if good(t["symbol"])]
-    return symbols[:TOP_N]
-
-def fetch_klines(spot: str):
-    url = f"{PIONEX}/api/v1/market/klines"
-    js = requests.get(
-        url,
-        params={
-            "symbol": spot,
-            "interval": INTERVAL,
-            "limit": LIMIT,
-            "type": "PERP",
-        },
-        timeout=10,
-    ).json()
-    kl = js.get("data", {}).get("klines") or js.get("data")
-    if not kl:
-        raise RuntimeError("no klines")
-    closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl]
-    return closes
-
-def analyse(perp: str):
-    spot = perp.replace("_PERP", "")
-    try:
-        closes = fetch_klines(spot)
-    except Exception as e:
-        logging.warning("Skip %s: %s", perp, e)
+def analyze_symbol(symbol):
+    klines = fetch_klines(symbol)
+    if not klines or len(klines) < 50:
+        logging.warning(f"Skip {symbol}: no klines")
         return None
-    lo, hi = min(closes), max(closes)
-    band = hi - lo
-    now = closes[-1]
-    if band <= 0:
+
+    prices = [float(k[4]) for k in klines]  # closing prices
+    high = max(prices)
+    low = min(prices)
+    now = prices[-1]
+    range_pct = ((high - low) / low) * 100
+    change_7d = ((now - prices[0]) / prices[0]) * 100
+
+    if change_7d < CHANGE_7D_THRESHOLD:
         return None
-    pos = (now - lo) / band
-    if pos < 0.05 or pos > 0.95:
+
+    zone = "🟢 Long" if now < low + 0.25 * (high - low) else "🔴 Short" if now > low + 0.75 * (high - low) else None
+    if not zone:
         return None
-    if 0.25 <= pos <= 0.75:
-        return None  # skip Neutral zone
-    zone = "Long" if pos < 0.25 else "Short"
-    width_pct = band / now * 100
-    spacing = max(GRID_MIN_SPACING, GRID_TARGET_SPACING)
-    grids = max(GRID_MIN, min(GRID_MAX, int(width_pct / spacing * 1.2)))
-    cycle_days = round((grids * spacing) / width_pct * 2, 1) if width_pct else "-"
-    fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
+
+    grids = max(10, min(100, round(range_pct / SPACING)))
+    spacing = SPACING
+    cycle = round((grids / (range_pct + 1e-6)) * 1.5, 1)
+
     return {
-        "symbol": perp,
-        "range": f"{fmt(lo)} – {fmt(hi)}",
+        "symbol": symbol,
+        "low": low,
+        "high": high,
+        "now": now,
         "zone": zone,
         "grids": grids,
-        "spacing": f"{spacing:.2f}%",
-        "vol": f"{width_pct:.1f}%",
-        "cycle": f"{cycle_days} days",
+        "spacing": spacing,
+        "volatility": round(range_pct, 1),
+        "cycle": cycle
     }
 
-ZONE_EMO = {
-    "Long": "📈 Entry Zone: 🟢 Long",
-    "Short": "📉 Entry Zone: 🔴 Short",
-}
-
-def build(d):
+def format_result(d):
+    fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
     return (
-        f"*{d['symbol']}*\n"
-        f"📊 Range: `{d['range']}`\n"
-        f"{ZONE_EMO[d['zone']]}\n"
-        f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
-        f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']}`"
+        f"{d['symbol']}\n"
+        f"📊 Range: {fmt(d['low'])} – {fmt(d['high'])}\n"
+        f"📈 Entry Zone: {d['zone']}\n"
+        f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
+        f"🌪️ Volatility: {d['volatility']}%  |  ⏱️ Cycle: {d['cycle']} days"
     )
 
-def load_last():
-    if not os.path.exists(STATE_FILE):
-        return set()
-    with open(STATE_FILE) as f:
-        return set(map(str.strip, f))
-
-def save_current(s):
-    with open(STATE_FILE, "w") as f:
-        f.write("\n".join(sorted(s)))
-
 def main():
-    symbols = top_perp_symbols()
-    current, msgs = set(), []
-    for sym in symbols:
-        res = analyse(sym)
-        if res:
-            current.add(sym)
-            msgs.append(build(res))
-    dropped = load_last() - current
-    for d in dropped:
-        msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
-    save_current(current)
+    symbols = fetch_symbols()
+    logging.info(f"Scanning {len(symbols)} symbols...")
+    msgs = []
+
+    for s in symbols:
+        result = analyze_symbol(s)
+        if result:
+            msgs.append(result)
 
     if not msgs:
-        logging.info("No valid entries.")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="No trending Long/Short grid setups found today.")
         return
-    buf, chunks = "", []
-    for m in msgs:
-        if len(buf) + len(m) + 2 > 4000:
-            chunks.append(buf)
-            buf = m + "\n\n"
-        else:
-            buf += m + "\n\n"
-    if buf:
-        chunks.append(buf)
-    for c in chunks:
-        tg(c)
 
-if __name__ == "__main__":
+    msg_text = "\n\n".join([format_result(m) for m in msgs])
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg_text)
+
+if __name__ == '__main__':
     main()
