@@ -1,107 +1,177 @@
-# Enhanced Grid Scanner v5.0.4 - Small Cap Discovery Edition
-# Description: Scans top 100 volume PERP symbols on Pionex, detects coins with strong Long/Short entry zones and filters for trending small-cap opportunities.
+"""
+Enhanced Grid Scanner – Pionex PERP v5.0.4
+Long/Short Only • Small-Cap Discovery • Dynamic Grid Count
+"""
 
-import requests
-import math
-import time
-import logging
-from datetime import datetime
-from telegram import Bot
+import os, logging, requests
 
-# === CONFIG ===
-TOP_N = 100
+# --- CONFIG --------------------------------------------------
+PIONEX   = "https://api.pionex.com"
 INTERVAL = "60M"
-LIMIT = 200
-VOLATILITY_THRESHOLD = 5
-SPACING = 0.75
-CHANGE_7D_THRESHOLD = 10
-TELEGRAM_TOKEN = "<YOUR_SECRET_BOT_TOKEN>"
-TELEGRAM_CHAT_ID = "<YOUR_SECRET_CHAT_ID>"
-PIONEX_KLINE_ENDPOINT = "https://api.pionex.com/api/v1/market/klines"
-PIONEX_TICKER_ENDPOINT = "https://api.pionex.com/api/v1/market/tickers"
+LIMIT    = 200
+TOP_N    = 100                       # scan top-100 by 24h volume
+SPACING  = 0.75                      # % per grid
+GRID_MIN = 10
+GRID_MAX = 200
 
-# === LOGGING ===
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELE_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+STATE_FILE = "last_symbols.txt"
 
-bot = Bot(token=TELEGRAM_TOKEN)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 
-# === HELPERS ===
+# --- Filters -------------------------------------------------
+WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
+STABLE  = {"USDT", "USDC", "BUSD", "DAI"}
+EXCL    = {"LUNA", "LUNC", "USTC"}
+
+def good(sym: str) -> bool:
+    u = sym.upper()
+    return (
+        u.split("_")[0] not in WRAPPED | STABLE | EXCL
+        and not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S"))
+    )
+
+# --- Telegram -----------------------------------------------
+def tg(msg: str):
+    if not (TELE_TOKEN and TELE_CHAT):
+        return
+    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+    try:
+        requests.post(url,
+                      json={"chat_id": TELE_CHAT,
+                            "text": msg,
+                            "parse_mode": "Markdown"},
+                      timeout=10).raise_for_status()
+    except Exception as exc:
+        logging.error("Telegram error: %s", exc)
+
+# --- Pionex API wrappers -------------------------------------
 def fetch_symbols():
-    r = requests.get(PIONEX_TICKER_ENDPOINT)
-    data = r.json()
-    symbols = [i['symbol'] for i in data if i['symbol'].endswith('_USDT_PERP')]
-    sorted_data = sorted(data, key=lambda x: -float(x['quoteVolume']))[:TOP_N]
-    return [i['symbol'] for i in sorted_data if i['symbol'] in symbols]
+    r   = requests.get(f"{PIONEX}/api/v1/market/tickers",
+                       params={"type": "PERP"}, timeout=10)
+    js  = r.json()
+    tks = js.get("data", {}).get("tickers", [])
+    sorted_tk = sorted(tks, key=lambda x: float(x["amount"]), reverse=True)
+    return [t["symbol"] for t in sorted_tk if good(t["symbol"])][:TOP_N]
 
-def fetch_klines(symbol):
-    url = f"{PIONEX_KLINE_ENDPOINT}?symbol={symbol}&interval={INTERVAL}&limit={LIMIT}&type=PERP"
-    r = requests.get(url)
-    if r.status_code != 200:
-        return []
-    return r.json().get("data", [])
+def fetch_klines(symbol: str):
+    r = requests.get(f"{PIONEX}/api/v1/market/klines",
+                     params={"symbol": symbol,
+                             "interval": INTERVAL,
+                             "limit": LIMIT,
+                             "type": "PERP"},
+                     timeout=10)
+    js = r.json()
+    kl = js.get("data", {}).get("klines") or js.get("data")
+    if not kl:
+        raise RuntimeError("no klines")
+    closes = [float(k["close"]) if isinstance(k, dict) else float(k[4])
+              for k in kl]
+    return closes
 
-def analyze_symbol(symbol):
-    klines = fetch_klines(symbol)
-    if not klines or len(klines) < 50:
-        logging.warning(f"Skip {symbol}: no klines")
+# --- Analysis ------------------------------------------------
+ZONE_EMO = {
+    "Long":  "📈 Entry Zone: 🟢 Long",
+    "Short": "📉 Entry Zone: 🔴 Short",
+}
+
+def analyse(symbol: str):
+    try:
+        closes = fetch_klines(symbol)
+    except Exception as exc:
+        logging.warning("Skip %s: %s", symbol, exc)
         return None
 
-    prices = [float(k[4]) for k in klines]  # closing prices
-    high = max(prices)
-    low = min(prices)
-    now = prices[-1]
-    range_pct = ((high - low) / low) * 100
-    change_7d = ((now - prices[0]) / prices[0]) * 100
-
-    if change_7d < CHANGE_7D_THRESHOLD:
+    lo, hi = min(closes), max(closes)
+    band   = hi - lo
+    now    = closes[-1]
+    if band <= 0:
         return None
 
-    zone = "🟢 Long" if now < low + 0.25 * (high - low) else "🔴 Short" if now > low + 0.75 * (high - low) else None
-    if not zone:
-        return None
+    pos = (now - lo) / band
+    if pos < 0.25:
+        zone = "Long"
+    elif pos > 0.75:
+        zone = "Short"
+    else:
+        return None        # Neutral skipped
 
-    grids = max(10, min(100, round(range_pct / SPACING)))
-    spacing = SPACING
-    cycle = round((grids / (range_pct + 1e-6)) * 1.5, 1)
+    width_pct = band / now * 100
+    grids     = max(GRID_MIN,
+                    min(GRID_MAX,
+                        int(width_pct / SPACING * 1.2)))
+    cycle_days = (round((grids * SPACING) / width_pct * 2, 1)
+                  if width_pct else "-")
+
+    # formatting helper
+    fmt = (lambda p: f"${p:.8f}" if p < 0.1 else
+                    f"${p:,.4f}" if p < 1 else
+                    f"${p:,.2f}")
 
     return {
         "symbol": symbol,
-        "low": low,
-        "high": high,
-        "now": now,
+        "range": f"{fmt(lo)} – {fmt(hi)}",
         "zone": zone,
         "grids": grids,
-        "spacing": spacing,
-        "volatility": round(range_pct, 1),
-        "cycle": cycle
+        "spacing": f"{SPACING:.2f}%",
+        "vol": f"{width_pct:.1f}%",
+        "cycle": f"{cycle_days} days",
     }
 
-def format_result(d):
-    fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
+def build(d: dict) -> str:
     return (
-        f"{d['symbol']}\n"
-        f"📊 Range: {fmt(d['low'])} – {fmt(d['high'])}\n"
-        f"📈 Entry Zone: {d['zone']}\n"
-        f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
-        f"🌪️ Volatility: {d['volatility']}%  |  ⏱️ Cycle: {d['cycle']} days"
+        f"*{d['symbol']}*\n"
+        f"📊 Range: `{d['range']}`\n"
+        f"{ZONE_EMO[d['zone']]}\n"
+        f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
+        f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']}`"
     )
 
+# --- State helpers ------------------------------------------
+def load_last():
+    if not os.path.exists(STATE_FILE):
+        return set()
+    with open(STATE_FILE) as f:
+        return set(map(str.strip, f))
+
+def save_current(s):
+    with open(STATE_FILE, "w") as f:
+        f.write("\n".join(sorted(s)))
+
+# --- Main ----------------------------------------------------
 def main():
     symbols = fetch_symbols()
-    logging.info(f"Scanning {len(symbols)} symbols...")
-    msgs = []
+    logging.info("Scanning top-%d PERPs …", len(symbols))
 
-    for s in symbols:
-        result = analyze_symbol(s)
-        if result:
-            msgs.append(result)
+    current, msgs = set(), []
+    for sym in symbols:
+        res = analyse(sym)
+        if res:
+            current.add(sym)
+            msgs.append(build(res))
+
+    # drop alert
+    dropped = load_last() - current
+    for d in dropped:
+        msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
+    save_current(current)
 
     if not msgs:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="No trending Long/Short grid setups found today.")
+        tg("No valid Long/Short grid setups found.")
         return
 
-    msg_text = "\n\n".join([format_result(m) for m in msgs])
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg_text)
+    # send in chunks (Telegram 4096 char limit)
+    buf = ""
+    for m in msgs:
+        if len(buf) + len(m) + 2 > 4000:
+            tg(buf)
+            buf = m + "\n\n"
+        else:
+            buf += m + "\n\n"
+    if buf:
+        tg(buf)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
