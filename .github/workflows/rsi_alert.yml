@@ -1,12 +1,10 @@
 name: Grid Trading Scanner
 on:
-schedule:
-  # Regular scans every 3 hours during 08:00–23:00 MYT (00:00–15:00 UTC)
-  - cron: '0 0,3,6,9,12,15 * * *'
-
-  # Urgent scans every 1 hour during 08:00–23:00 MYT (00:00–15:00 UTC)
-  - cron: '0 0-15 * * *'
-
+  schedule:
+    # Regular scans every 3 hours during 08:00–23:00 MYT (00:00–15:00 UTC)
+    - cron: '0 0,3,6,9,12,15 * * *'
+    # Urgent scans every 1 hour during 08:00–23:00 MYT (00:00–15:00 UTC)
+    - cron: '0 0-15 * * *'
   workflow_dispatch:
     inputs:
       force_summary:
@@ -28,6 +26,8 @@ jobs:
   opportunity-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Only run this job for regular scans (every 3 hours)
+    if: github.event.schedule == '0 0,3,6,9,12,15 * * *' || github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Checkout code
@@ -81,11 +81,12 @@ jobs:
           -d text="⚠️ Grid Trading Scanner workflow failed! Check GitHub Actions logs for details." || true
         continue-on-error: true
 
-  # Separate job for urgent alerts (runs every 15 minutes during market hours)
+  # Separate job for urgent alerts (runs every hour during market hours)
   urgent-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event.schedule == '*/15 * * * *'
+    # Only run this job for urgent scans (every hour)
+    if: github.event.schedule == '0 0-15 * * *'
     
     steps:
       - name: Checkout code
@@ -99,7 +100,7 @@ jobs:
       - name: Install dependencies (minimal)
         run: |
           python -m pip install --upgrade pip
-          pip install requests numpy scipy
+          pip install requests numpy scipy python-telegram-bot
           
       - name: Run urgent opportunity scanner
         run: python rsi_bot.py --urgent-only
@@ -107,3 +108,11 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           URGENT_SCAN: 'true'
+          
+      - name: Notify on urgent scan failure
+        if: failure()
+        run: |
+          curl -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          -d text="⚠️ Urgent Grid Trading Scanner failed! Check logs immediately." || true
+        continue-on-error: true
