@@ -182,17 +182,24 @@ def fetch_perp_tickers() -> List[Dict]:
 def convert_symbol_for_klines(symbol: str) -> str:
     """Convert perpetual symbol to spot symbol for klines API"""
     if symbol.endswith("_PERP"):
+        # Remove _PERP suffix
         base_symbol = symbol.replace("_PERP", "")
-        # Handle special cases
-        if base_symbol in ["BTC", "ETH", "BNB", "ADA", "DOT"]:  # Add more as needed
-            return f"{base_symbol}_USDT"
+        
+        # If it already ends with _USDT, use as-is
+        if base_symbol.endswith("_USDT"):
+            return base_symbol
+        
+        # Otherwise, add _USDT
         return f"{base_symbol}_USDT"
+    
     return symbol
 
 def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> Tuple[List[float], List[float], List[float]]:
     """Fetch kline data with improved error handling and conversion"""
     spot_symbol = convert_symbol_for_klines(symbol)
     url = f"{PIONEX_API}/api/v1/market/klines"
+    
+    logger.debug(f"Fetching klines for {symbol} -> {spot_symbol}")
     
     try:
         data = make_api_request(url, {
@@ -201,11 +208,26 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> Tuple[L
             "limit": limit
         })
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch klines for {symbol}: {e}")
+        raise RuntimeError(f"Failed to fetch klines for {symbol} (as {spot_symbol}): {e}")
     
     # Validate response
     if data.get("code", 0) != 0:
-        raise RuntimeError(f"Klines API error for {symbol}: {data.get('message', 'Unknown error')}")
+        error_msg = data.get("message", "Unknown error")
+        # Try without conversion if original conversion failed
+        if "symbol error" in error_msg.lower() and spot_symbol != symbol:
+            logger.debug(f"Symbol conversion failed for {symbol}, trying original symbol")
+            try:
+                data = make_api_request(url, {
+                    "symbol": symbol, 
+                    "interval": interval, 
+                    "limit": limit
+                })
+                if data.get("code", 0) != 0:
+                    raise RuntimeError(f"Klines API error for {symbol}: {data.get('message', 'Unknown error')}")
+            except Exception:
+                raise RuntimeError(f"Klines API error for {symbol} (tried both {spot_symbol} and {symbol}): {error_msg}")
+        else:
+            raise RuntimeError(f"Klines API error for {symbol}: {error_msg}")
     
     if "data" not in data or "klines" not in data["data"]:
         raise RuntimeError(f"Invalid klines response structure for {symbol}")
