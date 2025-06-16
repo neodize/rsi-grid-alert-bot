@@ -90,7 +90,7 @@ def start_msg(d):
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
-            f"🌪️ Volatility: {d['vol']}%  |  σ: {d['std']:.5f}  |  ⏱️ Cycle: {d['cycle']} d\n"
+            f"🌪️ Volatility: {d['vol']}%  | ⏱️ Cycle: {d['cycle']} d\n"
             f"⚙️ Leverage Hint: {lev}")
 
 def stop_msg(sym, reason, info):
