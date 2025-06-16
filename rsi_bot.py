@@ -1,11 +1,13 @@
-"""Enhanced Grid Scanner – v3.1
+"""Enhanced Grid Scanner – v3.2
 ================================
 Fixes & diagnostics:
 1. **Correct ticker endpoint** → `/api/v1/market/tickers?type=PERP`.
 2. **Proper symbol conversion** for klines (`BTC_PERP` → `BTC_USDT`).
-3. **Detailed debug logging** for every rejection (width, volume, cycles).
-4. Adds third fallback mode `loose` (width 2‑30 %, vol ≥ 1 M, cycles ≥ 0.2).
+3. **Detailed logging** for every rejection (width, volume, cycles).
+4. Adds third fallback mode `loose` (width 2‑30 %, vol ≥ 500k, cycles ≥ 0.2).
 5. Keeps multi‑message Telegram output (3 coins per chunk).
+6. 🔧 Now uses correct `turnover` field for USDT volume.
+7. 🔧 Reduced filter volume thresholds to increase matches.
 
 Adjust filters easily via `.env`:
 ```
@@ -97,9 +99,9 @@ def est_cycles(width_pct: float) -> float:
 # ─────────────── FILTER LOGIC ─────────────────────
 
 FILTERS = {
-    "conservative": dict(width=(5, 15), vol=10_000_000, cycles=1.0),
-    "aggressive":   dict(width=(3, 25), vol=3_000_000,  cycles=0.5),
-    "loose":        dict(width=(2, 30), vol=1_000_000,  cycles=0.2),
+    "conservative": dict(width=(5, 15), vol=3_000_000, cycles=1.0),
+    "aggressive":   dict(width=(3, 25), vol=1_000_000,  cycles=0.5),
+    "loose":        dict(width=(2, 30), vol=500_000,    cycles=0.2),
 }
 
 
@@ -117,12 +119,12 @@ def analyse(mode: str) -> List[Dict]:
     for tk in tickers:
         sym = tk["symbol"]
         price = float(tk["close"])
-        vol24 = float(tk["amount"])
+        vol24 = float(tk.get("turnover", 0))
         try:
             closes, highs, lows = fetch_klines(sym, "1h", 200)
             ub, mid, lb = bollinger(closes)
             if mid is None:
-                logging.debug(f"{sym} skipped: insufficient klines")
+                logging.info(f"{sym} skipped: insufficient klines")
                 continue
             width_pct = (ub - lb) / mid * 100
             cycles = est_cycles(width_pct)
@@ -136,10 +138,10 @@ def analyse(mode: str) -> List[Dict]:
                     "cycles": round(cycles, 2),
                 })
             else:
-                logging.debug(
-                    f"{sym} reject mode {mode}: width {width_pct:.2f}, vol {vol24/1e6:.1f}M, cycles {cycles:.2f}")
+                logging.info(
+                    f"{sym} REJECT {mode} | width: {width_pct:.2f}% | vol: {vol24/1e6:.1f}M | cycles: {cycles:.2f}")
         except Exception as exc:
-            logging.debug(f"{sym} error: {exc}")
+            logging.info(f"{sym} error: {exc}")
     return sorted(results, key=lambda x: -x["cycles"])
 
 # ─────────────── FORMAT & SEND ────────────────────
