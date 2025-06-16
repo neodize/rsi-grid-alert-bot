@@ -1,8 +1,8 @@
-"""
-Enhanced Grid Scanner – Pionex PERP v5.0.3
-"""
+# Enhanced Grid Scanner – Pionex PERP v5.0.3+
 
-import os, logging, requests
+import os
+import logging
+import requests
 
 PIONEX = "https://api.pionex.com"
 INTERVAL = "60M"
@@ -49,12 +49,12 @@ def top_perp_symbols():
     symbols = [t["symbol"] for t in sorted_tk if good(t["symbol"])]
     return symbols[:TOP_N]
 
-def fetch_klines(spot: str):
+def fetch_klines(symbol: str):
     url = f"{PIONEX}/api/v1/market/klines"
     js = requests.get(
         url,
         params={
-            "symbol": spot,
+            "symbol": symbol,
             "interval": INTERVAL,
             "limit": LIMIT,
             "type": "PERP",
@@ -68,9 +68,8 @@ def fetch_klines(spot: str):
     return closes
 
 def analyse(perp: str):
-    spot = perp.replace("_PERP", "")
     try:
-        closes = fetch_klines(spot)
+        closes = fetch_klines(perp)
     except Exception as e:
         logging.warning("Skip %s: %s", perp, e)
         return None
@@ -80,13 +79,10 @@ def analyse(perp: str):
     if band <= 0:
         return None
     pos = (now - lo) / band
+    if pos < 0.05 or pos > 0.95:
+        return None
     zone = "Long" if pos < 0.25 else "Short" if pos > 0.75 else "Neutral"
     width_pct = band / now * 100
-
-    # 🚫 Skip Neutral zones if volatility is too low
-    if zone == "Neutral" and width_pct < 8:
-        return None
-
     spacing = max(GRID_MIN_SPACING, GRID_TARGET_SPACING)
     grids = max(2, int(width_pct / spacing))
     cycle_days = round((grids * spacing) / width_pct * 2, 1) if width_pct else "-"
@@ -101,7 +97,6 @@ def analyse(perp: str):
         "cycle": f"{cycle_days} days",
     }
 
-# emoji mapping
 ZONE_EMO = {
     "Long": "📈 Entry Zone: 🟢 Long",
     "Neutral": "🔁 Entry Zone: ⚪️ Neutral",
@@ -113,4 +108,47 @@ def build(d):
         f"*{d['symbol']}*\n"
         f"📊 Range: `{d['range']}`\n"
         f"{ZONE_EMO[d['zone']]}\n"
-        f"🧮 Grids: `{d['grids']}`  |
+        f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
+        f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']}`"
+    )
+
+def load_last():
+    if not os.path.exists(STATE_FILE):
+        return set()
+    with open(STATE_FILE) as f:
+        return set(map(str.strip, f))
+
+def save_current(s):
+    with open(STATE_FILE, "w") as f:
+        f.write("\n".join(sorted(s)))
+
+def main():
+    symbols = top_perp_symbols()
+    current, msgs = set(), []
+    for sym in symbols:
+        res = analyse(sym)
+        if res:
+            current.add(sym)
+            msgs.append(build(res))
+    dropped = load_last() - current
+    for d in dropped:
+        msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
+    save_current(current)
+
+    if not msgs:
+        logging.info("No valid entries.")
+        return
+    buf, chunks = "", []
+    for m in msgs:
+        if len(buf) + len(m) + 2 > 4000:
+            chunks.append(buf)
+            buf = m + "\n\n"
+        else:
+            buf += m + "\n\n"
+    if buf:
+        chunks.append(buf)
+    for c in chunks:
+        tg(c)
+
+if __name__ == "__main__":
+    main()
