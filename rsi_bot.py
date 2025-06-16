@@ -3,8 +3,10 @@ from pathlib import Path
 import numpy as np
 
 # ── TELEGRAM CONFIG ──────────────────────────────
-TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+# Attempt to read from TG_TOKEN/TG_CHAT_ID, fallback to TELEGRAM_TOKEN/TELEGRAM_CHAT_ID
+TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
+
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
