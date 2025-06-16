@@ -1,187 +1,137 @@
-# rsi_bot.py (Enhanced Leaderboard Strategy Edition v5.1)
-# Dynamic grids + tight cycle + auto stop alerts
+import os
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from scipy.stats import linregress
+from telegram import Bot
 
-import requests, os, json, logging, math, time
+# Env config
+TG_TOKEN = os.getenv("TG_TOKEN") or os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 
-# === CONFIG =================================================
-API_BASE     = "https://api.pionex.com/api/v1"
-INTERVAL     = "60M"
-LIMIT        = 200
-TOP_N        = 100          # scan top 100 PERPs by volume
-SPACING_MIN  = 0.3          # %   lower bound on grid spacing
-SPACING_MAX  = 1.2          # %   upper bound
-CYCLE_MAX    = 2.0          # days – only keep setups faster than this
-STOP_BUFFER  = 0.01         # 1 % buffer outside range before stop
-GRID_MIN     = 10
-GRID_MAX     = 200
-STATE_FILE   = "active_grids.json"
+bot = Bot(token=TG_TOKEN)
 
-TG_TOKEN   = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
-
-WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
-STABLE  = {"USDT", "USDC", "BUSD", "DAI"}
-EXCL    = {"LUNA", "LUNC", "USTC"}
-
-# === TELEGRAM ===============================================
-
-def tg(text: str):
-    if not (TG_TOKEN and TG_CHAT_ID):
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID,
-                                  "text": text,
-                                  "parse_mode": "Markdown"}, timeout=10)
-    except Exception as exc:
-        logging.error("Telegram error: %s", exc)
-
-# === PIONEX API =============================================
-
-def good(sym):
-    u = sym.upper()
-    return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and
-            not u.endswith(("UP","DOWN","3L","3S","5L","5S")))
+# Parameters
+INTERVAL = "60M"
+LIMIT = 200
+CYCLE_CUTOFF = 2.0  # in days
+BREAKOUT_THRESHOLD = 0.03  # 3% range exit
+MAX_CANDLES = 200
+GRID_SPACING_TARGET = 0.75 / 100  # 0.75%
 
 def fetch_symbols():
-    r = requests.get(f"{API_BASE}/market/tickers", params={"type":"PERP"}, timeout=10)
-    tks = r.json().get("data", {}).get("tickers", [])
-    tks = sorted(tks, key=lambda x: float(x["amount"]), reverse=True)
-    return [t["symbol"] for t in tks if good(t["symbol"])][:TOP_N]
+    url = "https://api.pionex.com/api/v1/market/tickers"
+    response = requests.get(url)
+    data = response.json()["data"]
+    symbols = [i["symbol"] for i in data if i["symbol"].endswith("_USDT_PERP")]
+    return symbols
 
-def fetch_klines(sym):
-    r = requests.get(f"{API_BASE}/market/klines",
-                     params={"symbol": sym, "interval": INTERVAL, "limit": LIMIT, "type":"PERP"},
-                     timeout=10)
-    kl = r.json().get("data", {}).get("klines") or r.json().get("data")
-    if not kl:
-        raise RuntimeError("no klines")
-    closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl]
-    return closes
+def fetch_ohlcv(symbol):
+    url = f"https://api.pionex.com/api/v1/market/klines?symbol={symbol}&interval={INTERVAL}&limit={LIMIT}&type=PERP"
+    response = requests.get(url)
+    data = response.json()
+    if not isinstance(data, list) or not all(len(d) >= 5 for d in data):
+        return None
+    df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    return df
 
-# === ANALYSIS ===============================================
-
-ZONE_EMO = {"Long": "📈 Entry Zone: 🟢 Long", "Short": "📉 Entry Zone: 🔴 Short"}
-
-def analysis(sym):
-    cls = fetch_klines(sym)
-    lo, hi = min(cls), max(cls)
-    rng = hi - lo
-    now = cls[-1]
-    if rng <= 0:
+def analyze_symbol(symbol):
+    df = fetch_ohlcv(symbol)
+    if df is None or df.empty:
         return None
 
-    pos = (now - lo) / rng
-    if 0.25 <= pos <= 0.75:
-        return None  # neutral skipped
-    zone = "Long" if pos < 0.25 else "Short"
+    prices = df["close"]
+    high = df["high"].max()
+    low = df["low"].min()
+    range_pct = (high - low) / low
+    last_price = prices.iloc[-1]
 
-    vol_pct = rng / now * 100
-    spacing = max(SPACING_MIN, min(SPACING_MAX, 0.75 * (30 / max(vol_pct, 1))))
-    grids = max(GRID_MIN, min(GRID_MAX, math.floor(rng / (now * spacing / 100))))
+    # Entry Zone
+    lower_bound = low + (high - low) * 0.25
+    upper_bound = high - (high - low) * 0.25
+    if last_price < lower_bound:
+        zone = "🟢 Long"
+        zone_code = "long"
+    elif last_price > upper_bound:
+        zone = "🔴 Short"
+        zone_code = "short"
+    else:
+        zone = "🔁 Neutral"
+        zone_code = "neutral"
 
-    cycle = round((grids * spacing) / (vol_pct + 1e-9) * 2, 1)
-    if cycle > CYCLE_MAX:
-        return None
+    # Volatility
+    volatility = np.std(prices.pct_change().dropna()) * np.sqrt(len(prices)) * 100
 
-    fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
+    # Grid Spacing
+    grid_spacing = GRID_SPACING_TARGET
+    grid_count = max(10, int(np.log(high / low) / np.log(1 + grid_spacing)))
+
+    # Cycle estimation
+    x = np.arange(len(prices))
+    y = prices.values
+    slope, intercept, r_value, p_value, std_err = linregress(x, y)
+    amplitude = (high - low) / 2
+    cycle = (
+        np.pi * amplitude / abs(slope) / 24
+        if slope != 0 else 99
+    )
+    cycle = round(cycle, 1)
+
+    # Planned stop: price out of range or entry zone flipped
+    planned_stop = None
+    if last_price < low * (1 - BREAKOUT_THRESHOLD) or last_price > high * (1 + BREAKOUT_THRESHOLD):
+        planned_stop = "🛑 Price out of range"
+    elif zone_code != "long":
+        planned_stop = "🛑 Exit zone flipped"
 
     return {
-        "symbol": sym,
+        "symbol": symbol,
+        "range": f"${low:.4f} – ${high:.4f}",
         "zone": zone,
-        "low": lo,
-        "high": hi,
-        "now": now,
-        "grids": grids,
-        "spacing": round(spacing, 2),
-        "vol": round(vol_pct, 1),
+        "grids": grid_count,
+        "spacing": round(grid_spacing * 100, 2),
+        "volatility": round(volatility, 1),
         "cycle": cycle,
+        "planned_stop": planned_stop,
     }
 
-# === STATE I/O ==============================================
+def send_telegram_message(message):
+    try:
+        bot.send_message(chat_id=TG_CHAT_ID, text=message, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {}
-    with open(STATE_FILE) as f:
-        return json.load(f)
-
-def save_state(d):
-    with open(STATE_FILE, "w") as f:
-        json.dump(d, f, indent=2)
-
-# === FORMATTERS =============================================
-
-def fmt_range(lo, hi):
-    fmt = lambda p: f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
-    return f"{fmt(lo)} – {fmt(hi)}"
-
-def build_start(d):
-    lev_hint = "20x–50x" if d['spacing'] <= 0.5 else "10x–25x" if d['spacing'] <= 0.75 else "5x–15x"
-    return (f"📈 Start Grid Bot: {d['symbol']}\n"
-            f"📊 Range: {fmt_range(d['low'], d['high'])}\n"
-            f"{ZONE_EMO[d['zone']]}\n"
-            f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
-            f"🌪️ Volatility: {d['vol']}%  |  ⏱️ Cycle: {d['cycle']} days\n"
-            f"⚙️ Leverage Hint: {lev_hint}\n")
-
-def build_stop(sym, reason, info):
-    return (f"🛑 Exit Alert: {sym}\n"
-            f"📉 Reason: {reason}\n"
-            f"📊 Range: {fmt_range(info['low'], info['high'])}\n"
-            f"💱 Current Price: ${info['now']:,.4f if info['now']<1 else ',.2f'}\n")
-
-# === MAIN ====================================================
+def format_summary(results):
+    messages = []
+    for r in results:
+        line = f"<b>{r['symbol']}</b>\n"
+        line += f"📊 Range: {r['range']}\n"
+        line += f"📈 Entry Zone: {r['zone']}\n"
+        line += f"🧮 Grids: {r['grids']}  |  📏 Spacing: {r['spacing']}%\n"
+        line += f"🌪️ Volatility: {r['volatility']}%  |  ⏱️ Cycle: {r['cycle']} days"
+        if r["planned_stop"]:
+            line += f"\n{r['planned_stop']}"
+        messages.append(line)
+    return "\n\n".join(messages)
 
 def main():
-    prev_state = load_state()      # {symbol: {zone, low, high}}
-    next_state = {}
-    start_msgs, stop_msgs = [], []
+    symbols = fetch_symbols()
+    shortlisted = []
+    for symbol in symbols:
+        result = analyze_symbol(symbol)
+        if result and result["cycle"] <= CYCLE_CUTOFF:
+            shortlisted.append(result)
 
-    for sym in fetch_symbols():
-        res = analysis(sym)
-        if not res:
-            continue
-        next_state[sym] = {
-            "zone": res['zone'],
-            "low": res['low'],
-            "high": res['high']
-        }
-        # --- start alert ---
-        if sym not in prev_state:
-            start_msgs.append(build_start(res))
-        else:
-            # compare for zone flip or range break
-            prev = prev_state[sym]
-            if prev['zone'] != res['zone']:
-                stop_msgs.append(build_stop(sym, f"Trend flip ({prev['zone']} → {res['zone']})", res))
-            elif res['now'] > prev['high'] * (1 + STOP_BUFFER) or res['now'] < prev['low'] * (1 - STOP_BUFFER):
-                stop_msgs.append(build_stop(sym, "Price exited range", res))
+    if not shortlisted:
+        send_telegram_message("🔍 No good Grid Trading opportunities found under cycle ≤ 2 days.")
+        return
 
-    # any symbols that disappeared entirely
-    dropped = set(prev_state) - set(next_state)
-    for d in dropped:
-        info = prev_state[d]
-        dummy_price = (info['low'] + info['high']) / 2
-        stop_msgs.append(build_stop(d, "No longer meets criteria", {**info, "now": dummy_price}))
-
-    save_state(next_state)
-
-    # --- send Telegram chunks ---
-    for bucket in (start_msgs, stop_msgs):
-        if not bucket:
-            continue
-        buf = ""
-        for m in bucket:
-            if len(buf) + len(m) + 2 > 4000:
-                tg(buf); buf = m + "\n\n"
-            else:
-                buf += m + "\n\n"
-        if buf:
-            tg(buf)
+    message = format_summary(shortlisted)
+    send_telegram_message("✅ <b>Grid Bot Opportunities</b> (Cycle ≤ 2d):\n\n" + message)
 
 if __name__ == "__main__":
     main()
