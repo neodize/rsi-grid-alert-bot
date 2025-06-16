@@ -1,5 +1,5 @@
 """
-Enhanced Grid Scanner – Pionex PERP v5.0.1
+Enhanced Grid Scanner – Pionex PERP v5.0.2
 """
 
 import os, logging, requests
@@ -14,7 +14,6 @@ GRID_MIN_SPACING = 0.35
 TELE_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELE_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = "last_symbols.txt"
-HYPE = "HYPE_USDT_PERP"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -69,9 +68,9 @@ def fetch_klines(spot: str):
     return closes
 
 def analyse(perp: str):
-    spot = perp.replace("_PERP", "")
+    spot = perp
     try:
-        closes = fetch_klines(perp)
+        closes = fetch_klines(spot)
     except Exception as e:
         logging.warning("Skip %s: %s", perp, e)
         return None
@@ -99,7 +98,6 @@ def analyse(perp: str):
         "cycle": f"{cycle_days} days",
     }
 
-# emoji mapping
 ZONE_EMO = {
     "Long": "📈 Entry Zone: 🟢 Long",
     "Neutral": "🔁 Entry Zone: ⚪️ Neutral",
@@ -111,7 +109,7 @@ def build(d):
         f"*{d['symbol']}*\n"
         f"📊 Range: `{d['range']}`\n"
         f"{ZONE_EMO[d['zone']]}\n"
-        f"💰 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
+        f"🧮 Grids: `{d['grids']}`  |  📏 Spacing: `{d['spacing']}`\n"
         f"🌪️ Volatility: `{d['vol']}`  |  ⏱️ Cycle: `{d['cycle']}`"
     )
 
@@ -127,18 +125,12 @@ def save_current(s):
 
 def main():
     symbols = top_perp_symbols()
-    if HYPE not in symbols:
-        symbols.insert(0, HYPE)  # Always prioritize HYPE on top
-
     current, msgs = set(), []
     for sym in symbols:
         res = analyse(sym)
         if res:
             current.add(sym)
             msgs.append(build(res))
-        elif sym == HYPE:
-            msgs.append(f"*{HYPE}* – No valid recommendation at the moment.")
-
     dropped = load_last() - current
     for d in dropped:
         msgs.append(f"🛑 *{d}* dropped – consider closing its grid bot.")
@@ -148,7 +140,7 @@ def main():
         logging.info("No valid entries.")
         return
 
-    # split into telegram-sized chunks
+    # chunk messages to avoid Telegram 4096 char limit
     buf, chunks = "", []
     for m in msgs:
         if len(buf) + len(m) + 2 > 4000:
