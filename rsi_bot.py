@@ -1,6 +1,6 @@
 import os, json, math, logging, time, requests
-import numpy as np
 from pathlib import Path
+import numpy as np
 
 # ── ENV + CONFIG ────────────────────────────────────
 TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
@@ -12,10 +12,11 @@ MIN_NOTIONAL_USD = 1_000_000
 SPACING_MIN = 0.3
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 5.0
-STOP_BUFFER = 0.005  # Tighter stop
+CYCLE_MAX = 2.0
+STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-VOL_THRESHOLD = 1.5  # Stricter for volatile assets
+VOL_THRESHOLD = 2.5
+
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
@@ -27,18 +28,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ── TELEGRAM ────────────────────────────────────────
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
-        logging.error("Missing Telegram credentials")
         return
     try:
-        r = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
             timeout=10
-        )
-        r.raise_for_status()
-        logging.info("Telegram Response: %s", r.json())
-    except requests.exceptions.RequestException as e:
-        logging.error("Telegram error: %s, Response: %s", e, r.text if 'r' in locals() else "No response")
+        ).raise_for_status()
+    except Exception as e:
+        logging.error("Telegram error: %s", e)
 
 # ── SYMBOL FETCHING ─────────────────────────────────
 def valid(sym):
@@ -46,106 +44,33 @@ def valid(sym):
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
             not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
 
-def fetch_symbols(retries=3):
-    for attempt in range(retries):
-        try:
-            r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
-            r.raise_for_status()
-            tickers = r.json().get("data", {}).get("tickers", [])
-            logging.info("Raw tickers: %s", [t["symbol"] for t in tickers])
-            pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
-            pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
-            symbols = [p["symbol"] for p in pairs][:TOP_N]
-            logging.info("Fetched %d valid symbols: %s", len(symbols), symbols)
-            return symbols
-        except Exception as e:
-            logging.warning("Failed to fetch symbols, attempt %d: %s", attempt + 1, e)
-            time.sleep(2)
-    logging.error("Failed to fetch symbols after %d retries", retries)
-    return ["HYPE_USDT_PERP", "BTC_USDT_PERP", "ETH_USDT_PERP"]
+def fetch_symbols():
+    r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
+    tickers = r.json().get("data", {}).get("tickers", [])
+    pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
+    pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
+    return [p["symbol"] for p in pairs][:TOP_N]
 
 # ── FETCH CLOSES WITH LIMIT ─────────────────────────
-def fetch_closes(sym, interval="5M", limit=400, retries=3):
-    sym_alt = sym.replace("USDT_PERP", "_USDT_PERP")
-    for s in [sym, sym_alt]:
-        for attempt in range(retries):
-            try:
-                r = requests.get(
-                    f"{API}/market/klines",
-                    params={"symbol": s, "interval": interval, "limit": limit},
-                    timeout=10
-                )
-                r.raise_for_status()
-                payload = r.json().get("data", {})
-                logging.info("Raw API response for %s (%s): %s", s, interval, r.json())
-                kl = payload.get("klines") or payload
-                closes = []
-                for k in kl:
-                    if isinstance(k, dict) and "close" in k:
-                        closes.append(float(k["close"]))
-                    elif isinstance(k, (list, tuple)) and len(k) >= 5:
-                        closes.append(float(k[4]))
-                logging.info("Fetched %d closes for %s (%s)", len(closes), s, interval)
-                return closes
-            except Exception as e:
-                logging.warning("API error for %s (%s), attempt %d: %s", s, interval, attempt + 1, e)
-                time.sleep(2)
-    logging.error("Failed to fetch closes for %s after %d retries", sym, retries)
-    return []
-
-# ── FETCH OHLC FOR ATR ──────────────────────────────
-def fetch_ohlc(sym, interval="5M", limit=400, retries=3):
-    sym_alt = sym.replace("USDT_PERP", "_USDT_PERP")
-    for s in [sym, sym_alt]:
-        for attempt in range(retries):
-            try:
-                r = requests.get(
-                    f"{API}/market/klines",
-                    params={"symbol": s, "interval": interval, "limit": limit},
-                    timeout=10
-                )
-                r.raise_for_status()
-                payload = r.json().get("data", {})
-                kl = payload.get("klines") or payload
-                ohlc = []
-                for k in kl:
-                    if isinstance(k, dict):
-                        o, h, l, c = float(k.get("open", 0)), float(k.get("high", 0)), float(k.get("low", 0)), float(k.get("close", 0))
-                    elif isinstance(k, (list, tuple)) and len(k) >= 5:
-                        o, h, l, c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
-                    else:
-                        continue
-                    if o > 0 and h > 0 and l > 0 and c > 0:
-                        ohlc.append((o, h, l, c))
-                logging.info("Fetched %d OHLC for %s (%s)", len(ohlc), s, interval)
-                return ohlc
-            except Exception as e:
-                logging.warning("OHLC API error for %s (%s), attempt %d: %s", s, interval, attempt + 1, e)
-                time.sleep(2)
-    logging.error("Failed to fetch OHLC for %s after %d retries", sym, retries)
-    return []
+def fetch_closes(sym, interval="5M", limit=400):
+    r = requests.get(
+        f"{API}/market/klines",
+        params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"},
+        timeout=10
+    )
+    payload = r.json().get("data", {})
+    kl = payload.get("klines") or payload
+    closes = []
+    for k in kl:
+        if isinstance(k, dict) and "close" in k:
+            closes.append(float(k["close"]))
+        elif isinstance(k, (list, tuple)) and len(k) >= 5:
+            closes.append(float(k[4]))
+    return closes
 
 # ── ANALYSIS FUNCTIONS ──────────────────────────────
 def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
-
-def compute_atr(ohlc, period=14):
-    if len(ohlc) < period + 1:
-        return 0
-    trs = []
-    for i in range(1, len(ohlc)):
-        o, h, l, c = ohlc[i]
-        prev_c = ohlc[i-1][3]
-        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-        trs.append(tr)
-    return float(np.mean(trs[-period:])) if trs else 0
-
-def compute_trend(closes, short_period=20, long_period=50):
-    if len(closes) < long_period:
-        return "Neutral"
-    short_sma = np.mean(closes[-short_period:])
-    long_sma = np.mean(closes[-long_period:])
-    return "Bullish" if short_sma > long_sma else "Bearish" if short_sma < long_sma else "Neutral"
 
 def compute_cooldown(vol_pct, std_dev):
     base = 300
@@ -162,7 +87,10 @@ def should_trigger(sym, vol_pct, std_dev):
 
 def calculate_grids(rng, px, spacing, vol):
     base = rng / (px * spacing / 100)
-    return max(10, min(200, math.floor(base * (1 if vol < 1.5 else 1.5)))
+    if vol < 1.5:
+        return max(4, min(200, math.floor(base / 2)))
+    else:
+        return max(10, min(200, math.floor(base)))
 
 def grid_type_hint(rng_pct, vol):
     if rng_pct < 1.5 and vol < 1.2:
@@ -193,21 +121,16 @@ def start_msg(d, rank=None):
     minutes = int((remaining_seconds % 3600) // 60)
     cycle_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
-    range_warning = (f"⚠️ Price {money(d['now'])} outside range {money(d['low'])}–{money(d['high'])}. Use Pionex AI range."
-                     if d["now"] < d["low"] or d["now"] > d["high"] else "")
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
             f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
-            f"🔧 Grid Mode Hint: {mode}\n"
-            f"📉 Trend: {d['trend']}\n"
-            f"{range_warning}\n"
-            f"⚠️ Set range in Pionex AI Grid Bot for optimal performance")
+            f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
-    closes = fetch_closes(sym, interval="5M", limit=1)
+    closes = fetch_closes(sym, interval="5M", limit=1)  # Fetch latest close
     now = closes[-1] if closes and closes else (info["low"] + info["high"]) / 2
     return (f"🛑 Exit Alert: {sym}\n"
             f"📉 Reason: {reason}\n"
@@ -217,50 +140,32 @@ def stop_msg(sym, reason, info):
 # ── UPDATED ANALYSE FUNCTION ────────────────────────
 def analyse(sym, interval="5M", limit=400):
     closes = fetch_closes(sym, interval, limit=limit)
-    ohlc = fetch_ohlc(sym, interval, limit=limit)
-    if len(closes) < 60 or len(ohlc) < 60:
-        logging.warning("Insufficient data for %s (%s): %d closes, %d OHLC", sym, interval, len(closes), len(ohlc))
+    if len(closes) < 60:
         return None
-
-    px = closes[-1]
-    atr = compute_atr(ohlc, period=14)
-    trend = compute_trend(closes, short_period=20, long_period=50)
-    if atr == 0 or px == 0:
-        logging.warning("Invalid ATR or price for %s (%s): atr=%.2f, px=%.2f", sym, interval, atr, px)
-        return None
-
-    # ATR-based range, adjusted for trend
-    multiplier = 4.0 if trend == "Neutral" else 3.5 if trend == "Bullish" else 4.5  # Wider in bearish
-    mid = px  # Center on current price
-    low = mid - atr * multiplier
-    high = mid + atr * multiplier
+    low, high = min(closes), max(closes)
+    px = closes[-1]  # Current price
     rng = high - low
-    if rng <= 0:
-        logging.warning("Invalid range for %s (%s): rng=%.2f", sym, interval, rng)
+    if rng <= 0 or px == 0:
         return None
-
     pos = (px - low) / rng
+    # Relaxed position filter to allow more flexibility
+    if 0.25 <= pos <= 0.75:
+        return None
     std = compute_std_dev(closes)
     vol = rng / px * 100
-    vf = max(0.1, vol + std * 100)
+    vf = max(0.1, vol + std * 100)  # Prevent zero division
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
     grids = calculate_grids(rng, px, spacing, vol)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     if cycle > CYCLE_MAX or cycle <= 0:
-        logging.warning("Invalid cycle for %s (%s): cycle=%.2f", sym, interval, cycle)
         return None
-
-    # Avoid signaling in strong trends
-    if trend in ["Bullish", "Bearish"] and abs(pos - 0.5) > 0.4:
-        logging.info("Skipping %s (%s): strong %s trend, pos=%.2f", sym, interval, trend, pos)
-        return None
-
-    zone = "Long" if pos < 0.5 else "Short"
-    logging.info("Analyse %s (%s): low=%.2f, high=%.2f, px=%.2f, pos=%.2f, vol=%.2f, std=%.5f, atr=%.2f, cycle=%.1f, grids=%d, trend=%s",
-                 sym, interval, low, high, px, pos, vol, std, atr, cycle, grids, trend)
+    # Dynamically adjust range based on current price if outside buffer
+    if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
+        low = min(px, low * 0.95)  # Adjust lower limit
+        high = max(px, high * 1.05)  # Adjust upper limit
     return dict(
         symbol=sym,
-        zone=zone,
+        zone="Long" if pos < 0.25 else "Short",
         low=low,
         high=high,
         now=px,
@@ -268,30 +173,21 @@ def analyse(sym, interval="5M", limit=400):
         spacing=round(spacing, 2),
         vol=round(vol, 1),
         std=round(std, 5),
-        atr=atr,
-        cycle=cycle,
-        trend=trend
+        cycle=cycle
     )
 
 # ── SCAN WITH FALLBACK ──────────────────────────────
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    for interval in ["5M", "15M", "1H"]:
-        try:
-            result = analyse(sym, interval)
-            if result:
-                logging.info("Analysis for %s (%s): vol=%.2f, cycle=%.2f, grids=%d, trend=%s",
-                             sym, interval, result.get('vol', 0), result.get('cycle', 0), result.get('grids', 0), result.get('trend', 'Unknown'))
-                if result.get('vol', 0) > vol_threshold and should_trigger(sym, result["vol"], result["std"]):
-                    logging.info("Symbol %s passed with vol=%.2f", sym, result['vol'])
-                    return result
-                else:
-                    logging.info("Symbol %s failed: vol=%.2f <= %.2f or cooldown", sym, result['vol'], vol_threshold)
-            else:
-                logging.warning("Analysis failed for %s (%s): result is None", sym, interval)
-        except Exception as e:
-            logging.warning("Exception analyzing %s (%s): %s", sym, interval, e)
-            continue
-    logging.warning("No valid analysis for %s", sym)
+    r60 = analyse(sym, interval="60M", limit=200)
+    if not r60:
+        return None
+    if r60["vol"] >= vol_threshold:
+        r5 = analyse(sym, interval="5M", limit=400)
+        if r5 and should_trigger(sym, r5["vol"], r5["std"]):
+            return r5
+        return None
+    elif should_trigger(sym, r60["vol"], r60["std"]):
+        return r60
     return None
 
 # ── STATE MANAGEMENT ────────────────────────────────
@@ -307,12 +203,7 @@ def load_state():
     return {}
 
 def save_state(d):
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(d, f, indent=2)
-        logging.info("State saved successfully")
-    except IOError as e:
-        logging.error("Error saving state file: %s", e)
+    STATE_FILE.write_text(json.dumps(d, indent=2))
 
 # ── CHECK_CYCLE_NOTIFICATION FUNCTION ───────────────
 def check_cycle_notification(start_time, cycle, sym, warned=False):
@@ -345,15 +236,11 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
 
 # ── MAIN FUNCTION ───────────────────────────────────
 def main():
-    tg(f"Test: Bot started at {time.strftime('%Y-%m-%d %I:%M %p %z')}")
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
 
-    symbols = fetch_symbols()
-    logging.info("Analyzing %d symbols: %s", len(symbols), symbols)
-
-    for sym in symbols:
+    for sym in fetch_symbols():
         res = scan_with_fallback(sym)
         if not res:
             continue
@@ -381,8 +268,6 @@ def main():
                 stops.append(stop_msg(sym, "Trend flip", res))
             elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
                 stops.append(stop_msg(sym, "Price exited range", res))
-                if sym == "HYPE_USDT_PERP" and res["now"] < 39.96:  # Tighter stop
-                    tg(f"🛑 Urgent: Stop HYPE_USDT_PERP grid bot! Price {res['now']:.2f} below $39.96")
 
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
@@ -392,7 +277,7 @@ def main():
             "now": mid
         })
         stops.append(stop_message)
-        tg(stop_message)
+        tg(stop_message)  # Ensure immediate Telegram notification
 
     save_state(nxt)
 
@@ -419,8 +304,6 @@ def main():
                 buf += m + "\n\n"
         if buf:
             tg(buf)
-
-    logging.info("Analysis complete. New opportunities: %d, Stops: %d", len(scored), len(stops))
 
 if __name__ == "__main__":
     main()
