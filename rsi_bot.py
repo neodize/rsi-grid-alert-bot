@@ -15,7 +15,7 @@ SPACING_TARGET = 0.75
 CYCLE_MAX = 5.0
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-VOL_THRESHOLD = 0.5
+VOL_THRESHOLD = 1.0  # Increased for volatile assets
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
@@ -62,11 +62,10 @@ def fetch_symbols(retries=3):
             logging.warning("Failed to fetch symbols, attempt %d: %s", attempt + 1, e)
             time.sleep(2)
     logging.error("Failed to fetch symbols after %d retries", retries)
-    return ["BTC_USDT_PERP", "ETH_USDT_PERP"]  # Fallback
+    return ["HYPE_USDT_PERP", "BTC_USDT_PERP", "ETH_USDT_PERP"]  # Fallback
 
 # ── FETCH CLOSES WITH LIMIT ─────────────────────────
 def fetch_closes(sym, interval="5M", limit=400, retries=3):
-    # Try both symbol formats
     sym_alt = sym.replace("USDT_PERP", "_USDT_PERP")
     for s in [sym, sym_alt]:
         for attempt in range(retries):
@@ -173,8 +172,8 @@ def analyse(sym, interval="5M", limit=400):
 
     mid = np.mean(closes[-20:])
     std = np.std(closes[-20:])
-    low = mid - 2 * std
-    high = mid + 2 * std
+    low = mid - 3 * std  # Wider range
+    high = mid + 3 * std
     px = closes[-1]
     rng = high - low
     if rng <= 0 or px == 0:
@@ -193,8 +192,8 @@ def analyse(sym, interval="5M", limit=400):
         return None
 
     zone = "Long" if pos < 0.5 else "Short"
-    logging.info("Analyse %s (%s): low=%.2f, high=%.2f, px=%.2f, pos=%.2f, vol=%.2f, std=%.5f, cycle=%.1f",
-                 sym, interval, low, high, px, pos, vol, std, cycle)
+    logging.info("Analyse %s (%s): low=%.2f, high=%.2f, px=%.2f, pos=%.2f, vol=%.2f, std=%.5f, cycle=%.1f, grids=%d",
+                 sym, interval, low, high, px, pos, vol, std, cycle, grids)
     return dict(
         symbol=sym,
         zone=zone,
@@ -279,7 +278,7 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
 
 # ── MAIN FUNCTION ───────────────────────────────────
 def main():
-    tg("Test: Bot started at 2025-06-17 10:10 PM +08")
+    tg("Test: Bot started at 2025-06-17 10:17 PM +08")
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
@@ -315,6 +314,8 @@ def main():
                 stops.append(stop_msg(sym, "Trend flip", res))
             elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
                 stops.append(stop_msg(sym, "Price exited range", res))
+                if sym == "HYPE_USDT_PERP" and res["now"] < 39.76:  # Explicit check
+                    tg(f"🛑 Urgent: Stop HYPE_USDT_PERP grid bot! Price {res['now']:.2f} below $39.76")
 
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
