@@ -1,29 +1,32 @@
-Futures Grid Bot Scanner with Ranked Telegram Alerts
-This Python script scans the futures market for grid bot opportunities by analyzing price volatility, grid parameters, and cycle times. It then ranks the potential opportunities using a composite score and sends emoji-enhanced alerts to your Telegram chat.
+# RSI Grid Alert Bot
 
-Features
-Market Ticker Scanning: Retrieves symbols from Pionex's API based on criteria like notional volume and token exclusions.
+This Python script scans the Pionex perpetual futures market for high-probability grid bot setups. It identifies symbols showing strong directional bias, evaluates volatility, and calculates grid parameters. When conditions are met, it sends start/stop alerts via Telegram.
 
-Hybrid Analysis: Uses a dual-interval scan (5-minute and 60-minute) to ensure that the conditions are right for deploying a grid strategy while filtering out tokens with moderate price positions.
+## 🔧 How It Works
 
-Composite Scoring: Calculates a score that takes into account:
+For the top 100 most liquid symbols, the script:
 
-Volatility: More dynamic price movements add to the score.
+1. **Fetches price history**
+2. **Analyzes current price position** relative to recent high/low range
+3. **Estimates volatility** and standard deviation
+4. **Computes grid size, spacing, and cycle**
+5. **Ranks results** based on a scoring formula
+6. **Sends top-ranked opportunities** to Telegram
 
-Grid Count: Fewer grids generally mean more efficient setups.
+---
 
-Spacing: Tighter spacing is favorable.
+## 🧠 Key Concepts
 
-Cycle Time: Shorter cycle durations can indicate faster potential returns.
+| Term          | Meaning                                                                 |
+|---------------|-------------------------------------------------------------------------|
+| **Range**     | The price boundaries (lowest to highest) in recent history              |
+| **Entry Zone**| "Long" if price is near the bottom of the range, "Short" if near top    |
+| **Grid Spacing** | How far apart each buy/sell order is, in % — based on volatility     |
+| **Grids**     | Number of levels the bot will place orders at within the range          |
+| **Volatility**| How much price has moved relative to its current price (%)              |
+| **Cycle**     | Estimated time (in days) for a full grid rotation, based on volatility  |
+| **Score**     | Higher = better opportunity (based on volatility, grid count, spacing…) |
+| **Leverage Hint** | Suggested leverage based on how tight the spacing is                |
 
-Suitability Messaging: Each signal is labeled with a suitability message:
+---
 
-🚀 Ideal for high-volatility scalping (score > 90)
-
-🎯 Balanced for trend-following bots (score between 80 and 90)
-
-📊 Moderate conditions — review before deploying (score ≤ 80)
-
-Stateful Operation: Uses a JSON file (active_grids.json) to track previously active signals, ensuring that alerts are sent only for new or flipped opportunities.
-
-Telegram Notifications: Sends alerts in ranked batches with emojis and actionable information for rapid decision-making.
