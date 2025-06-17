@@ -31,12 +31,31 @@ STATE_FILE = Path("active_grids.json")
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
-VOL_THRESHOLD = 2.5  # If the 60M analysis shows vol ≥ 2.5, perform a 5M rescan.
+VOL_THRESHOLD = 2.5
 
 last_trade_time = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
+# ── SCORING FUNCTION ─────────────────────────────
+def score_signal(d):
+    return round(
+        d["vol"] * 2 +
+        ((200 - d["grids"]) / 200) * 10 +
+        ((1.5 - min(d["spacing"], 1.5)) * 15) +
+        (1.5 / max(d["cycle"], 0.1)) * 10,
+        1
+    )
 
-# ── HELPER FUNCTIONS ───────────────────────────────
+def interpret_score(score):
+    # Interpret the score with emoji hints
+    return (
+        "🚀 Ideal for high-volatility scalping"
+        if score > 90 else
+        "🎯 Balanced for trend-following bots"
+        if score > 80 else
+        "📊 Moderate conditions — review before deploying"
+    )
+# ── MARKET UTILS ─────────────────────────────────
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and
@@ -55,19 +74,15 @@ def fetch_closes(sym, interval="5M"):
                      timeout=10)
     payload = r.json().get("data", {})
     kl = payload.get("klines") or payload
-    closes = []
-    for k in kl:
-        if isinstance(k, dict) and "close" in k:
-            closes.append(float(k["close"]))
-        elif isinstance(k, (list, tuple)) and len(k) >= 5:
-            closes.append(float(k[4]))
+    closes = [float(k["close"]) if isinstance(k, dict) else float(k[4])
+              for k in kl if (isinstance(k, dict) and "close" in k) or (isinstance(k, (list, tuple)) and len(k) >= 5)]
     return closes
-
+# ── ANALYSIS FUNCTIONS ───────────────────────────
 def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
 def compute_cooldown(vol_pct, std_dev):
-    base = 300  # 5 minutes in seconds
+    base = 300
     extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
     return base + extra
 
@@ -82,29 +97,25 @@ def should_trigger(sym, vol_pct, std_dev):
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
-ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
-
-def start_msg(d):
+def start_msg(d, rank=None):
+    score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
-    return (f"📈 Start Grid Bot: {d['symbol']}\n"
+    prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
+    return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}%  |  ⏱️ Cycle: {d['cycle']} d\n"
-            f"⚙️ Leverage Hint: {lev}")
+            f"🌀 Score: {score}\n"
+            f"⚙️ Leverage Hint: {lev}\n"
+            f"🧭 Suitability: {interpret_score(score)}")
 
 def stop_msg(sym, reason, info):
     return (f"🛑 Exit Alert: {sym}\n"
             f"📉 Reason: {reason}\n"
             f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
             f"💱 Current Price: {money(info['now'])}")
-
-def load_state():
-    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-
-def save_state(d):
-    STATE_FILE.write_text(json.dumps(d, indent=2))
-
+            
 def analyse(sym, interval="5M"):
     closes = fetch_closes(sym, interval)
     if len(closes) < 60:
@@ -117,7 +128,6 @@ def analyse(sym, interval="5M"):
     pos = (px - low) / rng
     if 0.25 <= pos <= 0.75:
         return None
-
     std_dev = compute_std_dev(closes)
     vol_pct = rng / px * 100
     v_factor = vol_pct + std_dev * 100
@@ -126,69 +136,82 @@ def analyse(sym, interval="5M"):
     cycle = round((grids * spacing) / (v_factor + 1e-9) * 2, 1)
     if cycle > CYCLE_MAX:
         return None
-
     return dict(symbol=sym, zone="Long" if pos < 0.25 else "Short",
                 low=low, high=high, now=px,
                 grids=grids, spacing=round(spacing, 2),
                 vol=round(vol_pct, 1), std=round(std_dev, 5), cycle=cycle)
 
-# ── HYBRID SCANNING ───────────────────────────────
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    # Broad/efficient scan with 60M interval
-    res_60m = analyse(sym, interval="60M")
-    if not res_60m:
+    r60 = analyse(sym, interval="60M")
+    if not r60:
         return None
-
-    # If volatility is high, refine the data by scanning using 5M interval
-    if res_60m['vol'] >= vol_threshold:
-        res_5m = analyse(sym, interval="5M")
-        if res_5m and should_trigger(sym, res_5m["vol"], res_5m["std"]):
-            return res_5m
+    if r60['vol'] >= vol_threshold:
+        r5 = analyse(sym, interval="5M")
+        if r5 and should_trigger(sym, r5["vol"], r5["std"]):
+            return r5
         else:
             return None
     else:
-        # Use the 60M result if it passes cooldown
-        if should_trigger(sym, res_60m["vol"], res_60m["std"]):
-            return res_60m
+        if should_trigger(sym, r60["vol"], r60["std"]):
+            return r60
         else:
             return None
+# ── STATE MANAGEMENT & MAIN LOGIC ────────────────
+def load_state():
+    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
-# ── MAIN ───────────────────────────────────────────
+def save_state(d):
+    STATE_FILE.write_text(json.dumps(d, indent=2))
+
 def main():
     prev = load_state()
-    nxt, start_alerts, stop_alerts = {}, [], []
-
+    nxt, ranked, stops = {}, [], []
+    
     for sym in fetch_symbols():
         res = scan_with_fallback(sym)
         if not res:
             continue
         nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
         if sym not in prev:
-            start_alerts.append(start_msg(res))
+            ranked.append((score_signal(res), res))
         else:
             p = prev[sym]
             if p["zone"] != res["zone"]:
-                stop_alerts.append(stop_msg(sym, "Trend flip", res))
+                stops.append(stop_msg(sym, "Trend flip", res))
             elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
-                stop_alerts.append(stop_msg(sym, "Price exited range", res))
-
+                stops.append(stop_msg(sym, "Price exited range", res))
+    
+    # Handle symbols that no longer meet criteria
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
-        stop_alerts.append(stop_msg(gone, "No longer meets criteria",
-                                     {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
+        stops.append(stop_msg(gone, "No longer meets criteria",
+                               {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
+    
     save_state(nxt)
-
-    # Send alerts in batches
-    for alerts in (start_alerts, stop_alerts):
-        if not alerts:
-            continue
+    
+    # Send ranked start alerts sorted by score (descending)
+    if ranked:
+        ranked.sort(reverse=True)
         buf = ""
-        for msg in alerts:
-            if len(buf) + len(msg) + 2 > 4000:
+        for i, (_, signal) in enumerate(ranked, 1):
+            m = start_msg(signal, rank=i)
+            if len(buf) + len(m) > 3500:
                 tg(buf)
-                buf = msg + "\n\n"
+                buf = m + "\n\n"
             else:
-                buf += msg + "\n\n"
+                buf += m + "\n\n"
+        if buf:
+            tg(buf)
+    
+    # Send stop alerts in batches
+    if stops:
+        buf = ""
+        for m in stops:
+            if len(buf) + len(m) > 3500:
+                tg(buf)
+                buf = m + "\n\n"
+            else:
+                buf += m + "\n\n"
         if buf:
             tg(buf)
 
