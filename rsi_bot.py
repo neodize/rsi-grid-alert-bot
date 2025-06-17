@@ -2,6 +2,10 @@ import os, json, math, logging, time, requests
 import numpy as np
 from pathlib import Path
 
+# ── ENV + CONFIG ─────────────────────────────────────
+TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
+
 API = "https://api.pionex.com/api/v1"
 STATE_FILE = Path("active_grids.json")
 
@@ -13,18 +17,66 @@ CYCLE_MAX = 2.0
 STOP_BUFFER = 0.01  # Prevent premature stop conditions
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ── TELEGRAM ─────────────────────────────────────────
+def tg(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        logging.error("Missing Telegram credentials")
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        )
+        logging.info("Telegram Response: %s", r.json())
+    except Exception as e:
+        logging.error("Telegram error: %s", e)
 
+# ── SYMBOL FETCHING ───────────────────────────────────
+def valid(sym):
+    """Exclude wrapped, stable, and excluded tokens."""
+    u = sym.upper()
+    return (u.split("_")[0] not in {"WBTC", "WETH", "WSOL", "WBNB", "USDT", "USDC", "BUSD", "DAI", "LUNA", "LUNC", "USTC"} 
+            and not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
+
+def fetch_symbols():
+    """Retrieve the top perpetual trading pairs based on volume."""
+    r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
+    tickers = r.json().get("data", {}).get("tickers", [])
+    pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > 1_000_000]
+    pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
+    return [p["symbol"] for p in pairs][:100]
+# ── FETCH CLOSES WITH LIMIT ───────────────────────────
 def fetch_closes(sym, interval="5M", limit=400):
+    """Fetch historical closing prices for a given symbol."""
     r = requests.get(f"{API}/market/klines", params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"}, timeout=10)
     payload = r.json().get("data", {})
     kl = payload.get("klines") or payload
     closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl if isinstance(k, (list, tuple))]
     return closes
 
+# ── ANALYSIS FUNCTIONS ─────────────────────────────────
 def compute_std_dev(closes, period=30):
+    """Calculate standard deviation based on recent price movements."""
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
+def compute_cooldown(vol_pct, std_dev):
+    """Determine cooldown time based on volatility and deviation."""
+    base = 300
+    extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
+    return base + extra
+
+def should_trigger(sym, vol_pct, std_dev):
+    """Check if a trade signal should be triggered based on cooldown logic."""
+    now = time.time()
+    cooldown = compute_cooldown(vol_pct, std_dev)
+    if now - last_trade_time.get(sym, 0) >= cooldown:
+        last_trade_time[sym] = now
+        return True
+    return False
+# ── BOLLINGER BANDS FOR VALIDATION ───────────────────
 def fetch_bollinger(sym, interval="5M"):
+    """Calculate Bollinger Bands for additional range validation."""
     closes = fetch_closes(sym, interval)
     if len(closes) < 60:
         return None
@@ -34,15 +86,19 @@ def fetch_bollinger(sym, interval="5M"):
     lower = mid - (std_dev * 2)
     return lower, upper
 
+# ── PERCENTILE ADJUSTMENT BASED ON LEVERAGE ──────────
 def determine_percentiles(leverage):
+    """Adjust range width based on trading leverage."""
     if leverage <= 5:
-        return 5, 95  # Wider range for moderate trading
+        return 5, 95  # Wider range for low leverage
     elif leverage <= 10:
         return 3, 97  # Balanced range for mid-leverage
     else:
         return 2, 98  # Tighter range for aggressive leverage
 
+# ── PRICE RANGE CALCULATION ──────────────────────────
 def analyse(sym, interval="5M", limit=400, leverage=5):
+    """Determine optimal price range for grid bot trading."""
     closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
         return None
@@ -99,3 +155,140 @@ def analyse(sym, interval="5M", limit=400, leverage=5):
         std=round(std, 5),
         cycle=cycle
     )
+# ── SCAN WITH FALLBACK ───────────────────────────────
+def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
+    """Analyze price trends using multiple timeframes."""
+    r60 = analyse(sym, interval="60M", limit=200)
+    if not r60:
+        return None
+    if r60["vol"] >= vol_threshold:
+        r5 = analyse(sym, interval="5M", limit=400)
+        if r5 and should_trigger(sym, r5["vol"], r5["std"]):
+            return r5
+        return None
+    elif should_trigger(sym, r60["vol"], r60["std"]):
+        return r60
+    return None
+
+# ── STATE MANAGEMENT ─────────────────────────────────
+def load_state():
+    """Load previously saved trading bot states."""
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                content = f.read().strip()
+                return json.loads(content) if content else {}
+        except json.JSONDecodeError:
+            logging.warning("Invalid JSON in %s, returning empty state", STATE_FILE)
+            return {}
+    return {}
+
+def save_state(d):
+    """Save the updated trading bot state."""
+    STATE_FILE.write_text(json.dumps(d, indent=2))
+# ── CYCLE NOTIFICATION FUNCTION ───────────────────────
+def check_cycle_notification(start_time, cycle, sym, warned=False):
+    """Send a warning before cycle completion if needed."""
+    if not start_time or not cycle or warned:
+        return False
+    current_time = time.time()
+    elapsed_time = current_time - start_time
+    cycle_seconds = cycle * 24 * 3600
+    threshold = max(3600, cycle_seconds * 0.1)
+    remaining = cycle_seconds - elapsed_time
+    if 0 < remaining <= threshold:
+        remaining_seconds = remaining
+        days = int(remaining_seconds // (24 * 3600))
+        remaining_seconds %= (24 * 3600)
+        hours = int(remaining_seconds // 3600)
+        minutes = int((remaining_seconds % 3600) // 60)
+        remaining_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
+        tg(f"⚠️ Cycle Warning: {sym}\n"
+           f"Time remaining: {remaining_time}\n"
+           f"Consider reviewing or stopping the bot.")
+        return True
+    return False
+
+# ── EXECUTE TRADES & ALERTS ───────────────────────────
+def execute_trade(sym, data):
+    """Trigger a trade action with notifications."""
+    msg = (f"📈 Trade Alert: {sym}\n"
+           f"🔵 Entry Zone: {data['zone']}\n"
+           f"📊 Price Range: {data['low']} – {data['high']}\n"
+           f"🌀 Score: {score_signal(data)}")
+    tg(msg)
+# ── MAIN FUNCTION ────────────────────────────────────
+def main():
+    """Execute the main trading cycle and notify based on conditions."""
+    prev = load_state()
+    nxt, scored, stops = {}, [], []
+    current_time = time.time()
+
+    for sym in fetch_symbols():
+        res = scan_with_fallback(sym)
+        if not res:
+            continue
+
+        prev_state = prev.get(sym, {})
+        warned = prev_state.get("warned", False)
+        start_time = prev_state.get("start_time", current_time)
+
+        if check_cycle_notification(start_time, res["cycle"], sym, warned):
+            warned = True
+
+        nxt[sym] = {
+            "zone": res["zone"],
+            "low": res["low"],
+            "high": res["high"],
+            "start_time": start_time,
+            "warned": warned
+        }
+
+        if sym not in prev:
+            scored.append((score_signal(res), res))
+        else:
+            p = prev[sym]
+            if p["zone"] != res["zone"]:
+                stops.append(stop_msg(sym, "Trend flip", res))
+            elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
+                stops.append(stop_msg(sym, "Price exited range", res))
+
+    for gone in set(prev) - set(nxt):
+        mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
+        stop_message = stop_msg(gone, "No longer meets criteria", {
+            "low": prev[gone]["low"],
+            "high": prev[gone]["high"],
+            "now": mid
+        })
+        stops.append(stop_message)
+        tg(stop_message)  # Immediate Telegram alert
+
+    save_state(nxt)
+
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        buf = ""
+        for i, (_, r) in enumerate(scored, 1):
+            m = start_msg(r, i)
+            if len(buf) + len(m) > 3500:
+                tg(buf)
+                buf = m + "\n\n"
+            else:
+                buf += m + "\n\n"
+        if buf:
+            tg(buf)
+
+    if stops:
+        buf = ""
+        for m in stops:
+            if len(buf) + len(m) > 3500:
+                tg(buf)
+                buf = m + "\n\n"
+            else:
+                buf += m + "\n\n"
+        if buf:
+            tg(buf)
+
+if __name__ == "__main__":
+    main()
+
