@@ -109,12 +109,12 @@ def score_signal(d):
         1
     )
 
-# ── UPDATED START_MSG FUNCTION ──────────────────────
+# ── START_MSG FUNCTION ──────────────────────────────
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
     mode = grid_type_hint((d["high"] - d["low"]) / d["now"] * 100, d["vol"])
-    total_seconds = d["cycle"] * 24 * 3600  # Convert days to seconds
+    total_seconds = d["cycle"] * 24 * 3600
     days = int(total_seconds // (24 * 3600))
     remaining_seconds = total_seconds % (24 * 3600)
     hours = int(remaining_seconds // 3600)
@@ -141,28 +141,29 @@ def analyse(sym, interval="5M", limit=400):
     if len(closes) < 60:
         return None
     low, high = min(closes), max(closes)
-    px = closes[-1]
+    px = closes[-1]  # Current price
     rng = high - low
     if rng <= 0 or px == 0:
         return None
     pos = (px - low) / rng
-    if 0.35 <= pos <= 0.65:
+    # Relaxed position filter to allow more flexibility
+    if 0.25 <= pos <= 0.75:
         return None
     std = compute_std_dev(closes)
     vol = rng / px * 100
     vf = max(0.1, vol + std * 100)  # Prevent zero division
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
     grids = calculate_grids(rng, px, spacing, vol)
-    cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)  # In days
+    cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     if cycle > CYCLE_MAX or cycle <= 0:
         return None
-    if px < low:
-        low = px
-    elif px > high:
-        high = px
+    # Dynamically adjust range based on current price if outside buffer
+    if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
+        low = min(px, low * 0.95)  # Adjust lower limit
+        high = max(px, high * 1.05)  # Adjust upper limit
     return dict(
         symbol=sym,
-        zone="Long" if pos < 0.35 else "Short",
+        zone="Long" if pos < 0.25 else "Short",
         low=low,
         high=high,
         now=px,
@@ -194,14 +195,14 @@ def load_state():
 def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
 
-# ── UPDATED CHECK_CYCLE_NOTIFICATION FUNCTION ───────
+# ── CHECK_CYCLE_NOTIFICATION FUNCTION ───────────────
 def check_cycle_notification(start_time, cycle, sym, warned=False):
     if not start_time or not cycle or warned:
         return False
     current_time = time.time()
     elapsed_time = current_time - start_time
-    cycle_seconds = cycle * 24 * 3600  # Convert days to seconds
-    threshold = max(3600, cycle_seconds * 0.1)  # Warning threshold (1 hour or 10% of cycle)
+    cycle_seconds = cycle * 24 * 3600
+    threshold = max(3600, cycle_seconds * 0.1)
     remaining = cycle_seconds - elapsed_time
     if 0 < remaining <= threshold:
         remaining_seconds = remaining
