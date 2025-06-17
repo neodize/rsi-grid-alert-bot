@@ -12,40 +12,6 @@ MIN_NOTIONAL_USD = 1_000_000
 SPACING_MIN = 0.3
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 5.0  # Relaxed to allow more cycles
-STOP_BUFFER = 0.01
-STATE_FILE = Path("active_grids.json")
- ból
-
-System: It looks like your message was cut off, and the artifact for the modified script is incomplete (it ends at `STATE_FILE = Path("active_grids.json")`). Since you prefer the script you provided and want to improve its price range to align with Pionex’s AI strategy while using it as an indicator for starting/stopping futures grid bots, I’ll complete the modifications based on your input and the troubleshooting steps we’ve discussed. The key issues to address are:
-
-1. **API Failure**: The logs show `fetch_closes` returns 0 closes for symbols like `EPT_USDT_PERP` and `APE_USDT_PERP`, causing `analyse` to fail.
-2. **Price Range**: The current range (`min(closes)`, `max(closes)`) is too narrow or misaligned with Pionex’s AI strategy.
-3. **Telegram**: Ensure Telegram notifications work for signals and test messages.
-
-### Modifications
-- **Debug API**: Add logging and retry logic to `fetch_closes` and `fetch_symbols` to diagnose empty responses.
-- **Volatility-Based Range**: Use Bollinger Bands (mean ± 2*std) for a wider, adaptive price range, mimicking Pionex’s AI strategy.
-- **Relax Filters**: Remove the strict position filter (`0.25 <= pos <= 0.75`) to allow more opportunities.
-- **Test Symbols**: Hardcode known symbols (`BTCUSDT_PERP`, `ETHUSDT_PERP`) for testing.
-- **Telegram Test**: Add a test message to verify connectivity.
-
-### Full Modified Script
-<xaiArtifact artifact_id="460e429e-c65f-4bd8-8ff6-61c4275437d1" artifact_version_id="b6294f3e-eedd-4f49-af5e-6a0455f6b6eb" title="rsi_bot.py" contentType="text/python">
-import os, json, math, logging, time, requests
-import numpy as np
-from pathlib import Path
-
-# ── ENV + CONFIG ────────────────────────────────────
-TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
-
-API = "https://api.pionex.com/api/v1"
-TOP_N = 100
-MIN_NOTIONAL_USD = 1_000_000
-SPACING_MIN = 0.3
-SPACING_MAX = 1.2
-SPACING_TARGET = 0.75
 CYCLE_MAX = 5.0  # Relaxed for testing
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
@@ -184,7 +150,8 @@ def start_msg(d, rank=None):
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
             f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
-            f"🔧 Grid Mode Hint: {mode}")
+            f"🔧 Grid Mode Hint: {mode}\n"
+            f"⚠️ Set range in Pionex AI Grid Bot for optimal performance")
 
 def stop_msg(sym, reason, info):
     closes = fetch_closes(sym, interval="5M", limit=1)
@@ -194,24 +161,25 @@ def stop_msg(sym, reason, info):
             f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
             f"💱 Current Price: {money(now)}")
 
-# ── UPDATED ANALYSE FUNCTIONuencia
+# ── UPDATED ANALYSE FUNCTION ────────────────────────
+def analyse(sym, interval="5M", limit=400):
     closes = fetch_closes(sym, interval, limit=limit)
-    if len(closes) < 20:  # Reduced from 60
+    if len(closes) < 20:
         logging.warning("Insufficient data for %s (%s): %d closes", sym, interval, len(closes))
         return None
 
-    # Use Bollinger Bands for price range (mimics Pionex AI strategy)
+    # Bollinger Bands for price range (mimics Pionex AI)
     mid = np.mean(closes[-20:])
     std = np.std(closes[-20:])
-    low = mid - 2 * std  # Lower Bollinger Band
-    high = mid + 2 * std  # Upper Bollinger Band
+    low = mid - 2 * std
+    high = mid + 2 * std
     px = closes[-1]
     rng = high - low
     if rng <= 0 or px == 0:
         logging.warning("Invalid range for %s (%s): rng=%.2f, px=%.2f", sym, interval, rng, px)
         return None
 
-    # Removed position filter to allow more opportunities
+    pos = (px - low) / rng
     std = compute_std_dev(closes)
     vol = rng / px * 100
     vf = max(0.1, vol + std * 100)
@@ -222,9 +190,7 @@ def stop_msg(sym, reason, info):
         logging.warning("Invalid cycle for %s (%s): cycle=%.2f", sym, interval, cycle)
         return None
 
-    pos = (px - low) / rng
-    zone = "Long" if pos < 0.5 else "Short"  # Adjusted from 0.25 to 0.5
-
+    zone = "Long" if pos < 0.5 else "Short"
     logging.info("Analyse %s (%s): low=%.2f, high=%.2f, px=%.2f, pos=%.2f, vol=%.2f, std=%.5f, cycle=%.1f",
                  sym, interval, low, high, px, pos, vol, std, cycle)
     return dict(
@@ -242,16 +208,16 @@ def stop_msg(sym, reason, info):
 
 # ── SCAN WITH FALLBACK ──────────────────────────────
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    for interval in ["5M", "15M", "1H"]:  # Replaced 60M with 1H
+    for interval in ["5M", "15M", "1H"]:
         try:
             result = analyse(sym, interval)
             if result:
                 logging.info("Analysis for %s (%s): vol=%.2f, cycle=%.2f, grids=%d", sym, interval, result.get('vol', 0), result.get('cycle', 0), result.get('grids', 0))
-                if result.get('vol', 0) > vol_threshold:
+                if result.get('vol', 0) > vol_threshold and should_trigger(sym, result["vol"], result["std"]):
                     logging.info("Symbol %s passed with vol=%.2f", sym, result['vol'])
                     return result
                 else:
-                    logging.info("Symbol %s failed: vol=%.2f <= %.2f", sym, result['vol'], vol_threshold)
+                    logging.info("Symbol %s failed: vol=%.2f <= %.2f or cooldown", sym, result['vol'], vol_threshold)
             else:
                 logging.warning("Analysis failed for %s (%s): result is None", sym, interval)
         except Exception as e:
@@ -311,7 +277,7 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
 
 # ── MAIN FUNCTION ───────────────────────────────────
 def main():
-    tg("Test: Bot started at 2025-06-17 10:04 PM +08")
+    tg("Test: Bot started at 2025-06-17 10:07 PM +08")
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
@@ -321,55 +287,43 @@ def main():
     logging.info("Testing with symbols: %s", symbols)
 
     for sym in symbols:
-        try:
-            logging.info("Processing symbol: %s", sym)
-            res = scan_with_fallback(sym)
-            if not res:
-                logging.info("No valid result for %s", sym)
-                continue
-
-            prev_state = prev.get(sym, {})
-            warned = prev_state.get("warned", False)
-            start_time = prev_state.get("start_time", current_time)
-
-            if check_cycle_notification(start_time, res["cycle"], sym, warned):
-                warned = True
-
-            nxt[sym] = {
-                "zone": res["zone"],
-                "low": res["low"],
-                "high": res["high"],
-                "start_time": start_time,
-                "warned": warned
-            }
-
-            if sym not in prev:
-                scored.append((score_signal(res), res))
-            else:
-                p = prev[sym]
-                logging.info("Comparing %s: prev_zone=%s, new_zone=%s, prev_low=%.2f, prev_high=%.2f, now=%.2f",
-                             sym, p["zone"], res["zone"], p["low"], p["high"], res["now"])
-                if p["zone"] != res["zone"]:
-                    stops.append(stop_msg(sym, "Trend flip", res))
-                elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
-                    stops.append(stop_msg(sym, "Price exited range", res))
-
-        except Exception as e:
-            logging.error("Error processing symbol %s: %s", sym, e)
+        res = scan_with_fallback(sym)
+        if not res:
             continue
 
+        prev_state = prev.get(sym, {})
+        warned = prev_state.get("warned", False)
+        start_time = prev_state.get("start_time", current_time)
+
+        if check_cycle_notification(start_time, res["cycle"], sym, warned):
+            warned = True
+
+        nxt[sym] = {
+            "zone": res["zone"],
+            "low": res["low"],
+            "high": res["high"],
+            "start_time": start_time,
+            "warned": warned
+        }
+
+        if sym not in prev:
+            scored.append((score_signal(res), res))
+        else:
+            p = prev[sym]
+            if p["zone"] != res["zone"]:
+                stops.append(stop_msg(sym, "Trend flip", res))
+            elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
+                stops.append(stop_msg(sym, "Price exited range", res))
+
     for gone in set(prev) - set(nxt):
-        try:
-            mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
-            stop_message = stop_msg(gone, "No longer meets criteria", {
-                "low": prev[gone]["low"],
-                "high": prev[gone]["high"],
-                "now": mid
-            })
-            stops.append(stop_message)
-            tg(stop_message)
-        except Exception as e:
-            logging.error("Error handling removed symbol %s: %s", gone, e)
+        mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
+        stop_message = stop_msg(gone, "No longer meets criteria", {
+            "low": prev[gone]["low"],
+            "high": prev[gone]["high"],
+            "now": mid
+        })
+        stops.append(stop_message)
+        tg(stop_message)
 
     save_state(nxt)
 
