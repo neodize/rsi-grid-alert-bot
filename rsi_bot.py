@@ -84,6 +84,11 @@ def calculate_grids(rng, px, spacing, vol):
         return max(4, min(200, math.floor(base / 2)))
     else:
         return max(10, min(200, math.floor(base)))
+
+def grid_type_hint(rng_pct, vol):
+    if rng_pct < 1.5 and vol < 1.2:
+        return "Arithmetic"
+    return "Geometric"
 # Part 4 of 7
 
 def money(p):
@@ -101,13 +106,15 @@ def score_signal(d):
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
+    mode = grid_type_hint((d["high"] - d["low"]) / d["now"] * 100, d["vol"])
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {d['cycle']} d\n"
-            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}")
+            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
+            f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
     return (f"🛑 Exit Alert: {sym}\n"
