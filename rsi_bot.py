@@ -2,6 +2,7 @@ import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
 
+# ── ENV + CONFIG ────────────────────────────────────
 TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
@@ -23,6 +24,8 @@ ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 last_trade_time = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ── TELEGRAM ────────────────────────────────────────
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -35,6 +38,7 @@ def tg(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
+# ── SYMBOL FETCHING ─────────────────────────────────
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
@@ -47,10 +51,13 @@ def fetch_symbols():
     pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
     return [p["symbol"] for p in pairs][:TOP_N]
 
-def fetch_closes(sym, interval="5M"):
-    r = requests.get(f"{API}/market/klines", 
-                     params={"symbol": sym, "interval": interval, "limit": 200, "type": "PERP"}, 
-                     timeout=10)
+# ── FETCH CLOSES WITH LIMIT ─────────────────────────
+def fetch_closes(sym, interval="5M", limit=400):
+    r = requests.get(
+        f"{API}/market/klines",
+        params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"},
+        timeout=10
+    )
     payload = r.json().get("data", {})
     kl = payload.get("klines") or payload
     closes = []
@@ -60,8 +67,8 @@ def fetch_closes(sym, interval="5M"):
         elif isinstance(k, (list, tuple)) and len(k) >= 5:
             closes.append(float(k[4]))
     return closes
-# Part 3 of 7
 
+# ── ANALYSIS FUNCTIONS ──────────────────────────────
 def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
@@ -89,7 +96,6 @@ def grid_type_hint(rng_pct, vol):
     if rng_pct < 1.5 and vol < 1.2:
         return "Arithmetic"
     return "Geometric"
-# Part 4 of 7
 
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
@@ -121,10 +127,10 @@ def stop_msg(sym, reason, info):
             f"📉 Reason: {reason}\n"
             f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
             f"💱 Current Price: {money(info['now'])}")
-# Part 5 of 7
 
-def analyse(sym, interval="5M"):
-    closes = fetch_closes(sym, interval)
+# ── UPDATED ANALYSE FUNCTION ────────────────────────
+def analyse(sym, interval="5M", limit=400):
+    closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
         return None
     low, high = min(closes), max(closes)
@@ -133,7 +139,7 @@ def analyse(sym, interval="5M"):
     if rng <= 0 or px == 0:
         return None
     pos = (px - low) / rng
-    if 0.25 <= pos <= 0.75:
+    if 0.35 <= pos <= 0.65:
         return None
     std = compute_std_dev(closes)
     vol = rng / px * 100
@@ -141,27 +147,41 @@ def analyse(sym, interval="5M"):
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
     grids = calculate_grids(rng, px, spacing, vol)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
-    if cycle > CYCLE_MAX:
+    if cycle > CYCLE_MAX or cycle <= 0:
         return None
-    return dict(symbol=sym, zone="Long" if pos < 0.25 else "Short",
-                low=low, high=high, now=px,
-                grids=grids, spacing=round(spacing, 2),
-                vol=round(vol, 1), std=round(std, 5), cycle=cycle)
+    # Adjust range to include current price
+    if px < low:
+        low = px
+    elif px > high:
+        high = px
+    return dict(
+        symbol=sym,
+        zone="Long" if pos < 0.35 else "Short",
+        low=low,
+        high=high,
+        now=px,
+        grids=grids,
+        spacing=round(spacing, 2),
+        vol=round(vol, 1),
+        std=round(std, 5),
+        cycle=cycle
+    )
 
+# ── SCAN WITH FALLBACK ──────────────────────────────
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    r60 = analyse(sym, interval="60M")
+    r60 = analyse(sym, interval="60M", limit=200)
     if not r60:
         return None
     if r60["vol"] >= vol_threshold:
-        r5 = analyse(sym, interval="5M")
+        r5 = analyse(sym, interval="5M", limit=400)
         if r5 and should_trigger(sym, r5["vol"], r5["std"]):
             return r5
         return None
     elif should_trigger(sym, r60["vol"], r60["std"]):
         return r60
     return None
-# Part 6 of 7
 
+# ── STATE MANAGEMENT ────────────────────────────────
 def load_state():
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
@@ -183,8 +203,8 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
            f"Consider reviewing or stopping the bot.")
         return True
     return False
-# Part 7 of 7
 
+# ── MAIN FUNCTION ───────────────────────────────────
 def main():
     prev = load_state()
     nxt, scored, stops = {}, [], []
