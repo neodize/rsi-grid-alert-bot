@@ -143,13 +143,12 @@ def analyse(sym, interval="5M", limit=400):
         return None
     std = compute_std_dev(closes)
     vol = rng / px * 100
-    vf = vol + std * 100
+    vf = max(0.1, vol + std * 100)  # Prevent zero division
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
     grids = calculate_grids(rng, px, spacing, vol)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     if cycle > CYCLE_MAX or cycle <= 0:
         return None
-    # Adjust range to include current price
     if px < low:
         low = px
     elif px > high:
