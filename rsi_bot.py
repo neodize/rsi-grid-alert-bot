@@ -130,10 +130,12 @@ def start_msg(d, rank=None):
             f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
+    closes = fetch_closes(sym, interval="5M", limit=1)  # Fetch latest close
+    now = closes[-1] if closes and closes else (info["low"] + info["high"]) / 2
     return (f"🛑 Exit Alert: {sym}\n"
             f"📉 Reason: {reason}\n"
             f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
-            f"💱 Current Price: {money(info['now'])}")
+            f"💱 Current Price: {money(now)}")
 
 # ── UPDATED ANALYSE FUNCTION ────────────────────────
 def analyse(sym, interval="5M", limit=400):
@@ -190,7 +192,15 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
 
 # ── STATE MANAGEMENT ────────────────────────────────
 def load_state():
-    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                content = f.read().strip()
+                return json.loads(content) if content else {}
+        except json.JSONDecodeError:
+            logging.warning("Invalid JSON in %s, returning empty state", STATE_FILE)
+            return {}
+    return {}
 
 def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
@@ -261,11 +271,13 @@ def main():
 
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
-        stops.append(stop_msg(gone, "No longer meets criteria", {
+        stop_message = stop_msg(gone, "No longer meets criteria", {
             "low": prev[gone]["low"],
             "high": prev[gone]["high"],
             "now": mid
-        }))
+        })
+        stops.append(stop_message)
+        tg(stop_message)  # Ensure immediate Telegram notification
 
     save_state(nxt)
 
