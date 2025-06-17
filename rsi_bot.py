@@ -68,6 +68,8 @@ def should_trigger(sym, vol_pct, std_dev):
         last_trade_time[sym] = now
         return True
     return False
+# Part 4 of 6
+
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
@@ -96,6 +98,8 @@ def stop_msg(sym, reason, info):
             f"Reason: {reason}\n"
             f"Range: {money(info['low'])} – {money(info['high'])}\n"
             f"Current Price: {money(info['now'])}")
+# Part 5 of 6
+
 def analyse(sym, interval="5M"):
     closes = fetch_closes(sym, interval)
     if len(closes) < 60:
@@ -138,6 +142,8 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
     elif should_trigger(sym, r60["vol"], r60["std"]):
         return r60
     return None
+# Part 6 of 6
+
 def load_state():
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
@@ -185,7 +191,7 @@ def main():
         if buf:
             tg(buf)
 
-       if stops:
+    if stops:
         buf = ""
         for m in stops:
             if len(buf) + len(m) > 3500:
@@ -195,4 +201,6 @@ def main():
                 buf += m + "\n\n"
         if buf:
             tg(buf)
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
