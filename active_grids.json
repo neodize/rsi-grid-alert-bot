@@ -1,5 +1,9 @@
-if __name__ == "__main__":
-    res = analyse("HYPEUSDTPERP")
-    if res:
-        print(start_msg(res))
-    main()
+{
+  "HYPEUSDTPERP": {
+    "zone": "Long",
+    "low": 40.16,
+    "high": 45.77,
+    "start_time": 1718638646,
+    "warned": false
+  }
+}
