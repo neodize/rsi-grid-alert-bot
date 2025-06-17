@@ -191,7 +191,7 @@ def main():
 # Part 7 of 7
 
     if scored:
-        scored.sort(reverse=True)
+        scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
         for i, (_, r) in enumerate(scored, 1):
             m = start_msg(r, i)
