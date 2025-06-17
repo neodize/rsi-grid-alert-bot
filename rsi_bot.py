@@ -19,7 +19,7 @@ VOL_THRESHOLD = 2.5
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
-ZONE_EMO = {"Long": "Long", "Short": "Short"}
+ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 last_trade_time = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -86,6 +86,11 @@ def calculate_grids(rng, px, spacing, vol):
         return max(10, min(200, math.floor(base)))
 # Part 4 of 7
 
+def grid_type_hint(rng_pct, vol):
+    if rng_pct < 1.5 and vol < 1.2:
+        return "Arithmetic"
+    return "Geometric"
+
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
@@ -101,19 +106,21 @@ def score_signal(d):
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
-    prefix = f"Top {rank}: {d['symbol']}" if rank else f"Start Grid Bot: {d['symbol']}"
+    mode = grid_type_hint((d['high'] - d['low']) / d['now'] * 100, d['vol'])
+    prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
-            f"Range: {money(d['low'])} – {money(d['high'])}\n"
-            f"Entry Zone: {ZONE_EMO[d['zone']]}\n"
-            f"Grids: {d['grids']} | Spacing: {d['spacing']}%\n"
-            f"Volatility: {d['vol']}% | Cycle: {d['cycle']} d\n"
-            f"Score: {score} | Leverage Hint: {lev}")
+            f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
+            f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
+            f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
+            f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {d['cycle']} d\n"
+            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
+            f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
-    return (f"Exit Alert: {sym}\n"
-            f"Reason: {reason}\n"
-            f"Range: {money(info['low'])} – {money(info['high'])}\n"
-            f"Current Price: {money(info['now'])}")
+    return (f"🛑 Exit Alert: {sym}\n"
+            f"📉 Reason: {reason}\n"
+            f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
+            f"💱 Current Price: {money(info['now'])}")
 # Part 5 of 7
 
 def analyse(sym, interval="5M"):
