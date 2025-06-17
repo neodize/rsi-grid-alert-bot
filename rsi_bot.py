@@ -12,8 +12,8 @@ STATE_FILE = Path("active_grids.json")
 SPACING_MIN = 0.3
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 2.0
-VOL_THRESHOLD = 2.5
+CYCLE_MAX = 5.0  # Relaxed for testing
+VOL_THRESHOLD = 0.5  # Lowered for testing
 STOP_BUFFER = 0.01  
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -40,22 +40,41 @@ def valid(sym):
     return (u.split("_")[0] not in {"WBTC", "WETH", "WSOL", "WBNB", "USDT", "USDC", "BUSD", "DAI", "LUNA", "LUNC", "USTC"} 
             and not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
 
-def fetch_symbols():
+def fetch_symbols(retries=3):
     """Retrieve the top perpetual trading pairs based on volume."""
-    r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
-    tickers = r.json().get("data", {}).get("tickers", [])
-    pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > 1_000_000]
-    pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
-    return [p["symbol"] for p in pairs][:100]
+    for attempt in range(retries):
+        try:
+            r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
+            r.raise_for_status()
+            tickers = r.json().get("data", {}).get("tickers", [])
+            pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > 1_000_000]
+            pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
+            symbols = [p["symbol"] for p in pairs][:100]
+            logging.info("Fetched %d valid symbols: %s", len(symbols), symbols)
+            return symbols
+        except Exception as e:
+            logging.warning("Failed to fetch symbols, attempt %d: %s", attempt + 1, e)
+            time.sleep(2)
+    logging.error("Failed to fetch symbols after %d retries", retries)
+    return []
 
 # ── FETCH CLOSES & STATISTICAL FUNCTIONS ───────────────
-def fetch_closes(sym, interval="5M", limit=400):
+def fetch_closes(sym, interval="5M", limit=400, retries=3):
     """Fetch historical closing prices for a given symbol."""
-    r = requests.get(f"{API}/market/klines", params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"}, timeout=10)
-    payload = r.json().get("data", {})
-    kl = payload.get("klines") or payload
-    closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl if isinstance(k, (list, tuple))]
-    return closes
+    for attempt in range(retries):
+        try:
+            r = requests.get(f"{API}/market/klines", params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"}, timeout=10)
+            r.raise_for_status()
+            payload = r.json().get("data", {})
+            kl = payload.get("klines") or payload
+            closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl if isinstance(k, (list, tuple))]
+            logging.info("Fetched %d closes for %s (%s)", len(closes), sym, interval)
+            return closes
+        except Exception as e:
+            logging.warning("API error for %s (%s), attempt %d: %s", sym, interval, attempt + 1, e)
+            time.sleep(2)
+    logging.error("Failed to fetch closes for %s after %d retries", sym, retries)
+    return []
 
 def compute_std_dev(closes, period=30):
     """Calculate standard deviation based on recent price movements."""
@@ -65,6 +84,7 @@ def fetch_bollinger(sym, interval="5M"):
     """Calculate Bollinger Bands for additional range validation."""
     closes = fetch_closes(sym, interval)
     if len(closes) < 60:
+        logging.warning("Insufficient Bollinger data for %s (%s): %d closes", sym, interval, len(closes))
         return None
     mid = np.mean(closes[-20:])
     std_dev = np.std(closes[-20:])
@@ -76,30 +96,30 @@ def fetch_bollinger(sym, interval="5M"):
 def determine_percentiles(leverage):
     """Adjust range width based on trading leverage."""
     if leverage <= 5:
-        return 5, 95  # Wider range for low leverage
+        return 5, 95
     elif leverage <= 10:
-        return 3, 97  # Balanced range for mid-leverage
+        return 3, 97
     else:
-        return 2, 98  # Tighter range for aggressive leverage
+        return 2, 98
 
 # ── PRICE RANGE CALCULATION ──────────────────────────
 def analyse(sym, interval="5M", limit=400, leverage=5):
     """Determine optimal price range for grid bot trading."""
     closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
+        logging.warning("Insufficient data for %s (%s): %d closes", sym, interval, len(closes))
         return None
 
-    # Adjust percentile range based on leverage level
     low_pct, high_pct = determine_percentiles(leverage)
     low = np.percentile(closes, low_pct)
     high = np.percentile(closes, high_pct)
 
-    px = closes[-1]  # Current price
+    px = closes[-1]
     rng = high - low
     if rng <= 0 or px == 0:
+        logging.warning("Invalid range for %s (%s): rng=%.2f, px=%.2f", sym, interval, rng, px)
         return None
 
-    # Ensure current price inclusion
     if px < low:
         low = px
     elif px > high:
@@ -108,28 +128,27 @@ def analyse(sym, interval="5M", limit=400, leverage=5):
 
     std = compute_std_dev(closes)
     vol = rng / px * 100
-    vf = max(0.1, vol + std * 100)  # Prevent division by zero
+    vf = max(0.1, vol + std * 100)
 
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / vf)))
     grids = max(10, min(200, math.floor(rng / (px * spacing / 100))))
     cycle = round((grids * spacing) / vf * 2, 1)
     if cycle > CYCLE_MAX or cycle <= 0:
+        logging.warning("Invalid cycle for %s (%s): cycle=%.2f", sym, interval, cycle)
         return None
 
     pos = (px - low) / rng
     zone = "Long" if pos < 0.5 else "Short"
 
-    # Validate with Bollinger Bands
     boll_result = fetch_bollinger(sym, interval)
     if boll_result:
         boll_lower, boll_upper = boll_result
         low = max(low, boll_lower)
         high = min(high, boll_upper)
-        rng = high - low  # Adjust range
+        rng = high - low
 
-    logging.info("Analyse %s: low=%.2f, high=%.2f, px=%.2f, pos=%.2f, vol=%.2f, std=%.5f, cycle=%.1f",
-                 sym, low, high, px, pos, vol, std, cycle)
-
+    logging.info("Analyse %s (%s): low=%.2f, high=%.2f, px=%.2f, pos=%.2f, vol=%.2f, std=%.5f, cycle=%.1f",
+                 sym, interval, low, high, px, pos, vol, std, cycle)
     return dict(
         symbol=sym,
         zone=zone,
@@ -167,11 +186,9 @@ def save_state(state):
 # ── SCORING AND MESSAGE FUNCTIONS ──────────────────────
 def score_signal(data):
     """Calculate a score for the trading signal."""
-    # Higher volatility and optimal cycle time get better scores
-    vol_score = min(data['vol'] / 10, 5)  # Cap at 5 points
-    cycle_score = 5 - abs(data['cycle'] - 1.0) * 2  # Optimal cycle around 1.0
-    grid_score = min(data['grids'] / 50, 3)  # More grids = better (up to 3 points)
-    
+    vol_score = min(data['vol'] / 10, 5)
+    cycle_score = 5 - abs(data['cycle'] - 1.0) * 2
+    grid_score = min(data['grids'] / 50, 3)
     return round(vol_score + cycle_score + grid_score, 2)
 
 def start_msg(data, rank):
@@ -198,11 +215,19 @@ def scan_with_fallback(sym):
     for interval in ["5M", "15M", "1H"]:
         try:
             result = analyse(sym, interval)
-            if result and result.get('vol', 0) > VOL_THRESHOLD:
-                return result
+            if result:
+                logging.info("Analysis for %s (%s): vol=%.2f, cycle=%.2f, grids=%d", sym, interval, result.get('vol', 0), result.get('cycle', 0), result.get('grids', 0))
+                if result.get('vol', 0) > VOL_THRESHOLD:
+                    logging.info("Symbol %s passed with vol=%.2f", sym, result['vol'])
+                    return result
+                else:
+                    logging.info("Symbol %s failed: vol=%.2f <= %.2f", sym, result['vol'], VOL_THRESHOLD)
+            else:
+                logging.warning("Analysis failed for %s (%s): result is None", sym, interval)
         except Exception as e:
-            logging.warning("Failed to analyze %s with %s interval: %s", sym, interval, e)
+            logging.warning("Exception analyzing %s (%s): %s", sym, interval, e)
             continue
+    logging.warning("No valid analysis for %s", sym)
     return None
 
 # ── CYCLE NOTIFICATION FUNCTION ───────────────────────
@@ -240,6 +265,7 @@ def execute_trade(sym, data):
 # ── MAIN FUNCTION ────────────────────────────────────
 def main():
     """Execute the main trading cycle and notify based on conditions."""
+    tg("Test: Bot started at 2025-06-17 09:57 PM +08")
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
@@ -253,8 +279,10 @@ def main():
 
     for sym in symbols:
         try:
+            logging.info("Processing symbol: %s", sym)
             res = scan_with_fallback(sym)
             if not res:
+                logging.info("No valid result for %s", sym)
                 continue
 
             prev_state = prev.get(sym, {})
@@ -276,6 +304,8 @@ def main():
                 scored.append((score_signal(res), res))
             else:
                 p = prev[sym]
+                logging.info("Comparing %s: prev_zone=%s, new_zone=%s, prev_low=%.2f, prev_high=%.2f, now=%.2f",
+                             sym, p["zone"], res["zone"], p["low"], p["high"], res["now"])
                 if p["zone"] != res["zone"]:
                     stops.append(stop_msg(sym, "Trend flip", res))
                 elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
@@ -285,7 +315,6 @@ def main():
             logging.error("Error processing symbol %s: %s", sym, e)
             continue
 
-    # Handle symbols that no longer meet criteria
     for gone in set(prev) - set(nxt):
         try:
             mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
@@ -295,13 +324,12 @@ def main():
                 "now": mid
             })
             stops.append(stop_message)
-            tg(stop_message)  # Immediate Telegram alert
+            tg(stop_message)
         except Exception as e:
             logging.error("Error handling removed symbol %s: %s", gone, e)
 
     save_state(nxt)
 
-    # Send new opportunities
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
@@ -315,7 +343,6 @@ def main():
         if buf:
             tg(buf)
 
-    # Send stop notifications
     if stops:
         buf = ""
         for m in stops:
