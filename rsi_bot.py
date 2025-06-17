@@ -12,10 +12,10 @@ MIN_NOTIONAL_USD = 1_000_000
 SPACING_MIN = 0.3
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 5.0  # Relaxed for testing
+CYCLE_MAX = 5.0
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-VOL_THRESHOLD = 0.5  # Lowered for testing
+VOL_THRESHOLD = 0.5
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
@@ -62,32 +62,35 @@ def fetch_symbols(retries=3):
             logging.warning("Failed to fetch symbols, attempt %d: %s", attempt + 1, e)
             time.sleep(2)
     logging.error("Failed to fetch symbols after %d retries", retries)
-    return []
+    return ["BTC_USDT_PERP", "ETH_USDT_PERP"]  # Fallback
 
 # ── FETCH CLOSES WITH LIMIT ─────────────────────────
 def fetch_closes(sym, interval="5M", limit=400, retries=3):
-    for attempt in range(retries):
-        try:
-            r = requests.get(
-                f"{API}/market/klines",
-                params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"},
-                timeout=10
-            )
-            r.raise_for_status()
-            payload = r.json().get("data", {})
-            logging.info("Raw API response for %s (%s): %s", sym, interval, r.json())
-            kl = payload.get("klines") or payload
-            closes = []
-            for k in kl:
-                if isinstance(k, dict) and "close" in k:
-                    closes.append(float(k["close"]))
-                elif isinstance(k, (list, tuple)) and len(k) >= 5:
-                    closes.append(float(k[4]))
-            logging.info("Fetched %d closes for %s (%s)", len(closes), sym, interval)
-            return closes
-        except Exception as e:
-            logging.warning("API error for %s (%s), attempt %d: %s", sym, interval, attempt + 1, e)
-            time.sleep(2)
+    # Try both symbol formats
+    sym_alt = sym.replace("USDT_PERP", "_USDT_PERP")
+    for s in [sym, sym_alt]:
+        for attempt in range(retries):
+            try:
+                r = requests.get(
+                    f"{API}/market/klines",
+                    params={"symbol": s, "interval": interval, "limit": limit},
+                    timeout=10
+                )
+                r.raise_for_status()
+                payload = r.json().get("data", {})
+                logging.info("Raw API response for %s (%s): %s", s, interval, r.json())
+                kl = payload.get("klines") or payload
+                closes = []
+                for k in kl:
+                    if isinstance(k, dict) and "close" in k:
+                        closes.append(float(k["close"]))
+                    elif isinstance(k, (list, tuple)) and len(k) >= 5:
+                        closes.append(float(k[4]))
+                logging.info("Fetched %d closes for %s (%s)", len(closes), s, interval)
+                return closes
+            except Exception as e:
+                logging.warning("API error for %s (%s), attempt %d: %s", s, interval, attempt + 1, e)
+                time.sleep(2)
     logging.error("Failed to fetch closes for %s after %d retries", sym, retries)
     return []
 
@@ -168,7 +171,6 @@ def analyse(sym, interval="5M", limit=400):
         logging.warning("Insufficient data for %s (%s): %d closes", sym, interval, len(closes))
         return None
 
-    # Bollinger Bands for price range (mimics Pionex AI)
     mid = np.mean(closes[-20:])
     std = np.std(closes[-20:])
     low = mid - 2 * std
@@ -277,14 +279,13 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
 
 # ── MAIN FUNCTION ───────────────────────────────────
 def main():
-    tg("Test: Bot started at 2025-06-17 10:07 PM +08")
+    tg("Test: Bot started at 2025-06-17 10:10 PM +08")
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
 
-    # Hardcode symbols for testing
-    symbols = ["BTCUSDT_PERP", "ETHUSDT_PERP"]
-    logging.info("Testing with symbols: %s", symbols)
+    symbols = fetch_symbols()
+    logging.info("Analyzing %d symbols: %s", len(symbols), symbols)
 
     for sym in symbols:
         res = scan_with_fallback(sym)
