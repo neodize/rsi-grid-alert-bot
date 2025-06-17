@@ -120,8 +120,9 @@ def analyse(sym, interval="5M", limit=400, leverage=5):
     zone = "Long" if pos < 0.5 else "Short"
 
     # Validate with Bollinger Bands
-    boll_lower, boll_upper = fetch_bollinger(sym, interval)
-    if boll_lower and boll_upper:
+    boll_result = fetch_bollinger(sym, interval)
+    if boll_result:
+        boll_lower, boll_upper = boll_result
         low = max(low, boll_lower)
         high = min(high, boll_upper)
         rng = high - low  # Adjust range
@@ -141,6 +142,68 @@ def analyse(sym, interval="5M", limit=400, leverage=5):
         std=round(std, 5),
         cycle=cycle
     )
+
+# ── STATE MANAGEMENT FUNCTIONS ──────────────────────
+def load_state():
+    """Load the current state from the JSON file."""
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logging.error("Error loading state file: %s", e)
+            return {}
+    return {}
+
+def save_state(state):
+    """Save the current state to the JSON file."""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+        logging.info("State saved successfully")
+    except IOError as e:
+        logging.error("Error saving state file: %s", e)
+
+# ── SCORING AND MESSAGE FUNCTIONS ──────────────────────
+def score_signal(data):
+    """Calculate a score for the trading signal."""
+    # Higher volatility and optimal cycle time get better scores
+    vol_score = min(data['vol'] / 10, 5)  # Cap at 5 points
+    cycle_score = 5 - abs(data['cycle'] - 1.0) * 2  # Optimal cycle around 1.0
+    grid_score = min(data['grids'] / 50, 3)  # More grids = better (up to 3 points)
+    
+    return round(vol_score + cycle_score + grid_score, 2)
+
+def start_msg(data, rank):
+    """Generate a start message for a new trading opportunity."""
+    return (f"🚀 #{rank} NEW OPPORTUNITY: {data['symbol']}\n"
+            f"🎯 Zone: {data['zone']}\n"
+            f"📊 Range: {data['low']:.4f} - {data['high']:.4f}\n"
+            f"💰 Current: {data['now']:.4f}\n"
+            f"🔢 Grids: {data['grids']}\n"
+            f"📏 Spacing: {data['spacing']}%\n"
+            f"📈 Volatility: {data['vol']}%\n"
+            f"⏰ Cycle: {data['cycle']} days\n"
+            f"⭐ Score: {score_signal(data)}")
+
+def stop_msg(symbol, reason, data):
+    """Generate a stop message for ending a trade."""
+    return (f"🛑 STOP: {symbol}\n"
+            f"❌ Reason: {reason}\n"
+            f"📊 Range was: {data['low']:.4f} - {data['high']:.4f}\n"
+            f"💰 Current: {data['now']:.4f}")
+
+def scan_with_fallback(sym):
+    """Scan a symbol with fallback intervals if the primary fails."""
+    for interval in ["5M", "15M", "1H"]:
+        try:
+            result = analyse(sym, interval)
+            if result and result.get('vol', 0) > VOL_THRESHOLD:
+                return result
+        except Exception as e:
+            logging.warning("Failed to analyze %s with %s interval: %s", sym, interval, e)
+            continue
+    return None
 
 # ── CYCLE NOTIFICATION FUNCTION ───────────────────────
 def check_cycle_notification(start_time, cycle, sym, warned=False):
@@ -181,47 +244,64 @@ def main():
     nxt, scored, stops = {}, [], []
     current_time = time.time()
 
-    for sym in fetch_symbols():
-        res = scan_with_fallback(sym)
-        if not res:
+    try:
+        symbols = fetch_symbols()
+        logging.info("Fetched %d symbols to analyze", len(symbols))
+    except Exception as e:
+        logging.error("Failed to fetch symbols: %s", e)
+        return
+
+    for sym in symbols:
+        try:
+            res = scan_with_fallback(sym)
+            if not res:
+                continue
+
+            prev_state = prev.get(sym, {})
+            warned = prev_state.get("warned", False)
+            start_time = prev_state.get("start_time", current_time)
+
+            if check_cycle_notification(start_time, res["cycle"], sym, warned):
+                warned = True
+
+            nxt[sym] = {
+                "zone": res["zone"],
+                "low": res["low"],
+                "high": res["high"],
+                "start_time": start_time,
+                "warned": warned
+            }
+
+            if sym not in prev:
+                scored.append((score_signal(res), res))
+            else:
+                p = prev[sym]
+                if p["zone"] != res["zone"]:
+                    stops.append(stop_msg(sym, "Trend flip", res))
+                elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
+                    stops.append(stop_msg(sym, "Price exited range", res))
+
+        except Exception as e:
+            logging.error("Error processing symbol %s: %s", sym, e)
             continue
 
-        prev_state = prev.get(sym, {})
-        warned = prev_state.get("warned", False)
-        start_time = prev_state.get("start_time", current_time)
-
-        if check_cycle_notification(start_time, res["cycle"], sym, warned):
-            warned = True
-
-        nxt[sym] = {
-            "zone": res["zone"],
-            "low": res["low"],
-            "high": res["high"],
-            "start_time": start_time,
-            "warned": warned
-        }
-
-        if sym not in prev:
-            scored.append((score_signal(res), res))
-        else:
-            p = prev[sym]
-            if p["zone"] != res["zone"]:
-                stops.append(stop_msg(sym, "Trend flip", res))
-            elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
-                stops.append(stop_msg(sym, "Price exited range", res))
-
+    # Handle symbols that no longer meet criteria
     for gone in set(prev) - set(nxt):
-        mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
-        stop_message = stop_msg(gone, "No longer meets criteria", {
-            "low": prev[gone]["low"],
-            "high": prev[gone]["high"],
-            "now": mid
-        })
-        stops.append(stop_message)
-        tg(stop_message)  # Immediate Telegram alert
+        try:
+            mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
+            stop_message = stop_msg(gone, "No longer meets criteria", {
+                "low": prev[gone]["low"],
+                "high": prev[gone]["high"],
+                "now": mid
+            })
+            stops.append(stop_message)
+            tg(stop_message)  # Immediate Telegram alert
+        except Exception as e:
+            logging.error("Error handling removed symbol %s: %s", gone, e)
 
     save_state(nxt)
 
+    # Send new opportunities
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
@@ -235,6 +315,7 @@ def main():
         if buf:
             tg(buf)
 
+    # Send stop notifications
     if stops:
         buf = ""
         for m in stops:
@@ -245,6 +326,8 @@ def main():
                 buf += m + "\n\n"
         if buf:
             tg(buf)
+
+    logging.info("Analysis complete. New opportunities: %d, Stops: %d", len(scored), len(stops))
 
 if __name__ == "__main__":
     main()
