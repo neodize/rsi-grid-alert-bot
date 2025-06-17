@@ -3,17 +3,16 @@ import time, math, requests, json
 from pathlib import Path
 import numpy as np
 
-# CONFIG
+# --- CONFIGURATION ---
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TOP_N = 100
 TOP_PICKS = 5
 VOL_THRESHOLD = 2.5
-STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
 ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 
-# TELEGRAM
+# --- TELEGRAM ALERT ---
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -22,11 +21,11 @@ def tg(msg):
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
             timeout=10,
-        )
-    except Exception:
-        pass
+        ).raise_for_status()
+    except Exception as e:
+        print("Telegram error:", e)
 
-# SYMBOLS & CANDLES
+# --- API CALLS ---
 def fetch_symbols():
     r = requests.get("https://api.pionex.com/api/v1/market/tickers", params={"type": "PERP"}, timeout=10)
     d = r.json().get("data", {}).get("tickers", [])
@@ -40,7 +39,7 @@ def fetch_closes(sym, interval="60M"):
     k = r.json().get("data", {}).get("klines", [])
     return [float(x[4]) for x in k if isinstance(x, list) and len(x) >= 5]
 
-# SCAN & ANALYSIS
+# --- METRICS & LOGIC ---
 def compute_std_dev(closes, period=30):
     return round(float(np.std(closes[-period:])), 5) if len(closes) >= period else 0
 
@@ -96,7 +95,7 @@ def scan_with_fallback(sym):
         return res_60m
     return None
 
-# SCORING & RANKING
+# --- SCORING ---
 def score_opportunity(d):
     v = d["vol"]
     c = max(0.1, d["cycle"])
@@ -121,7 +120,7 @@ def format_ranked_signal(d, rank):
         f"⚙️ Leverage Hint: {leverage_hint(d['spacing'])}"
     )
 
-# STATE
+# --- STATE & ALERTS ---
 def load_state():
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
@@ -137,7 +136,7 @@ def stop_msg(sym, reason, info):
         f"💱 Current Price: {fmt(info['now'])}"
     )
 
-# MAIN
+# --- MAIN EXECUTION ---
 def main():
     prev = load_state()
     nxt, candidates, stop_alerts = {}, [], []
@@ -177,4 +176,6 @@ def main():
             tg(buf)
 
 if __name__ == "__main__":
+    print("🔁 Starting hybrid grid scanner...")
     main()
+    print("✅ Scanner finished.")
