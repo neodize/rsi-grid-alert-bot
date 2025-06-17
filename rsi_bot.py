@@ -1,67 +1,73 @@
-import os
-import time, math, requests, json
+import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
 
-# --- CONFIGURATION ---
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TOP_N = 100
-TOP_PICKS = 5       # Adjust this to change how many top signals are sent
-VOL_THRESHOLD = 2.5
-STATE_FILE = Path("active_grids.json")
-ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
+# ── TELEGRAM CONFIG ──────────────────────────────
+TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
-# --- TELEGRAM ALERT ---
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("Telegram credentials not set.")
         return
     try:
-        response = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-        response.raise_for_status()
+            timeout=10
+        ).raise_for_status()
     except Exception as e:
-        print("Telegram error:", e)
+        logging.error("Telegram error: %s", e)
 
-# --- API CALLS ---
-def fetch_symbols():
-    try:
-        r = requests.get("https://api.pionex.com/api/v1/market/tickers", params={"type": "PERP"}, timeout=10)
-        data = r.json()
-        tickers = data.get("data", {}).get("tickers", [])
-        symbols = sorted([s["symbol"] for s in tickers if "USDT" in s["symbol"]], reverse=True)[:TOP_N]
-        return symbols
-    except Exception as e:
-        print("Error fetching symbols:", e)
-        return []
-
-def fetch_closes(sym, interval="60M"):
-    try:
-        r = requests.get("https://api.pionex.com/api/v1/market/klines",
-            params={"symbol": sym, "interval": interval, "limit": 200, "type": "PERP"},
-            timeout=10,
-        )
-        data = r.json()
-        klines = data.get("data", {}).get("klines", [])
-        return [float(x[4]) for x in klines if isinstance(x, list) and len(x) >= 5]
-    except Exception as e:
-        print(f"Error fetching klines for {sym}:", e)
-        return []
-
-# --- METRICS & ANALYSIS FUNCTIONS ---
-def compute_std_dev(closes, period=30):
-    if len(closes) < period:
-        return 0
-    return round(float(np.std(closes[-period:])), 5)
+# ── PARAMETERS ────────────────────────────────────
+API = "https://api.pionex.com/api/v1"
+TOP_N = 100
+MIN_NOTIONAL_USD = 1_000_000
+SPACING_MIN = 0.3
+SPACING_MAX = 1.2
+SPACING_TARGET = 0.75
+CYCLE_MAX = 2.0
+STOP_BUFFER = 0.01
+STATE_FILE = Path("active_grids.json")
+WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
+STABLE = {"USDT", "USDC", "BUSD", "DAI"}
+EXCL = {"LUNA", "LUNC", "USTC"}
+VOL_THRESHOLD = 2.5  # If the 60M analysis shows vol ≥ 2.5, perform a 5M rescan.
 
 last_trade_time = {}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ── HELPER FUNCTIONS ───────────────────────────────
+def valid(sym):
+    u = sym.upper()
+    return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and
+            not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
+
+def fetch_symbols():
+    r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
+    tickers = r.json().get("data", {}).get("tickers", [])
+    pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
+    pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
+    return [p["symbol"] for p in pairs][:TOP_N]
+
+def fetch_closes(sym, interval="5M"):
+    r = requests.get(f"{API}/market/klines",
+                     params={"symbol": sym, "interval": interval, "limit": 200, "type": "PERP"},
+                     timeout=10)
+    payload = r.json().get("data", {})
+    kl = payload.get("klines") or payload
+    closes = []
+    for k in kl:
+        if isinstance(k, dict) and "close" in k:
+            closes.append(float(k["close"]))
+        elif isinstance(k, (list, tuple)) and len(k) >= 5:
+            closes.append(float(k[4]))
+    return closes
+
+def compute_std_dev(closes, period=30):
+    return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
 def compute_cooldown(vol_pct, std_dev):
-    base = 300  # seconds
+    base = 300  # 5 minutes in seconds
     extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
     return base + extra
 
@@ -73,158 +79,118 @@ def should_trigger(sym, vol_pct, std_dev):
         return True
     return False
 
-def analyse(sym, interval="60M"):
-    closes = fetch_closes(sym, interval)
-    if len(closes) < 60:
-        return None
-    low, high = min(closes), max(closes)
-    current = closes[-1]
-    rng = high - low
-    if rng <= 0 or current == 0:
-        return None
-    pos = (current - low) / rng
-    # Only trigger if price is near the edges (outside 25%-75% of range)
-    if 0.25 <= pos <= 0.75:
-        return None
-    std_dev = compute_std_dev(closes)
-    vol_pct = rng / current * 100
-    v_factor = vol_pct + std_dev * 100
-    spacing = max(0.3, min(1.2, 0.75 * (30 / max(v_factor, 1))))
-    grids = max(10, min(200, math.floor(rng / (current * spacing / 100))))
-    cycle = round((grids * spacing) / (v_factor + 1e-9) * 2, 1)
-    if cycle > 2.0:
-        return None
-    return {
-        "symbol": sym,
-        "zone": "Long" if pos < 0.25 else "Short",
-        "low": low,
-        "high": high,
-        "now": current,
-        "grids": grids,
-        "spacing": round(spacing, 2),
-        "vol": round(vol_pct, 1),
-        "std": std_dev,
-        "cycle": cycle
-    }
+def money(p):
+    return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
-def scan_with_fallback(sym):
-    res_60m = analyse(sym, "60M")
-    if not res_60m:
-        return None
-    if res_60m["vol"] >= VOL_THRESHOLD:
-        res_5m = analyse(sym, "5M")
-        if res_5m and should_trigger(sym, res_5m["vol"], res_5m["std"]):
-            return res_5m
-    elif should_trigger(sym, res_60m["vol"], res_60m["std"]):
-        return res_60m
-    return None
+ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 
-# --- SCORING & MESSAGING ---
-def score_opportunity(d):
-    v = d["vol"]
-    c = max(0.1, d["cycle"])
-    s = d["spacing"]
-    g = min(200, d["grids"])
-    return round((v * 2) + (((200 - g) / 200) * 10) + ((1.5 - min(s, 1.5)) * 15) + ((1.5 / c) * 10), 1)
+def start_msg(d):
+    lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
+    return (f"📈 Start Grid Bot: {d['symbol']}\n"
+            f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
+            f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
+            f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
+            f"🌪️ Volatility: {d['vol']}%  |  ⏱️ Cycle: {d['cycle']} d\n"
+            f"⚙️ Leverage Hint: {lev}")
 
-def leverage_hint(spacing):
-    if spacing <= 0.5:
-        return "20x–50x"
-    elif spacing <= 0.75:
-        return "10x–25x"
-    else:
-        return "5x–15x"
+def stop_msg(sym, reason, info):
+    return (f"🛑 Exit Alert: {sym}\n"
+            f"📉 Reason: {reason}\n"
+            f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
+            f"💱 Current Price: {money(info['now'])}")
 
-def format_ranked_signal(d, rank):
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    tag = medals[rank-1] if rank <= 5 else f"{rank}️⃣"
-    return (
-        f"{tag} {d['symbol']}\n"
-        f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
-        f"🌪️ Volatility: {d['vol']}%\n"
-        f"📏 Spacing: {d['spacing']}%\n"
-        f"🧮 Grids: {d['grids']}\n"
-        f"⏱️ Cycle: {d['cycle']} d\n"
-        f"🌀 Score: {d['score']}\n"
-        f"⚙️ Leverage Hint: {leverage_hint(d['spacing'])}"
-    )
-
-# --- STATE & ALERTS ---
 def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    else:
-        return {}
+    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
 def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
 
-def stop_msg(sym, reason, info):
-    def fmt(p):
-        if p < 0.1:
-            return f"${p:.8f}"
-        elif p < 1:
-            return f"${p:,.4f}"
-        else:
-            return f"${p:,.2f}"
-    return (
-        f"🛑 Exit Alert: {sym}\n"
-        f"📉 Reason: {reason}\n"
-        f"📊 Range: {fmt(info['low'])} – {fmt(info['high'])}\n"
-        f"💱 Current Price: {fmt(info['now'])}"
-    )
+def analyse(sym, interval="5M"):
+    closes = fetch_closes(sym, interval)
+    if len(closes) < 60:
+        return None
+    low, high = min(closes), max(closes)
+    px = closes[-1]
+    rng = high - low
+    if rng <= 0 or px == 0:
+        return None
+    pos = (px - low) / rng
+    if 0.25 <= pos <= 0.75:
+        return None
 
-# --- MAIN EXECUTION ---
+    std_dev = compute_std_dev(closes)
+    vol_pct = rng / px * 100
+    v_factor = vol_pct + std_dev * 100
+    spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(v_factor, 1))))
+    grids = max(10, min(200, math.floor(rng / (px * spacing / 100))))
+    cycle = round((grids * spacing) / (v_factor + 1e-9) * 2, 1)
+    if cycle > CYCLE_MAX:
+        return None
+
+    return dict(symbol=sym, zone="Long" if pos < 0.25 else "Short",
+                low=low, high=high, now=px,
+                grids=grids, spacing=round(spacing, 2),
+                vol=round(vol_pct, 1), std=round(std_dev, 5), cycle=cycle)
+
+# ── HYBRID SCANNING ───────────────────────────────
+def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
+    # Broad/efficient scan with 60M interval
+    res_60m = analyse(sym, interval="60M")
+    if not res_60m:
+        return None
+
+    # If volatility is high, refine the data by scanning using 5M interval
+    if res_60m['vol'] >= vol_threshold:
+        res_5m = analyse(sym, interval="5M")
+        if res_5m and should_trigger(sym, res_5m["vol"], res_5m["std"]):
+            return res_5m
+        else:
+            return None
+    else:
+        # Use the 60M result if it passes cooldown
+        if should_trigger(sym, res_60m["vol"], res_60m["std"]):
+            return res_60m
+        else:
+            return None
+
+# ── MAIN ───────────────────────────────────────────
 def main():
     prev = load_state()
-    nxt = {}
-    candidates = []
-    stop_alerts = []
+    nxt, start_alerts, stop_alerts = {}, [], []
 
-    symbols = fetch_symbols()
-    print(f"Found {len(symbols)} symbols.")
-    for sym in symbols:
+    for sym in fetch_symbols():
         res = scan_with_fallback(sym)
-        if res:
-            res["score"] = score_opportunity(res)
-            nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
-            candidates.append(res)
-    
-    print(f"Found {len(candidates)} potential candidates.")
-    # Sort candidates descending by score
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    top_signals = candidates[:TOP_PICKS]
+        if not res:
+            continue
+        nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
+        if sym not in prev:
+            start_alerts.append(start_msg(res))
+        else:
+            p = prev[sym]
+            if p["zone"] != res["zone"]:
+                stop_alerts.append(stop_msg(sym, "Trend flip", res))
+            elif res["now"] > p["high"] * (1 + STOP_BUFFER) or res["now"] < p["low"] * (1 - STOP_BUFFER):
+                stop_alerts.append(stop_msg(sym, "Price exited range", res))
 
-    if top_signals:
-        msg = f"📊 Grid Signal Scoreboard (Top {TOP_PICKS})\n\n"
-        for i, d in enumerate(top_signals, start=1):
-            msg += format_ranked_signal(d, i) + "\n\n"
-        tg(msg.strip())
-        print("Telegram message sent for top signals.")
-    else:
-        # Send a fallback message so you know the scan did run
-        tg("No grid opportunities met criteria.")
-        print("No candidate signals found; sent fallback telegram message.")
-
-    # Check for grids that no longer meet criteria.
-    for sym in set(prev.keys()) - set(nxt.keys()):
-        mid = (prev[sym]["low"] + prev[sym]["high"]) / 2
-        stop_alerts.append(stop_msg(sym, "No longer meets criteria", {"low": prev[sym]["low"], "high": prev[sym]["high"], "now": mid}))
+    for gone in set(prev) - set(nxt):
+        mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
+        stop_alerts.append(stop_msg(gone, "No longer meets criteria",
+                                     {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
     save_state(nxt)
 
-    if stop_alerts:
+    # Send alerts in batches
+    for alerts in (start_alerts, stop_alerts):
+        if not alerts:
+            continue
         buf = ""
-        for m in stop_alerts:
-            if len(buf) + len(m) + 2 > 4000:
+        for msg in alerts:
+            if len(buf) + len(msg) + 2 > 4000:
                 tg(buf)
-                buf = m + "\n\n"
+                buf = msg + "\n\n"
             else:
-                buf += m + "\n\n"
+                buf += msg + "\n\n"
         if buf:
             tg(buf)
-        print("Sent exit alerts for removed signals.")
 
 if __name__ == "__main__":
-    print("🔁 Starting hybrid grid scanner...")
     main()
-    print("✅ Scanner finished.")
