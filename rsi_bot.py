@@ -2,6 +2,7 @@ import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
 
+# ── ENV + CONFIG ────────────────────────────────────
 TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
@@ -23,6 +24,7 @@ ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 last_trade_time = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ── TELEGRAM ────────────────────────────────────────
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -35,6 +37,7 @@ def tg(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
+# ── SYMBOL FETCHING ─────────────────────────────────
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
@@ -46,6 +49,7 @@ def fetch_symbols():
     pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
     pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
     return [p["symbol"] for p in pairs][:TOP_N]
+# Part 3 of 7
 
 def fetch_closes(sym, interval="5M"):
     r = requests.get(f"{API}/market/klines", 
@@ -60,7 +64,6 @@ def fetch_closes(sym, interval="5M"):
         elif isinstance(k, (list, tuple)) and len(k) >= 5:
             closes.append(float(k[4]))
     return closes
-# Part 3 of 6
 
 def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
@@ -77,6 +80,14 @@ def should_trigger(sym, vol_pct, std_dev):
         last_trade_time[sym] = now
         return True
     return False
+# Part 4 of 7
+
+def calculate_grids(rng, px, spacing, vol):
+    base = rng / (px * spacing / 100)
+    if vol < 1.5:
+        return max(4, min(200, math.floor(base / 2)))
+    else:
+        return max(10, min(200, math.floor(base)))
 
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
@@ -89,7 +100,6 @@ def score_signal(d):
         (1.5 / max(d["cycle"], 0.1)) * 10,
         1
     )
-# Part 4 of 6
 
 def start_msg(d, rank=None):
     score = score_signal(d)
@@ -101,6 +111,7 @@ def start_msg(d, rank=None):
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {d['cycle']} d\n"
             f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}")
+# Part 5 of 7
 
 def stop_msg(sym, reason, info):
     return (f"🛑 Exit Alert: {sym}\n"
@@ -124,7 +135,7 @@ def analyse(sym, interval="5M"):
     vol = rng / px * 100
     vf = vol + std * 100
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
-    grids = max(10, min(200, math.floor(rng / (px * spacing / 100))))
+    grids = calculate_grids(rng, px, spacing, vol)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     if cycle > CYCLE_MAX:
         return None
@@ -132,7 +143,6 @@ def analyse(sym, interval="5M"):
                 low=low, high=high, now=px,
                 grids=grids, spacing=round(spacing, 2),
                 vol=round(vol, 1), std=round(std, 5), cycle=cycle)
-# Part 5 of 6
 
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
     r60 = analyse(sym, interval="60M")
@@ -146,13 +156,13 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
     elif should_trigger(sym, r60["vol"], r60["std"]):
         return r60
     return None
+# Part 6 of 7
 
 def load_state():
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
 def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
-# Part 6 of 6
 
 def main():
     prev = load_state()
@@ -181,6 +191,7 @@ def main():
         }))
 
     save_state(nxt)
+# Part 7 of 7
 
     if scored:
         scored.sort(reverse=True)
