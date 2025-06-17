@@ -1,20 +1,19 @@
+import os
 import time, math, requests, json
 from pathlib import Path
 import numpy as np
 
-# --- CONFIGURATION ---
+# CONFIG
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TOP_N = 100
-TOP_PICKS = 5  # Adjust this to send more or fewer ranked signals
+TOP_PICKS = 5
 VOL_THRESHOLD = 2.5
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-
-# --- ZONE SYMBOLS ---
 ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 
-# --- TELEGRAM ALERT ---
+# TELEGRAM
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -27,7 +26,7 @@ def tg(msg):
     except Exception:
         pass
 
-# --- API CALLS ---
+# SYMBOLS & CANDLES
 def fetch_symbols():
     r = requests.get("https://api.pionex.com/api/v1/market/tickers", params={"type": "PERP"}, timeout=10)
     d = r.json().get("data", {}).get("tickers", [])
@@ -39,19 +38,18 @@ def fetch_closes(sym, interval="60M"):
         timeout=10,
     )
     k = r.json().get("data", {}).get("klines", [])
-    closes = [float(x[4]) for x in k if isinstance(x, list) and len(x) >= 5]
-    return closes
+    return [float(x[4]) for x in k if isinstance(x, list) and len(x) >= 5]
 
-# --- METRICS & ANALYSIS ---
+# SCAN & ANALYSIS
 def compute_std_dev(closes, period=30):
     return round(float(np.std(closes[-period:])), 5) if len(closes) >= period else 0
+
+last_trade_time = {}
 
 def compute_cooldown(vol_pct, std_dev):
     base = 300
     extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
     return base + extra
-
-last_trade_time = {}
 
 def should_trigger(sym, vol_pct, std_dev):
     now = time.time()
@@ -98,7 +96,7 @@ def scan_with_fallback(sym):
         return res_60m
     return None
 
-# --- SCORING ---
+# SCORING & RANKING
 def score_opportunity(d):
     v = d["vol"]
     c = max(0.1, d["cycle"])
@@ -123,7 +121,7 @@ def format_ranked_signal(d, rank):
         f"⚙️ Leverage Hint: {leverage_hint(d['spacing'])}"
     )
 
-# --- STATE & ALERTS ---
+# STATE
 def load_state():
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
@@ -131,8 +129,7 @@ def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
 
 def stop_msg(sym, reason, info):
-    def fmt(p):
-        return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
+    def fmt(p): return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
     return (
         f"🛑 Exit Alert: {sym}\n"
         f"📉 Reason: {reason}\n"
@@ -140,7 +137,7 @@ def stop_msg(sym, reason, info):
         f"💱 Current Price: {fmt(info['now'])}"
     )
 
-# --- MAIN LOOP ---
+# MAIN
 def main():
     prev = load_state()
     nxt, candidates, stop_alerts = {}, [], []
@@ -153,23 +150,21 @@ def main():
         nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
         candidates.append(res)
 
-    # Sort and send top picks only
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top_signals = candidates[:TOP_PICKS]
+
     if top_signals:
         msg = f"📊 Grid Signal Scoreboard (Top {TOP_PICKS})\n\n"
         for i, d in enumerate(top_signals, 1):
             msg += format_ranked_signal(d, i) + "\n\n"
         tg(msg.strip())
 
-    # Check for removed signals
     for gone in set(prev) - set(nxt):
         mid = (prev[gone]["low"] + prev[gone]["high"]) / 2
         stop_alerts.append(stop_msg(gone, "No longer meets criteria",
-                                   {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
+            {"low": prev[gone]["low"], "high": prev[gone]["high"], "now": mid}))
     save_state(nxt)
 
-    # Send stop alerts (if any)
     if stop_alerts:
         buf = ""
         for m in stop_alerts:
