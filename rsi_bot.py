@@ -13,10 +13,11 @@ SPACING_MIN = 0.3
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
 CYCLE_MAX = 2.0
-
-STOP_BUFFER = 0.01  # Prevent premature stop conditions
+VOL_THRESHOLD = 2.5
+STOP_BUFFER = 0.01  
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 # ── TELEGRAM ─────────────────────────────────────────
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -46,7 +47,8 @@ def fetch_symbols():
     pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > 1_000_000]
     pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
     return [p["symbol"] for p in pairs][:100]
-# ── FETCH CLOSES WITH LIMIT ───────────────────────────
+
+# ── FETCH CLOSES & STATISTICAL FUNCTIONS ───────────────
 def fetch_closes(sym, interval="5M", limit=400):
     """Fetch historical closing prices for a given symbol."""
     r = requests.get(f"{API}/market/klines", params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"}, timeout=10)
@@ -55,26 +57,10 @@ def fetch_closes(sym, interval="5M", limit=400):
     closes = [float(k["close"]) if isinstance(k, dict) else float(k[4]) for k in kl if isinstance(k, (list, tuple))]
     return closes
 
-# ── ANALYSIS FUNCTIONS ─────────────────────────────────
 def compute_std_dev(closes, period=30):
     """Calculate standard deviation based on recent price movements."""
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
-def compute_cooldown(vol_pct, std_dev):
-    """Determine cooldown time based on volatility and deviation."""
-    base = 300
-    extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
-    return base + extra
-
-def should_trigger(sym, vol_pct, std_dev):
-    """Check if a trade signal should be triggered based on cooldown logic."""
-    now = time.time()
-    cooldown = compute_cooldown(vol_pct, std_dev)
-    if now - last_trade_time.get(sym, 0) >= cooldown:
-        last_trade_time[sym] = now
-        return True
-    return False
-# ── BOLLINGER BANDS FOR VALIDATION ───────────────────
 def fetch_bollinger(sym, interval="5M"):
     """Calculate Bollinger Bands for additional range validation."""
     closes = fetch_closes(sym, interval)
@@ -155,37 +141,7 @@ def analyse(sym, interval="5M", limit=400, leverage=5):
         std=round(std, 5),
         cycle=cycle
     )
-# ── SCAN WITH FALLBACK ───────────────────────────────
-def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    """Analyze price trends using multiple timeframes."""
-    r60 = analyse(sym, interval="60M", limit=200)
-    if not r60:
-        return None
-    if r60["vol"] >= vol_threshold:
-        r5 = analyse(sym, interval="5M", limit=400)
-        if r5 and should_trigger(sym, r5["vol"], r5["std"]):
-            return r5
-        return None
-    elif should_trigger(sym, r60["vol"], r60["std"]):
-        return r60
-    return None
 
-# ── STATE MANAGEMENT ─────────────────────────────────
-def load_state():
-    """Load previously saved trading bot states."""
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, 'r') as f:
-                content = f.read().strip()
-                return json.loads(content) if content else {}
-        except json.JSONDecodeError:
-            logging.warning("Invalid JSON in %s, returning empty state", STATE_FILE)
-            return {}
-    return {}
-
-def save_state(d):
-    """Save the updated trading bot state."""
-    STATE_FILE.write_text(json.dumps(d, indent=2))
 # ── CYCLE NOTIFICATION FUNCTION ───────────────────────
 def check_cycle_notification(start_time, cycle, sym, warned=False):
     """Send a warning before cycle completion if needed."""
@@ -217,6 +173,7 @@ def execute_trade(sym, data):
            f"📊 Price Range: {data['low']} – {data['high']}\n"
            f"🌀 Score: {score_signal(data)}")
     tg(msg)
+
 # ── MAIN FUNCTION ────────────────────────────────────
 def main():
     """Execute the main trading cycle and notify based on conditions."""
@@ -291,4 +248,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
