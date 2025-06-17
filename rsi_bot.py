@@ -86,11 +86,6 @@ def calculate_grids(rng, px, spacing, vol):
         return max(10, min(200, math.floor(base)))
 # Part 4 of 7
 
-def grid_type_hint(rng_pct, vol):
-    if rng_pct < 1.5 and vol < 1.2:
-        return "Arithmetic"
-    return "Geometric"
-
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
@@ -106,15 +101,13 @@ def score_signal(d):
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
-    mode = grid_type_hint((d['high'] - d['low']) / d['now'] * 100, d['vol'])
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {d['cycle']} d\n"
-            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
-            f"🔧 Grid Mode Hint: {mode}")
+            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}")
 
 def stop_msg(sym, reason, info):
     return (f"🛑 Exit Alert: {sym}\n"
@@ -168,15 +161,48 @@ def load_state():
 def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
 
+def check_cycle_notification(start_time, cycle, sym, warned=False):
+    if not start_time or not cycle or warned:
+        return False
+    current_time = time.time()
+    elapsed_time = current_time - start_time
+    cycle_seconds = cycle * 24 * 3600
+    threshold = max(3600, cycle_seconds * 0.1)
+    remaining = cycle_seconds - elapsed_time
+    if 0 < remaining <= threshold:
+        tg(f"⚠️ Cycle Warning: {sym}\n"
+           f"Estimated cycle completion: {cycle} days\n"
+           f"Time remaining: {remaining / 3600:.1f} hours\n"
+           f"Consider reviewing or stopping the bot.")
+        return True
+    return False
+# Part 7 of 7
+
 def main():
     prev = load_state()
     nxt, scored, stops = {}, [], []
+    current_time = time.time()
 
     for sym in fetch_symbols():
         res = scan_with_fallback(sym)
         if not res:
             continue
-        nxt[sym] = {"zone": res["zone"], "low": res["low"], "high": res["high"]}
+
+        prev_state = prev.get(sym, {})
+        warned = prev_state.get("warned", False)
+        start_time = prev_state.get("start_time", current_time)
+
+        if check_cycle_notification(start_time, res["cycle"], sym, warned):
+            warned = True
+
+        nxt[sym] = {
+            "zone": res["zone"],
+            "low": res["low"],
+            "high": res["high"],
+            "start_time": start_time,
+            "warned": warned
+        }
+
         if sym not in prev:
             scored.append((score_signal(res), res))
         else:
@@ -195,7 +221,6 @@ def main():
         }))
 
     save_state(nxt)
-# Part 7 of 7
 
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
