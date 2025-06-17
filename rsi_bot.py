@@ -109,16 +109,23 @@ def score_signal(d):
         1
     )
 
+# ── UPDATED START_MSG FUNCTION ──────────────────────
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
     mode = grid_type_hint((d["high"] - d["low"]) / d["now"] * 100, d["vol"])
+    total_seconds = d["cycle"] * 24 * 3600  # Convert days to seconds
+    days = int(total_seconds // (24 * 3600))
+    remaining_seconds = total_seconds % (24 * 3600)
+    hours = int(remaining_seconds // 3600)
+    minutes = int((remaining_seconds % 3600) // 60)
+    cycle_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
-            f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {d['cycle']} d\n"
+            f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
             f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
             f"🔧 Grid Mode Hint: {mode}")
 
@@ -146,7 +153,7 @@ def analyse(sym, interval="5M", limit=400):
     vf = max(0.1, vol + std * 100)  # Prevent zero division
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
     grids = calculate_grids(rng, px, spacing, vol)
-    cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
+    cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)  # In days
     if cycle > CYCLE_MAX or cycle <= 0:
         return None
     if px < low:
@@ -187,18 +194,31 @@ def load_state():
 def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
 
+# ── UPDATED CHECK_CYCLE_NOTIFICATION FUNCTION ───────
 def check_cycle_notification(start_time, cycle, sym, warned=False):
     if not start_time or not cycle or warned:
         return False
     current_time = time.time()
     elapsed_time = current_time - start_time
-    cycle_seconds = cycle * 24 * 3600
-    threshold = max(3600, cycle_seconds * 0.1)
+    cycle_seconds = cycle * 24 * 3600  # Convert days to seconds
+    threshold = max(3600, cycle_seconds * 0.1)  # Warning threshold (1 hour or 10% of cycle)
     remaining = cycle_seconds - elapsed_time
     if 0 < remaining <= threshold:
+        remaining_seconds = remaining
+        days = int(remaining_seconds // (24 * 3600))
+        remaining_seconds %= (24 * 3600)
+        hours = int(remaining_seconds // 3600)
+        minutes = int((remaining_seconds % 3600) // 60)
+        remaining_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
+        cycle_seconds_total = cycle * 24 * 3600
+        days_total = int(cycle_seconds_total // (24 * 3600))
+        remaining_seconds_total = cycle_seconds_total % (24 * 3600)
+        hours_total = int(remaining_seconds_total // 3600)
+        minutes_total = int((remaining_seconds_total % 3600) // 60)
+        cycle_time = f"{days_total} Day(s) {hours_total} Hour(s) {minutes_total} Minute(s)" if days_total > 0 else f"{hours_total} Hour(s) {minutes_total} Minute(s)"
         tg(f"⚠️ Cycle Warning: {sym}\n"
-           f"Estimated cycle completion: {cycle} days\n"
-           f"Time remaining: {remaining / 3600:.1f} hours\n"
+           f"Estimated cycle completion: {cycle_time}\n"
+           f"Time remaining: {remaining_time}\n"
            f"Consider reviewing or stopping the bot.")
         return True
     return False
