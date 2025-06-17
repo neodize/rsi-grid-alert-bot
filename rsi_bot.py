@@ -2,7 +2,6 @@ import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
 
-# ── ENV + CONFIG ────────────────────────────────────
 TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
@@ -20,11 +19,10 @@ VOL_THRESHOLD = 2.5
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
-ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
+ZONE_EMO = {"Long": "Long", "Short": "Short"}
 last_trade_time = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-# ── TELEGRAM ────────────────────────────────────────
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -37,7 +35,6 @@ def tg(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
-# ── SYMBOL FETCHING ─────────────────────────────────
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
@@ -49,7 +46,6 @@ def fetch_symbols():
     pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
     pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
     return [p["symbol"] for p in pairs][:TOP_N]
-# Part 3 of 7
 
 def fetch_closes(sym, interval="5M"):
     r = requests.get(f"{API}/market/klines", 
@@ -64,6 +60,7 @@ def fetch_closes(sym, interval="5M"):
         elif isinstance(k, (list, tuple)) and len(k) >= 5:
             closes.append(float(k[4]))
     return closes
+# Part 3 of 7
 
 def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
@@ -80,7 +77,6 @@ def should_trigger(sym, vol_pct, std_dev):
         last_trade_time[sym] = now
         return True
     return False
-# Part 4 of 7
 
 def calculate_grids(rng, px, spacing, vol):
     base = rng / (px * spacing / 100)
@@ -88,6 +84,7 @@ def calculate_grids(rng, px, spacing, vol):
         return max(4, min(200, math.floor(base / 2)))
     else:
         return max(10, min(200, math.floor(base)))
+# Part 4 of 7
 
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
@@ -104,20 +101,20 @@ def score_signal(d):
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
-    prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
+    prefix = f"Top {rank}: {d['symbol']}" if rank else f"Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
-            f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
-            f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
-            f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
-            f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {d['cycle']} d\n"
-            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}")
-# Part 5 of 7
+            f"Range: {money(d['low'])} – {money(d['high'])}\n"
+            f"Entry Zone: {ZONE_EMO[d['zone']]}\n"
+            f"Grids: {d['grids']} | Spacing: {d['spacing']}%\n"
+            f"Volatility: {d['vol']}% | Cycle: {d['cycle']} d\n"
+            f"Score: {score} | Leverage Hint: {lev}")
 
 def stop_msg(sym, reason, info):
-    return (f"🛑 Exit Alert: {sym}\n"
-            f"📉 Reason: {reason}\n"
-            f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
-            f"💱 Current Price: {money(info['now'])}")
+    return (f"Exit Alert: {sym}\n"
+            f"Reason: {reason}\n"
+            f"Range: {money(info['low'])} – {money(info['high'])}\n"
+            f"Current Price: {money(info['now'])}")
+# Part 5 of 7
 
 def analyse(sym, interval="5M"):
     closes = fetch_closes(sym, interval)
