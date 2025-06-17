@@ -2,8 +2,8 @@ import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 API = "https://api.pionex.com/api/v1"
 TOP_N = 100
@@ -23,7 +23,6 @@ ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 last_trade_time = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -47,7 +46,6 @@ def fetch_symbols():
     pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
     pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
     return [p["symbol"] for p in pairs][:TOP_N]
-
 def fetch_closes(sym, interval="5M"):
     r = requests.get(f"{API}/market/klines",
                      params={"symbol": sym, "interval": interval, "limit": 200, "type": "PERP"},
@@ -70,7 +68,6 @@ def should_trigger(sym, vol_pct, std_dev):
         last_trade_time[sym] = now
         return True
     return False
-
 def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
@@ -86,20 +83,19 @@ def score_signal(d):
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
-    prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
+    prefix = f"Top {rank}: {d['symbol']}" if rank else f"Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
-            f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
-            f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
-            f"🧮 Grids: {d['grids']}  |  📏 Spacing: {d['spacing']}%\n"
-            f"🌪️ Volatility: {d['vol']}%  |  ⏱️ Cycle: {d['cycle']} d\n"
-            f"🌀 Score: {score}  |  ⚙️ Leverage Hint: {lev}")
+            f"Range: {money(d['low'])} – {money(d['high'])}\n"
+            f"Entry Zone: {ZONE_EMO[d['zone']]}\n"
+            f"Grids: {d['grids']}  |  Spacing: {d['spacing']}%\n"
+            f"Volatility: {d['vol']}%  |  Cycle: {d['cycle']} d\n"
+            f"Score: {score}  |  Leverage Hint: {lev}")
 
 def stop_msg(sym, reason, info):
-    return (f"🛑 Exit Alert: {sym}\n"
-            f"📉 Reason: {reason}\n"
-            f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
-            f"💱 Current Price: {money(info['now'])}")
-
+    return (f"Exit Alert: {sym}\n"
+            f"Reason: {reason}\n"
+            f"Range: {money(info['low'])} – {money(info['high'])}\n"
+            f"Current Price: {money(info['now'])}")
 def analyse(sym, interval="5M"):
     closes = fetch_closes(sym, interval)
     if len(closes) < 60:
@@ -142,9 +138,6 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
     elif should_trigger(sym, r60["vol"], r60["std"]):
         return r60
     return None
-
-# Part 5
-
 def load_state():
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
@@ -192,7 +185,7 @@ def main():
         if buf:
             tg(buf)
 
-    if stops:
+       if stops:
         buf = ""
         for m in stops:
             if len(buf) + len(m) > 3500:
@@ -202,6 +195,4 @@ def main():
                 buf += m + "\n\n"
         if buf:
             tg(buf)
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
