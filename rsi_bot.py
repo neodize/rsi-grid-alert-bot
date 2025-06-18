@@ -109,7 +109,22 @@ def score_signal(d):
         1
     )
 
-# ── START_MSG FUNCTION ──────────────────────────────
+# ── STATE MANAGEMENT ────────────────────────────────
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                content = f.read().strip()
+                return json.loads(content) if content else {}
+        except json.JSONDecodeError:
+            logging.warning("Invalid JSON in %s, returning empty state", STATE_FILE)
+            return {}
+    return {}
+
+def save_state(d):
+    STATE_FILE.write_text(json.dumps(d, indent=2))
+
+# ── NOTIFICATION FUNCTIONS ──────────────────────────
 def start_msg(d, rank=None):
     score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
@@ -137,75 +152,6 @@ def stop_msg(sym, reason, info):
             f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
             f"💱 Current Price: {money(now)}")
 
-# ── UPDATED ANALYSE FUNCTION ────────────────────────
-def analyse(sym, interval="5M", limit=400):
-    closes = fetch_closes(sym, interval, limit=limit)
-    if len(closes) < 60:
-        return None
-    low, high = min(closes), max(closes)
-    px = closes[-1]  # Current price
-    rng = high - low
-    if rng <= 0 or px == 0:
-        return None
-    pos = (px - low) / rng
-    # Relaxed position filter to allow more flexibility
-    if 0.25 <= pos <= 0.75:
-        return None
-    std = compute_std_dev(closes)
-    vol = rng / px * 100
-    vf = max(0.1, vol + std * 100)  # Prevent zero division
-    spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
-    grids = calculate_grids(rng, px, spacing, vol)
-    cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
-    if cycle > CYCLE_MAX or cycle <= 0:
-        return None
-    # Dynamically adjust range based on current price if outside buffer
-    if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
-        low = min(px, low * 0.95)  # Adjust lower limit
-        high = max(px, high * 1.05)  # Adjust upper limit
-    return dict(
-        symbol=sym,
-        zone="Long" if pos < 0.25 else "Short",
-        low=low,
-        high=high,
-        now=px,
-        grids=grids,
-        spacing=round(spacing, 2),
-        vol=round(vol, 1),
-        std=round(std, 5),
-        cycle=cycle
-    )
-
-# ── SCAN WITH FALLBACK ──────────────────────────────
-def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    r60 = analyse(sym, interval="60M", limit=200)
-    if not r60:
-        return None
-    if r60["vol"] >= vol_threshold:
-        r5 = analyse(sym, interval="5M", limit=400)
-        if r5 and should_trigger(sym, r5["vol"], r5["std"]):
-            return r5
-        return None
-    elif should_trigger(sym, r60["vol"], r60["std"]):
-        return r60
-    return None
-
-# ── STATE MANAGEMENT ────────────────────────────────
-def load_state():
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, 'r') as f:
-                content = f.read().strip()
-                return json.loads(content) if content else {}
-        except json.JSONDecodeError:
-            logging.warning("Invalid JSON in %s, returning empty state", STATE_FILE)
-            return {}
-    return {}
-
-def save_state(d):
-    STATE_FILE.write_text(json.dumps(d, indent=2))
-
-# ── CHECK_CYCLE_NOTIFICATION FUNCTION ───────────────
 def check_cycle_notification(start_time, cycle, sym, warned=False):
     if not start_time or not cycle or warned:
         return False
@@ -233,6 +179,145 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
            f"Consider reviewing or stopping the bot.")
         return True
     return False
+
+# ── ADDITIONAL INDICATOR FUNCTIONS ───────────────────
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50  # Neutral value if insufficient data
+    deltas = np.diff(closes)
+    seed = deltas[:period]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period or 1e-9
+    rs = up / down
+    rsi = [100 - 100 / (1 + rs)]
+    for delta in deltas[period:]:
+        up_val = max(delta, 0)
+        down_val = -min(delta, 0)
+        up = (up * (period - 1) + up_val) / period
+        down = (down * (period - 1) + down_val) / period or 1e-9
+        rs = up / down
+        rsi.append(100 - 100 / (1 + rs))
+    return rsi[-1]
+
+def compute_bollinger_bands(closes, period=20, dev_factor=2):
+    if len(closes) < period:
+        return None, None
+    sma = np.mean(closes[-period:])
+    std = np.std(closes[-period:])
+    lower = sma - dev_factor * std
+    upper = sma + dev_factor * std
+    return lower, upper
+
+def compute_macd(closes, slow=26, fast=12, signal=9):
+    if len(closes) < slow:
+        return None, None, None  # Not enough data for MACD
+    ema_fast = np.zeros_like(closes)
+    ema_slow = np.zeros_like(closes)
+    alpha_fast = 2 / (fast + 1)
+    alpha_slow = 2 / (slow + 1)
+    ema_fast[0] = closes[0]
+    ema_slow[0] = closes[0]
+    for i in range(1, len(closes)):
+        ema_fast[i] = alpha_fast * closes[i] + (1 - alpha_fast) * ema_fast[i-1]
+        ema_slow[i] = alpha_slow * closes[i] + (1 - alpha_slow) * ema_slow[i-1]
+    macd_line = ema_fast - ema_slow
+    signal_line = np.zeros_like(closes)
+    alpha_signal = 2 / (signal + 1)
+    signal_line[0] = macd_line[0]
+    for i in range(1, len(macd_line)):
+        signal_line[i] = alpha_signal * macd_line[i] + (1 - alpha_signal) * signal_line[i-1]
+    histogram = macd_line - signal_line
+    return macd_line[-1], signal_line[-1], histogram[-1]
+
+def regime_type(std_dev, vol):
+    # A simple regime classifier based on volatility % and std deviation of prices.
+    if vol > 3 or std_dev > 0.015:
+        return "Trending"
+    elif vol < 1.5 and std_dev < 0.005:
+        return "Sideways"
+    return "Normal"
+
+# ── UPDATED ANALYSE FUNCTION ─────────────────────────
+def analyse(sym, interval="5M", limit=400):
+    closes = fetch_closes(sym, interval, limit=limit)
+    if len(closes) < 60:
+        return None
+    low, high = min(closes), max(closes)
+    px = closes[-1]  # Current price
+    rng = high - low
+    if rng <= 0 or px == 0:
+        return None
+    pos = (px - low) / rng
+    # Only trade if price is closer to one extreme.
+    if 0.25 <= pos <= 0.75:
+        return None
+    std = compute_std_dev(closes)
+    vol = rng / px * 100
+    vf = max(0.1, vol + std * 100)  # Prevent division by zero
+    spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
+    grids = calculate_grids(rng, px, spacing, vol)
+    cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
+    if cycle > CYCLE_MAX or cycle <= 0:
+        return None
+    # Dynamically adjust range if price is outside the buffer.
+    if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
+        low = min(px, low * 0.95)
+        high = max(px, high * 1.05)
+    
+    # Compute additional indicators.
+    rsi = compute_rsi(closes)
+    bb_lower, bb_upper = compute_bollinger_bands(closes)
+    macd_line, signal_line, macd_hist = compute_macd(closes)
+    
+    # Determine current market regime.
+    regime = regime_type(std, vol)
+    # Dynamic thresholds: For a trending regime, use less extreme RSI thresholds.
+    if regime == "Trending":
+        rsi_long_threshold = 35
+        rsi_short_threshold = 65
+    elif regime == "Sideways":
+        rsi_long_threshold = 30
+        rsi_short_threshold = 70
+    else:  # Normal regime.
+        rsi_long_threshold = 30
+        rsi_short_threshold = 70
+    
+    # Evaluate combined entry conditions.
+    macd_confirm_long = macd_line is not None and macd_line > signal_line
+    macd_confirm_short = macd_line is not None and macd_line < signal_line
+    zone_check = None
+    if rsi < rsi_long_threshold and bb_lower is not None and px < bb_lower and macd_confirm_long:
+        zone_check = "Long"
+    elif rsi > rsi_short_threshold and bb_upper is not None and px > bb_upper and macd_confirm_short:
+        zone_check = "Short"
+    else:
+        return None  # No sufficient confluence.
+    
+    return dict(
+        symbol=sym,
+        zone=zone_check,
+        low=low,
+        high=high,
+        now=px,
+        grids=grids,
+        spacing=round(spacing, 2),
+        vol=round(vol, 1),
+        std=round(std, 5),
+        cycle=cycle
+    )
+
+def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
+    r60 = analyse(sym, interval="60M", limit=200)
+    if not r60:
+        return None
+    if r60["vol"] >= vol_threshold:
+        r5 = analyse(sym, interval="5M", limit=400)
+        if r5 and should_trigger(sym, r5["vol"], r5["std"]):
+            return r5
+        return None
+    elif should_trigger(sym, r60["vol"], r60["std"]):
+        return r60
+    return None
 
 # ── MAIN FUNCTION ───────────────────────────────────
 def main():
@@ -277,7 +362,7 @@ def main():
             "now": mid
         })
         stops.append(stop_message)
-        tg(stop_message)  # Ensure immediate Telegram notification
+        tg(stop_message)
 
     save_state(nxt)
 
