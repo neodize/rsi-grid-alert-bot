@@ -8,7 +8,7 @@ import numpy as np
 from pathlib import Path
 import sys
 
-# Ensure Python 3.11 compatibility
+# Ensure Python 3.7+ compatibility
 if sys.version_info < (3, 7):
     raise RuntimeError("Python 3.7 or higher required")
 
@@ -20,21 +20,21 @@ if not TG_TOKEN or not TG_CHAT_ID:
     logging.warning("Telegram token or chat ID not set, notifications disabled")
 
 API = "https://api.pionex.com/api/v1"
-MIN_NOTIONAL_USD = 100_000  # Low for small coins
-SPACING_MIN = 0.7  # Increased for small coins
+MIN_NOTIONAL_USD = 100_000
+SPACING_MIN = 0.7
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 5.0  # Longer cycles
+CYCLE_MAX = 5.0
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-VOL_THRESHOLD = 1.0  # Low for more opportunities
-GRID_HEIGHT = 0.15  # Default, adjusted dynamically
+VOL_THRESHOLD = 1.0
+GRID_HEIGHT = 0.15
 GRIDS_AMOUNT = 21
 
 # RELAXED THRESHOLDS
-POSITION_THRESHOLD = 0.25  # Further relaxed
-RSI_OVERSOLD = 40  # Lenient
-RSI_OVERBOUGHT = 60  # Lenient
+POSITION_THRESHOLD = 0.25
+RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 60
 REQUIRE_ALL_INDICATORS = False
 
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
@@ -71,7 +71,7 @@ def tg(msg):
 def valid(sym):
     u = sym.upper()
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
-            not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))  # Fixed syntax
+            not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
 
 def fetch_symbols():
     logging.info("Fetching symbols...")
@@ -136,7 +136,7 @@ def calculate_grids(rng, px, spacing, vol, use_fixed_grids=False):
     if use_fixed_grids:
         return GRIDS_AMOUNT
     base = rng / (px * spacing / 100)
-    if px < 0.01:  # Adjust for small coins
+    if px < 0.01:
         base *= 2
     if vol < 1.0:
         return max(4, min(200, math.floor(base / 2)))
@@ -252,7 +252,6 @@ def save_state(d):
 # ── NOTIFICATION FUNCTIONS ──────────────────────────
 def start_msg(d, rank=None):
     score = score_signal(d)
-    lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
     mode = grid_type_hint((d["high"] - d["low"]) / d["now"] * 100, d["vol"])
     total_seconds = d["cycle"] * 24 * 3600
     days = int(total_seconds // (24 * 3600))
@@ -266,7 +265,7 @@ def start_msg(d, rank=None):
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
-            f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
+            f"🌀 Score: {score}\n"
             f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
@@ -491,7 +490,7 @@ def main():
     
     signals_found = 0
     for i, sym in enumerate(symbols):
-        time.sleep(0.5)  # Prevent API rate limits
+        time.sleep(0.5)
         res = scan_with_fallback(sym)
         if not res:
             continue
@@ -546,10 +545,10 @@ def main():
         scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
         config_info = (f"📊 Position threshold: {POSITION_THRESHOLD}\n"
-                      f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
-                      f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
-                      f"📏 Grid height: {GRID_HEIGHT*100}% | 🧮 Default grids: {GRIDS_AMOUNT}\n"
-                      f"💰 Capital: $100 | 📈 Leverage: 10x\n")
+                       f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                       f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
+                       f"📏 Grid height: {GRID_HEIGHT*100}% for small coins | 🧮 Default grids: {GRIDS_AMOUNT}\n"
+                       f"💡 Simulation: $100 capital, 10x leverage (orders sized for $1,000 effective capital)\n")
         
         for i, (score, r) in enumerate(scored, 1):
             m = start_msg(r, i)
