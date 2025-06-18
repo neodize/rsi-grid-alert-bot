@@ -18,8 +18,8 @@ STATE_FILE = Path("active_grids.json")
 VOL_THRESHOLD = 2.5
 
 # RELAXED THRESHOLDS FOR TESTING
-POSITION_THRESHOLD = 0.4  # Relaxed from 0.25/0.75 to 0.4/0.6
-RSI_OVERSOLD = 40         # Relaxed from 30/35
+POSITION_THRESHOLD = 0.3  # Relaxed from 0.25/0.75 to 0.4/0.6 - 0.4
+RSI_OVERSOLD = 30         # Relaxed from 30/35 - 40
 RSI_OVERBOUGHT = 60       # Relaxed from 65/70
 REQUIRE_ALL_INDICATORS = False  # Allow 2 out of 3 indicators instead of all 3
 
