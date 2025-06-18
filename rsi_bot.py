@@ -11,9 +11,9 @@ API = "https://api.pionex.com/api/v1"
 STATE_FILE = Path("active_grids.json")
 
 # EXTREMELY relaxed thresholds for debugging
-VOL_THRESHOLD = 0.001  # 0.001% - almost any movement
-RSI_OVERSOLD = 90      # Almost impossible not to trigger
-RSI_OVERBOUGHT = 10    # Almost impossible not to trigger
+VOL_THRESHOLD = 0.5   # 0.5% volatility
+RSI_OVERSOLD = 30     # Traditional oversold
+RSI_OVERBOUGHT = 70   # Traditional overbought
 DEBUG_MODE = True
 
 print(f"🐛 ENHANCED DEBUG MODE: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} (Short), RSI≥{RSI_OVERSOLD} (Long)")
