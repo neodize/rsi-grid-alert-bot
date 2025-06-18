@@ -5,11 +5,11 @@ Combined RSI Bot and ATR Price Range Helper
 This file includes:
   1. The ATR-based Price Range Helper (non-intrusive add-on)
   2. Your original RSI bot script (kept intact, only wrapped into rsi_bot_main())
-
+  
 At runtime, you can choose:
-  [1] Run the original RSI Bot Scan
-  [2] Test the ATR Price Range Helper
-
+  [1] Run the original RSI Bot scan (unchanged logic)
+  [2] Test the ATR Price Range Helper for a token
+  
 No core logic of your original script is modified.
 """
 
@@ -22,10 +22,10 @@ import sys
 #                     ATR-Based Price Range Helper Module
 # =============================================================================
 
-# Configure logging (shared configuration)
+# Configure logging (this configuration is shared)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Pionex API endpoint (keeping consistent with your original script)
+# Pionex API endpoint for fetching candles (to match your original script)
 API = "https://api.pionex.com/api/v1"
 
 def fetch_ohlcv(symbol, interval="5M", limit=100):
@@ -49,12 +49,8 @@ def fetch_ohlcv(symbol, interval="5M", limit=100):
         sys.exit(1)
     
     data = response.json().get("data", {})
+    # The API may return a dict with "klines" or a raw list
     klines = data.get("klines") if isinstance(data, dict) else data
-
-    if not klines:
-        logging.error("No 'klines' found in response. Full response: %s", response.json())
-        sys.exit(1)
-        
     ohlcv = []
     for k in klines:
         if isinstance(k, dict) and "close" in k:
@@ -78,17 +74,17 @@ def fetch_ohlcv(symbol, interval="5M", limit=100):
         ohlcv.append(candle)
     
     if not ohlcv:
-        logging.error("No valid OHLCV data received after parsing.")
+        logging.error("No valid OHLCV data received.")
         sys.exit(1)
     return ohlcv
 
 def calculate_atr(ohlcv, period=14):
     """
     Calculate the Average True Range (ATR) on the provided OHLCV data.
-
+    
     ATR is computed by:
       TR = max[(High - Low), abs(High - Previous Close), abs(Low - Previous Close)]
-      ATR = Mean of the last `period` TR values.
+      ATR = Mean of the last `period` TR calculations.
     """
     if len(ohlcv) < period + 1:
         logging.error("Not enough data to calculate ATR. Need at least %d candles.", period + 1)
@@ -110,8 +106,8 @@ def calculate_atr(ohlcv, period=14):
 def determine_price_range(symbol, interval="5M", atr_period=14, atr_multiplier=2.0):
     """
     Determine a volatility-adjusted price range using ATR.
-
-    Uses the last candle's close as the center, computing:
+    
+    Uses the last candle's close as the center, and computes:
        Lower Bound = current_price - (atr_multiplier * ATR)
        Upper Bound = current_price + (atr_multiplier * ATR)
        
@@ -134,7 +130,7 @@ def determine_price_range(symbol, interval="5M", atr_period=14, atr_multiplier=2
 
 def format_currency(val):
     """
-    Format a numeric value into a currency string (matching your output style).
+    Format numeric value into a currency string (consistent with your bot's style).
     """
     if val < 0.1:
         return f"${val:.8f}"
@@ -145,7 +141,7 @@ def format_currency(val):
 
 def print_price_range(range_data):
     """
-    Print the ATR-based price range in a formatted style for debugging/testing.
+    Print the ATR-based price range in a formatted style.
     """
     symbol = range_data["symbol"]
     current_price = format_currency(range_data["current_price"])
@@ -161,6 +157,7 @@ def print_price_range(range_data):
     print(f"  Lower Bound: {lower_bound}")
     print(f"  Upper Bound: {upper_bound}")
     print("========================================")
+
 
 # =============================================================================
 #                     Original RSI Bot Script (Untouched)
@@ -651,41 +648,23 @@ def rsi_bot_main():
 # =============================================================================
 
 def main():
-    # Try to check for a command-line argument for mode.
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].strip()
-    else:
-        try:
-            mode = input("Enter mode - 1: Original RSI Bot, 2: ATR Price Range Helper: ").strip()
-        except EOFError:
-            logging.warning("No input received. Defaulting mode to '2' (ATR Price Range Helper).")
-            mode = "2"
+    print("Select Mode:")
+    print("1: Run Original RSI Bot Scan")
+    print("2: Test ATR-Based Price Range Helper")
+    mode = input("Enter 1 or 2: ").strip()
 
     if mode == "1":
         rsi_bot_main()
     elif mode == "2":
-        # Use a default token if no input is provided.
-        default_token = "NXPCUSDTPERP"
-        try:
-            token = input("Enter token symbol (default '{}'): ".format(default_token)).strip().upper()
-            if not token:
-                logging.info("No token provided. Using default token: %s", default_token)
-                token = default_token
-        except EOFError:
-            logging.warning("No token input received. Using default token: %s", default_token)
-            token = default_token
-        
-        try:
-            interval = input("Enter candle interval (default '5M'): ").strip() or "5M"
-        except EOFError:
-            interval = "5M"
+        token = input("Enter token symbol (e.g., NXPCUSDTPERP): ").strip().upper()
+        interval = input("Enter candle interval (default '5M'): ").strip() or "5M"
         try:
             atr_period = int(input("Enter ATR period (default 14): ").strip() or "14")
-        except (ValueError, EOFError):
+        except ValueError:
             atr_period = 14
         try:
             atr_multiplier = float(input("Enter ATR multiplier (default 2.0): ").strip() or "2.0")
-        except (ValueError, EOFError):
+        except ValueError:
             atr_multiplier = 2.0
 
         range_data = determine_price_range(token, interval=interval, atr_period=atr_period, atr_multiplier=atr_multiplier)
