@@ -2,42 +2,54 @@ import os
 import json
 import math
 import logging
-import time import time
+import time
 import requests
 import numpy as np
 from pathlib import Path
+import sys
 
-# ── ENV + CONFIG ────────────────────────────────────────────────────────────────┤
+# Ensure Python 3.11 compatibility
+if sys.version_info < (3, 7):
+    raise RuntimeError("Python 3.7 or higher required")
+
+# ── ENV + CONFIG ────────────────────────────────────
 TG_TOKEN = os.getenv("TG_TOKEN", os.getenv("TELEGRAM_TOKEN", "")).strip()
-TG_CHAT_ID = None
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+
+if not TG_TOKEN or not TG_CHAT_ID:
+    logging.warning("Telegram token or chat ID not set, notifications disabled")
+
 API = "https://api.pionex.com/api/v1"
-MIN_NOTIONAL_USD = 100_000  # Kept low for small coins
+MIN_NOTIONAL_USD = 100_000  # Low for small coins
 SPACING_MIN = 0.7  # Increased for small coins
-SPACING_MAX_CYCLE = 1.2
+SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 5.0  # Increased for longer cycles
+CYCLE_MAX = 5.0  # Longer cycles
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-VOL_THRESHOLD = 1.0  # Lowered for more opportunities
+VOL_THRESHOLD = 1.0  # Low for more opportunities
 GRID_HEIGHT = 0.15  # Default, adjusted dynamically
 GRIDS_AMOUNT = 21
 
 # RELAXED THRESHOLDS
-POSITION_THRESHOLD = 0.25  # Relaxed further
-RSI_OVERSOLD = 40  # Reverted for more signals
-RSI_OVERBOUGHT = RSI = 60  # Reverted for more signals
+POSITION_THRESHOLD = 0.25  # Further relaxed
+RSI_OVERSOLD = 40  # Lenient
+RSI_OVERBOUGHT = 60  # Lenient
 REQUIRE_ALL_INDICATORS = False
 
-WRAPPED = {"WBTC", "WETH", "WSOL"}
-STABLE = {"USDT"}
-EXCLUDE = {"USD"}
+WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
+STABLE = {"USDT", "USDC", "BUSD", "DAI"}
+EXCL = {"LUNA", "LUNC", "USTC"}
 ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 last_trade_time = {}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[
+    logging.FileHandler("grid_trading_bot.log"),
+    logging.StreamHandler()
+])
 
-# ── TELEGRAM ───────────────────────────────────────────────────────────────────┤
-def send_tg_message(msg):
+# ── TELEGRAM ────────────────────────────────────────
+def tg(msg):
     logging.info(f"Sending Telegram message: {msg[:100]}...")
     if not TG_TOKEN or not TG_CHAT_ID:
         logging.warning("Telegram not configured")
@@ -55,21 +67,21 @@ def send_tg_message(msg):
         logging.error(f"Telegram error: {e}")
         return False
 
-# ── SYMBOL FETCHING ─────────────────────────────────────────────────────────────┤─┤
-def is_valid_symbol(sym):
+# ── SYMBOL FETCHING ─────────────────────────────────
+def valid(sym):
     u = sym.upper()
-    return (u.split("_")[0] not in WRAPPED | STABLE | EXCLUDED and 
-            not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S"))))
+    return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
+            not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))  # Fixed syntax
 
-def get_symbols():
+def fetch_symbols():
     logging.info("Fetching symbols...")
     try:
-        r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=20)
+        r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        tickers = data.get("data", {}).get("tickers", {})
+        tickers = data.get("data", {}).get("tickers", [])
         logging.info(f"Total tickers received: {len(tickers)}")
-        pairs = [t for t in tickers if is_valid_symbol(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
+        pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
         pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
         symbols = [p["symbol"] for p in pairs]
         logging.info(f"Selected {len(symbols)} symbols")
@@ -78,9 +90,8 @@ def get_symbols():
         logging.error(f"Error fetching symbols: {e}")
         return []
 
-# ── FETCH CLOSES WITH LIMIT ────────
-─────────────────────────────┤
-def fetch_cl_oses(sym, interval="5m", limit=400):
+# ── FETCH CLOSES WITH LIMIT ─────────────────────────
+def fetch_closes(sym, interval="5M", limit=400):
     try:
         r = requests.get(
             f"{API}/market/klines",
@@ -89,7 +100,7 @@ def fetch_cl_oses(sym, interval="5m", limit=400):
         )
         r.raise_for_status()
         payload = r.json().get("data", {})
-        kl = payload.get("klines", {}) or payload
+        kl = payload.get("klines") or payload
         closes = []
         for k in kl:
             if isinstance(k, dict) and "close" in k:
@@ -99,21 +110,20 @@ def fetch_cl_oses(sym, interval="5m", limit=400):
         return closes
     except Exception as e:
         logging.error(f"Error fetching closes for {sym}: {e}")
-        return None []
+        return []
 
-# ── ANALYSIS FUNCTIONS ──────
-───────────────────────────────┤
-def calc_std_dev(closes, period=30):
+# ── ANALYSIS FUNCTIONS ──────────────────────────────
+def compute_std_dev(closes, period=30):
     return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
-def calc_cooldown(vol_pct, std_dev):
+def compute_cooldown(vol_pct, std_dev):
     base = 300
-    extra = max(0, (vol_pct - 1) + (std_dev * 0.01) * 100) * 60
+    extra = max(0, (vol_pct - 1) + (std_dev - 0.01) * 100) * 60
     return base + extra
 
 def should_trigger(sym, vol_pct, std_dev):
     now = time.time()
-    cooldown = calc_cooldown(vol_pct, std_dev)
+    cooldown = compute_cooldown(vol_pct, std_dev)
     last_time = last_trade_time.get(sym, 0)
     time_since_last = now - last_time
     should_trigger_result = time_since_last >= cooldown
@@ -122,26 +132,26 @@ def should_trigger(sym, vol_pct, std_dev):
         return True
     return False
 
-def calc_grids(rng, px, spacing, vol, use_fixed_grids=False):
+def calculate_grids(rng, px, spacing, vol, use_fixed_grids=False):
     if use_fixed_grids:
         return GRIDS_AMOUNT
     base = rng / (px * spacing / 100)
     if px < 0.01:  # Adjust for small coins
         base *= 2
-    if vol < 1.0:  # Adjusted for low volatility
-        return max(4, min(100, math.floor(base / 2)))
+    if vol < 1.0:
+        return max(4, min(200, math.floor(base / 2)))
     else:
-        return max(10, min(100, math.floor(base)))
+        return max(10, min(200, math.floor(base)))
 
-def grid_type_hint(rng_price_pct, vol):
+def grid_type_hint(rng_pct, vol):
     if rng_pct < 1.5 and vol < 1.2:
         return "Arithmetic"
     return "Geometric"
 
-def format_money(p):
+def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
-def calc_signal_score(d):
+def score_signal(d):
     return round(
         d["vol"] * 2 +
         ((200 - d["grids"]) / 200) * 10 +
@@ -150,11 +160,11 @@ def calc_signal_score(d):
         1
     )
 
-def calc_atr(sym, closes, period=14):
+def compute_atr(sym, closes, period=14):
     try:
         r = requests.get(
             f"{API}/market/klines",
-            params={"symbol": sym, "interval": "5m", "limit": period + 1, "type": "PERP"},
+            params={"symbol": sym, "interval": "5M", "limit": period + 1, "type": "PERP"},
             timeout=10
         )
         r.raise_for_status()
@@ -173,7 +183,7 @@ def calc_atr(sym, closes, period=14):
         logging.error(f"Error computing ATR for {sym}: {e}")
         return None
 
-def sim_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, leverage=10):
+def simulate_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, leverage=10):
     orders = []
     interval = (high - low) / (grids - 1) if grids > 1 else (high - low)
     grid_levels = [low + i * interval for i in range(grids)]
@@ -181,24 +191,22 @@ def sim_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, lev
     effective_capital = capital * leverage
     num_buy_grids = sum(1 for level in grid_levels if level <= px) or 1
     order_size = (effective_capital / num_buy_grids) / px
-    atr = calc_atr(sym, closes)
+    atr = compute_atr(sym, closes)
     stop_reason = None
     if atr:
-        if px > high + 3 * atr:  # Relaxed to 3x ATR
-            stop_reason = f"Price {format_money(px)} above upper limit {format_money(high)} + 3*atr*xATR {format_money(3*atr)}}
+        if px > high + 3 * atr:
+            stop_reason = f"Price {money(px)} above upper limit {money(high)} + 3*ATR {money(3*atr)}"
         elif px < low - 3 * atr:
-            stop_reason = f"Price {format_money(px)} below lower limit {format_money(low)} - 3x*ATR {format_money(3*atr)}}
+            stop_reason = f"Price {money(px)} below lower limit {money(low)} - 3*ATR {money(3*atr)}"
     if stop_reason:
         logging.info(f"Bot stop triggered for {sym}: {stop_reason}")
-        send_tg(f"🟑️ Stopped Grid Bot: {sym}\n{stop_reason}\n"
-               f"📊 Range: {format_money(low)} – {format_money(high{m)}"
-               f"💱 Current price: Price: {format_money(px)}")
+        tg(f"🛑 Stop Grid Bot: {sym}\n📉 Reason: {stop_reason}\n📊 Range: {money(low)} – {money(high)}\n💱 Current Price: {money(px)}")
         return [], stop_reason
     for level in grid_levels:
         try:
             if level <= px:
                 order = {
-                    'symbol': 'sym,
+                    'symbol': sym,
                     'type': 'limit',
                     'side': 'buy',
                     'amount': order_size,
@@ -206,7 +214,7 @@ def sim_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, lev
                     'leverage': leverage
                 }
                 orders.append(order)
-                logging.info(f"Simulated buy order for {sym} at {format_money(level)}: {order_size:.6f} {base_currency} (leverage: {leverage}x)")
+                logging.info(f"Simulated buy order for {sym} at {money(level)}: {order_size:.6f} {base_currency} (leverage: {leverage}x)")
             else:
                 order = {
                     'symbol': sym,
@@ -217,17 +225,16 @@ def sim_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, lev
                     'leverage': leverage
                 }
                 orders.append(order)
-                logging.info(f"Simulated sell order for {sym} at {format_money(level)}: {order_size:.6f} {base_currency} (leverage: {leverage}x)"))
+                logging.info(f"Simulated sell order for {sym} at {money(level)}: {order_size:.6f} {base_currency} (leverage: {leverage}x)")
         except Exception as e:
-            logging.error(f"Error simulating order for {sym} at {format_money(level)}: {e}")
-        return orders
-    for _, None
+            logging.error(f"Error simulating order for {sym} at {money(level)}: {e}")
+    return orders, None
 
-# ── STATE MANAGEMENT ────────┤───────────────────────────────┤
+# ── STATE MANAGEMENT ────────────────────────────────
 def load_state():
     if STATE_FILE.exists():
         try:
-            with open(STATE_FILE, 'r+') as f:
+            with open(STATE_FILE, 'r') as f:
                 content = f.read().strip()
                 state = json.loads(content) if content else {}
                 logging.info(f"Loaded state with {len(state)} symbols")
@@ -242,10 +249,9 @@ def save_state(d):
     STATE_FILE.write_text(json.dumps(d, indent=2))
     logging.info(f"Saved state with {len(d)} symbols")
 
-# ── NOTIFICATION FUNCTIONS ───────
-────────────────────────────┤
+# ── NOTIFICATION FUNCTIONS ──────────────────────────
 def start_msg(d, rank=None):
-    score = calc_signal_score(d)
+    score = score_signal(d)
     lev = "20x–50x" if d["spacing"] <= 0.5 else "10x–25x" if d["spacing"] <= 0.75 else "5x–15x"
     mode = grid_type_hint((d["high"] - d["low"]) / d["now"] * 100, d["vol"])
     total_seconds = d["cycle"] * 24 * 3600
@@ -256,7 +262,7 @@ def start_msg(d, rank=None):
     cycle_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
     return (f"{prefix}\n"
-            f"📊 Range: {format_money(d['low'])} – {format_money(d['high'])}\n"
+            f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
@@ -264,12 +270,12 @@ def start_msg(d, rank=None):
             f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
-    closes = fetch_cl_oses(sym, interval="5m", limit=1)
+    closes = fetch_closes(sym, interval="5M", limit=1)
     now = closes[-1] if closes and closes else (info["low"] + info["high"]) / 2
-    return (f"🟑️ Exit Alert: {sym}\n"
+    return (f"🛑 Exit Alert: {sym}\n"
             f"📉 Reason: {reason}\n"
-            f"📊 Range: {format_money(info['low'])} – {format_money(info['high'])}\n"
-            f"💱 Current Price: {format_money(now)}")
+            f"📊 Range: {money(info['low'])} – {money(info['high'])}\n"
+            f"💱 Current Price: {money(now)}")
 
 def check_cycle_notification(start_time, cycle, sym, warned=False):
     if not start_time or not cycle or warned:
@@ -292,16 +298,15 @@ def check_cycle_notification(start_time, cycle, sym, warned=False):
         hours_total = int(remaining_seconds_total // 3600)
         minutes_total = int((remaining_seconds_total % 3600) // 60)
         cycle_time = f"{days_total} Day(s) {hours_total} Hour(s) {minutes_total} Minute(s)" if days_total > 0 else f"{hours_total} Hour(s) {minutes_total} Minute(s)"
-        send_tg(f"⚠️ Cycle Warning: {sym}\n"
-               f"Estimated cycle completion: {cycle_time}\n"
-               f"Time remaining: {remaining_time}\n"
-               f"Consider reviewing or stopping the bot.")
+        tg(f"⚠️ Cycle Warning: {sym}\n"
+           f"Estimated cycle completion: {cycle_time}\n"
+           f"Time remaining: {remaining_time}\n"
+           f"Consider reviewing or stopping the bot.")
         return True
     return False
 
-# ── ADDITIONAL INDICATOR FUNCTIONS ───────
-────────────────────────────┤
-def calc_rsi(closes, period=14):
+# ── INDICATOR FUNCTIONS ─────────────────────────────
+def compute_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
     deltas = np.diff(closes)
@@ -319,7 +324,7 @@ def calc_rsi(closes, period=14):
         rsi.append(100 - 100 / (1 + rs))
     return rsi[-1]
 
-def calc_bollinger_bands(closes, period=20, dev_factor=2):
+def compute_bollinger_bands(closes, period=20, dev_factor=2):
     if len(closes) < period:
         return None, None
     sma = np.mean(closes[-period:])
@@ -328,7 +333,7 @@ def calc_bollinger_bands(closes, period=20, dev_factor=2):
     upper = sma + dev_factor * std
     return lower, upper
 
-def calc_macd(closes, slow=26, fast=12, signal=9):
+def compute_macd(closes, slow=26, fast=12, signal=9):
     if len(closes) < slow:
         return None, None, None
     ema_fast = np.zeros_like(closes)
@@ -349,24 +354,21 @@ def calc_macd(closes, slow=26, fast=12, signal=9):
     histogram = macd_line - signal_line
     return macd_line[-1], signal_line[-1], histogram[-1]
 
-def determine_regime_type(std_dev, vol):
+def regime_type(std_dev, vol):
     if vol > 3 or std_dev > 0.015:
         return "Trending"
     elif vol < 1.5 and std_dev < 0.005:
         return "Sideways"
     return "Normal"
 
-# ── RELAXED ANALYSE FUNCTION ─────────
-───────────────────────────────┤
-def analyse(sym, interval="5m", limit=400, use_grid_height=True):
-    closes = fetch_cl_oses(sym, interval, limit=limit)
+# ── ANALYSE FUNCTION ────────────────────────────────
+def analyse(sym, interval="5M", limit=400, use_grid_height=True):
+    closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
         return None
     
     px = closes[-1]
-    # Dynamic GRID_HEIGHT for small coins
     grid_height = 0.15 if px < 0.1 else 0.05
-    # Disable centered range for small/high-vol coins
     use_grid_height = use_grid_height and px >= 0.1
     if use_grid_height:
         low = px * (1 - grid_height / 2)
@@ -385,12 +387,12 @@ def analyse(sym, interval="5m", limit=400, use_grid_height=True):
         logging.debug(f"{sym}: Price too centered in range ({pos:.3f}), skipping")
         return None
     
-    std = calc_std_dev(closes)
+    std = compute_std_dev(closes)
     vol = rng / px * 100
     vf = max(0.1, vol + std * 100)
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
     use_fixed_grids = use_grid_height
-    grids = calc_grids(rng, px, spacing, vol, use_fixed_grids)
+    grids = calculate_grids(rng, px, spacing, vol, use_fixed_grids)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     
     if cycle > CYCLE_MAX or cycle <= 0:
@@ -400,11 +402,12 @@ def analyse(sym, interval="5m", limit=400, use_grid_height=True):
         low = min(px, low * 0.95)
         high = max(px, high * 1.05)
     
-    rsi = calc_rsi(closes)
-    bb_lower, bb_upper = calc_bollinger_bands(closes)
-    macd_line, signal_line, macd_hist = calc_macd(closes)
+    rsi = compute_rsi(closes)
+    bb_lower, bb_upper = compute_bollinger_bands(closes)
+    macd_line, signal_line, macd_hist = compute_macd(closes)
+    logging.debug(f"{sym}: RSI={rsi:.1f}, BB={px < bb_lower if bb_lower else False}, MACD={macd_line > signal_line if macd_line else False}")
     
-    regime = determine_regime_type(std, vol)
+    regime = regime_type(std, vol)
     
     rsi_long_threshold = RSI_OVERSOLD
     rsi_short_threshold = RSI_OVERBOUGHT
@@ -416,7 +419,6 @@ def analyse(sym, interval="5m", limit=400, use_grid_height=True):
     macd_signal_long = macd_line is not None and macd_line > signal_line
     macd_signal_short = macd_line is not None and macd_line < signal_line
     
-    # Relax indicator requirement for small coins
     if px < 0.1:
         if rsi_signal_long or bb_signal_long or macd_signal_long:
             zone_check = "Long"
@@ -436,7 +438,7 @@ def analyse(sym, interval="5m", limit=400, use_grid_height=True):
         else:
             return None
     
-    orders, stop_reason = sim_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, leverage=10)
+    orders, stop_reason = simulate_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, leverage=10)
     if stop_reason:
         return None
     
@@ -454,16 +456,16 @@ def analyse(sym, interval="5m", limit=400, use_grid_height=True):
         orders=orders
     )
     
-    logging.info(f"Valid signal found for {sym}: {zone_check} zone, vol={vol:.1f}%, score={calc_signal_score(result)}")
+    logging.info(f"Valid signal found for {sym}: {zone_check} zone, vol={vol:.1f}%, score={score_signal(result)}")
     return result
 
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    r60 = analyse(sym, interval="60m", limit=200, use_grid_height=True)
+    r60 = analyse(sym, interval="60M", limit=200, use_grid_height=True)
     if not r60:
         return None
     
     if r60["vol"] >= vol_threshold:
-        r5 = analyse(sym, interval="5m", limit=400, use_grid_height=True)
+        r5 = analyse(sym, interval="5M", limit=400, use_grid_height=True)
         if r5 and should_trigger(sym, r5["vol"], r5["std"]):
             return r5
         return None
@@ -472,8 +474,7 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
     
     return None
 
-# ── MAIN FUNCTION ───────────────
-───────────────────────────────┤
+# ── MAIN FUNCTION ───────────────────────────────────
 def main():
     logging.info("=== Starting RSI Bot Scan (RELAXED CONDITIONS) ===")
     
@@ -481,7 +482,7 @@ def main():
     nxt, scored, stops = {}, [], []
     current_time = time.time()
     
-    symbols = get_symbols()
+    symbols = fetch_symbols()
     if not symbols:
         logging.error("No symbols fetched, exiting")
         return
@@ -489,7 +490,8 @@ def main():
     logging.info(f"Scanning {len(symbols)} symbols...")
     
     signals_found = 0
-    for i, sym in enumerate(symbols):        
+    for i, sym in enumerate(symbols):
+        time.sleep(0.5)  # Prevent API rate limits
         res = scan_with_fallback(sym)
         if not res:
             continue
@@ -513,8 +515,8 @@ def main():
         }
 
         if sym not in prev:
-            scored.append((calc_signal_score(res), res))
-            logging.info(f"New signal for {sym}: score={calc_signal_score(res)}")
+            scored.append((score_signal(res), res))
+            logging.info(f"New signal for {sym}: score={score_signal(res)}")
         else:
             p = prev[sym]
             if p["zone"] != res["zone"]:
@@ -554,29 +556,29 @@ def main():
             if i == 1:
                 m = config_info + m
             if len(buf) + len(m) > 3500:
-                send_tg(buf)
+                tg(buf)
                 buf = m + "\n\n"
             else:
                 buf += m + "\n\n"
         if buf:
-            send_tg(buf)
+            tg(buf)
         logging.info(f"Sent {len(scored)} new signals")
     else:
         logging.info("No new signals to send")
         if TG_TOKEN and TG_CHAT_ID:
-            send_tg(f"📊 Scan completed - {len(symbols)} symbols checked, no new opportunities found\n"
-                   f"⚙️ Try adjusting thresholds if this persists")
+            tg(f"📊 Scan completed - {len(symbols)} symbols checked, no new opportunities found\n"
+               f"⚙️ Try adjusting thresholds if this persists")
 
     if stops:
         buf = ""
         for m in stops:
             if len(buf) + len(m) > 3500:
-                send_tg(buf)
+                tg(buf)
                 buf = m + "\n\n"
             else:
                 buf += m + "\n\n"
         if buf:
-            send_tg(buf)
+            tg(buf)
         logging.info(f"Sent {len(stops)} stop alerts")
 
 if __name__ == "__main__":
