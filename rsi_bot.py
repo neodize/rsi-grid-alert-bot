@@ -367,10 +367,16 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=True):
         return None
     
     px = closes[-1]
-    grid_height = 0.15 if px < 0.1 else 0.05  # 15% range for small coins
-    low = px * (1 - grid_height / 2)
-    high = px * (1 + grid_height / 2)
-    rng = high - low
+    grid_height = 0.15 if px < 0.1 else 0.05
+    use_grid_height = use_grid_height and px >= 0.1
+    if use_grid_height:
+        low = px * (1 - grid_height / 2)
+        high = px * (1 + grid_height / 2)
+        rng = high - low
+    else:
+        low = min(closes) * 0.95  # Extend lower bound by 5% to include recent lows
+        high = max(closes)
+        rng = high - low
     
     if rng <= 0 or px == 0:
         return None
@@ -385,7 +391,7 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=True):
     vol = rng / px * 100
     vf = max(0.1, vol + std * 100)
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
-    use_fixed_grids = True  # Use centered range with fixed grids
+    use_fixed_grids = use_grid_height
     grids = calculate_grids(rng, px, spacing, vol, use_fixed_grids)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     
@@ -395,12 +401,6 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=True):
     if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
         low = min(px, low * 0.95)
         high = max(px, high * 1.05)
-    
-    # Add trend filter
-    regime = regime_type(std, vol)
-    if regime == "Trending":
-        logging.debug(f"{sym}: Market trending, skipping")
-        return None
     
     rsi = compute_rsi(closes)
     bb_lower, bb_upper = compute_bollinger_bands(closes)
@@ -415,7 +415,7 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=True):
     bb_signal_long = bb_lower is not None and px < bb_lower
     bb_signal_short = bb_upper is not None and px > bb_upper
     macd_signal_long = macd_line is not None and macd_line > signal_line
-    macd_signal_short = macd_line is not none and macd_line < signal_line
+    macd_signal_short = macd_line is not None and macd_line < signal_line
     
     if px < 0.1:
         if rsi_signal_long or bb_signal_long or macd_signal_long:
@@ -546,8 +546,8 @@ def main():
         config_info = (f"📊 Position threshold: {POSITION_THRESHOLD}\n"
                        f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
                        f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
-                       f"📏 Grid height: {GRID_HEIGHT*100}% for small coins | 🧮 Default grids: {GRIDS_AMOUNT}\n"
-                       f"💡 Simulation: $100 capital, 10x leverage (orders sized for $1,000 effective capital)\n")
+                       f"📏 Grid height: {GRID_HEIGHT*100}% | 🧮 Default grids: {GRIDS_AMOUNT}\n"
+                       f"💰 Capital: $100 | 📈 Leverage: 10x\n")
         
         for i, (score, r) in enumerate(scored, 1):
             m = start_msg(r, i)
