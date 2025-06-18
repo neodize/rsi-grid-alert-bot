@@ -143,20 +143,35 @@ def fetch_closes(sym, interval="5M", limit=100):
         
         closes = []
         for i, k in enumerate(klines):
-            if isinstance(k, (list, tuple)) and len(k) > 4:
-                try:
-                    close = float(k[4])  # 5th element should be close price
+            try:
+                # Handle both dictionary format (current API) and array format
+                if isinstance(k, dict):
+                    # Dictionary format: {'close': '0.04586', ...}
+                    close_str = k.get('close')
+                    if close_str:
+                        close = float(close_str)
+                        if close > 0:
+                            closes.append(close)
+                            if i < 3:  # Debug first 3
+                                print(f"    Kline {i+1}: Close = {close} (from dict)")
+                                sys.stdout.flush()
+                elif isinstance(k, (list, tuple)) and len(k) > 4:
+                    # Array format: [timestamp, open, high, low, close, volume]
+                    close = float(k[4])
                     if close > 0:
                         closes.append(close)
                         if i < 3:  # Debug first 3
-                            print(f"    Kline {i+1}: Close = {close}")
+                            print(f"    Kline {i+1}: Close = {close} (from array)")
                             sys.stdout.flush()
-                except (ValueError, TypeError) as e:
+                else:
+                    if i < 3:  # Only log first few to avoid spam
+                        print(f"    ❌ Unknown kline format {i+1}: {type(k)} - {k}")
+                        sys.stdout.flush()
+                        
+            except (ValueError, TypeError) as e:
+                if i < 3:  # Only log first few errors
                     print(f"    ❌ Error parsing kline {i+1}: {e}")
                     sys.stdout.flush()
-            else:
-                print(f"    ❌ Invalid kline {i+1}: {k}")
-                sys.stdout.flush()
         
         print(f"  ✅ {sym}: Extracted {len(closes)} valid closes")
         if len(closes) > 0:
