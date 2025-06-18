@@ -1,32 +1,48 @@
 import time
 import requests
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import math
 
 # Configuration
 DEBUG_MODE = True
-MAX_WORKERS = 10  # Restored to original value
-REQUEST_DELAY = 0.1  # Back to original faster delay
-BATCH_SIZE = 30  # Back to original batch size
+MAX_WORKERS = 10
+REQUEST_DELAY = 0.1
+BATCH_SIZE = 30
 TELEGRAM_MAX_LENGTH = 4000
 MAX_SIGNALS_PER_MESSAGE = 50
 
 # API Configuration - No API keys needed for public data!
 API_BASE = "https://api.pionex.com"
 
-# Telegram Configuration - IMPORTANT: Fill these in!
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"     # Get from @BotFather on Telegram
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"     # Your Telegram chat ID
+# Telegram Configuration - Using environment variables for security
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # Trading Configuration
-VOL_THRESHOLD = 5.0
+VOL_THRESHOLD = 0.5
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 
 # Rate limiting
 request_lock = Lock()
 last_request_time = 0
+
+def check_telegram_config():
+    """Check if Telegram configuration is properly set."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ TELEGRAM CONFIGURATION MISSING!")
+        print("📋 To configure Telegram notifications:")
+        print("   1. Create a bot: Message @BotFather on Telegram")
+        print("   2. Get your chat ID: Message @userinfobot on Telegram")
+        print("   3. Set environment variables:")
+        print("      export TELEGRAM_BOT_TOKEN='your_bot_token_here'")
+        print("      export TELEGRAM_CHAT_ID='your_chat_id_here'")
+        print("   4. Or create a .env file with these variables")
+        print()
+        return False
+    return True
 
 def rate_limited_request(url, params, timeout=15, max_retries=5):
     """Make rate-limited API requests with exponential backoff - no auth needed for public data."""
@@ -353,11 +369,11 @@ def analyze_symbol(symbol):
         return None
 
 def send_telegram(message):
-    """Send message to Telegram."""
+    """Send message to Telegram using environment variables."""
     try:
-        if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
-            print("⚠️ Telegram not configured - add your TELEGRAM_TOKEN and TELEGRAM_CHAT_ID")
-            print(f"📱 Would send: {message[:100]}...")
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            print("⚠️ Telegram not configured - printing message instead:")
+            print(f"📱 {message[:200]}...")
             return True  # Return True to not block the flow during testing
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -440,14 +456,67 @@ def send_telegram_optimized(signals):
     except Exception as e:
         print(f"❌ Error in Telegram batch sending: {e}")
 
+def create_env_template():
+    """Create a .env template file for easy configuration."""
+    env_content = """# RSI Trading Bot Configuration
+# Copy this file to .env and fill in your values
+
+# Telegram Bot Configuration
+# 1. Message @BotFather on Telegram to create a bot
+# 2. Copy the bot token here (without quotes)
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+
+# 3. Message @userinfobot on Telegram to get your chat ID
+# 4. Copy your chat ID here (without quotes)
+TELEGRAM_CHAT_ID=your_chat_id_here
+
+# Example:
+# TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+# TELEGRAM_CHAT_ID=123456789
+"""
+    
+    try:
+        with open('.env.template', 'w') as f:
+            f.write(env_content)
+        print("📝 Created .env.template file for easy configuration")
+    except Exception as e:
+        print(f"⚠️ Could not create .env.template: {e}")
+
+def load_env_file():
+    """Load environment variables from .env file if it exists."""
+    try:
+        if os.path.exists('.env'):
+            with open('.env', 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ[key.strip()] = value.strip()
+            print("✅ Loaded configuration from .env file")
+            return True
+    except Exception as e:
+        print(f"⚠️ Error loading .env file: {e}")
+    return False
+
 def main_scan():
     """Main scanning function."""
     print("🚀 RSI BOT - FULL SCAN")
     print("=" * 50)
     
+    # Load .env file if it exists
+    load_env_file()
+    
+    # Update global variables with loaded env vars
+    global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+    
     # Check Telegram configuration
-    if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN":
-        print("⚠️ WARNING: Telegram not configured - signals will be printed only")
+    telegram_configured = check_telegram_config()
+    if not telegram_configured:
+        create_env_template()
+        print("📋 You can continue without Telegram (signals will be printed)")
+        print()
     
     # Fetch symbols
     symbols = fetch_symbols_safe()
@@ -522,8 +591,15 @@ if __name__ == "__main__":
     print("🤖 RSI Trading Bot Starting...")
     print("=" * 50)
     
+    # Load environment configuration
+    load_env_file()
+    
+    # Update global variables
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+    
     print("🔧 Configuration Check:")
-    print(f"   Telegram: {'✅ Configured' if TELEGRAM_TOKEN != 'YOUR_BOT_TOKEN' else '❌ Not configured'}")
+    print(f"   Telegram: {'✅ Configured' if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else '❌ Not configured'}")
     print(f"   RSI Oversold: {RSI_OVERSOLD}")
     print(f"   RSI Overbought: {RSI_OVERBOUGHT}")
     print(f"   Volatility Threshold: {VOL_THRESHOLD}%")
