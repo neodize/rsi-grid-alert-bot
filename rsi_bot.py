@@ -659,13 +659,17 @@ def main():
     if mode == "1":
         rsi_bot_main()
     elif mode == "2":
-        token = ""
+        # Use a default token if no input is provided.
+        default_token = "NXPCUSDTPERP"
         try:
-            token = input("Enter token symbol (e.g., NXPCUSDTPERP): ").strip().upper()
+            token = input("Enter token symbol (default '{}'): ".format(default_token)).strip().upper()
+            if not token:
+                logging.info("No token provided. Using default token: %s", default_token)
+                token = default_token
         except EOFError:
-            logging.warning("No token input received. Exiting.")
-            sys.exit(1)
-        interval = ""
+            logging.warning("No token input received. Using default token: %s", default_token)
+            token = default_token
+        
         try:
             interval = input("Enter candle interval (default '5M'): ").strip() or "5M"
         except EOFError:
