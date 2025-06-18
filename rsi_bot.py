@@ -17,18 +17,23 @@ STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
 VOL_THRESHOLD = 2.5
 
+# RELAXED THRESHOLDS FOR TESTING
+POSITION_THRESHOLD = 0.4  # Relaxed from 0.25/0.75 to 0.4/0.6
+RSI_OVERSOLD = 40         # Relaxed from 30/35
+RSI_OVERBOUGHT = 60       # Relaxed from 65/70
+REQUIRE_ALL_INDICATORS = False  # Allow 2 out of 3 indicators instead of all 3
+
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
 EXCL = {"LUNA", "LUNC", "USTC"}
 ZONE_EMO = {"Long": "🟢 Long", "Short": "🔴 Short"}
 last_trade_time = {}
 
-# Enhanced logging with debug level
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ── TELEGRAM ────────────────────────────────────────
 def tg(msg):
-    logging.info(f"Attempting to send Telegram message: {msg[:100]}...")
+    logging.info(f"Sending Telegram message: {msg[:100]}...")
     if not TG_TOKEN or not TG_CHAT_ID:
         logging.warning("Telegram token or chat ID not configured")
         return False
@@ -48,10 +53,8 @@ def tg(msg):
 # ── SYMBOL FETCHING ─────────────────────────────────
 def valid(sym):
     u = sym.upper()
-    is_valid = (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
-                not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
-    logging.debug(f"Symbol {sym} valid: {is_valid}")
-    return is_valid
+    return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
+            not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
 
 def fetch_symbols():
     logging.info("Fetching symbols...")
@@ -59,20 +62,14 @@ def fetch_symbols():
         r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        logging.debug(f"API response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
         
         tickers = data.get("data", {}).get("tickers", [])
         logging.info(f"Total tickers received: {len(tickers)}")
         
-        pairs = []
-        for t in tickers:
-            if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD:
-                pairs.append(t)
-                logging.debug(f"Valid pair: {t['symbol']} with volume {t.get('amount', 0)}")
-        
+        pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
         pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
         symbols = [p["symbol"] for p in pairs][:TOP_N]
-        logging.info(f"Selected {len(symbols)} symbols: {symbols[:10]}...")
+        logging.info(f"Selected {len(symbols)} symbols")
         return symbols
     except Exception as e:
         logging.error(f"Error fetching symbols: {e}")
@@ -80,7 +77,6 @@ def fetch_symbols():
 
 # ── FETCH CLOSES WITH LIMIT ─────────────────────────
 def fetch_closes(sym, interval="5M", limit=400):
-    logging.debug(f"Fetching closes for {sym}, interval={interval}, limit={limit}")
     try:
         r = requests.get(
             f"{API}/market/klines",
@@ -98,7 +94,6 @@ def fetch_closes(sym, interval="5M", limit=400):
             elif isinstance(k, (list, tuple)) and len(k) >= 5:
                 closes.append(float(k[4]))
         
-        logging.debug(f"Fetched {len(closes)} closes for {sym}")
         return closes
     except Exception as e:
         logging.error(f"Error fetching closes for {sym}: {e}")
@@ -106,9 +101,7 @@ def fetch_closes(sym, interval="5M", limit=400):
 
 # ── ANALYSIS FUNCTIONS ──────────────────────────────
 def compute_std_dev(closes, period=30):
-    result = float(np.std(closes[-period:])) if len(closes) >= period else 0
-    logging.debug(f"Computed std_dev: {result}")
-    return result
+    return float(np.std(closes[-period:])) if len(closes) >= period else 0
 
 def compute_cooldown(vol_pct, std_dev):
     base = 300
@@ -122,8 +115,6 @@ def should_trigger(sym, vol_pct, std_dev):
     time_since_last = now - last_time
     should_trigger_result = time_since_last >= cooldown
     
-    logging.debug(f"Cooldown check for {sym}: time_since_last={time_since_last:.0f}s, cooldown={cooldown:.0f}s, should_trigger={should_trigger_result}")
-    
     if should_trigger_result:
         last_trade_time[sym] = now
         return True
@@ -132,11 +123,9 @@ def should_trigger(sym, vol_pct, std_dev):
 def calculate_grids(rng, px, spacing, vol):
     base = rng / (px * spacing / 100)
     if vol < 1.5:
-        result = max(4, min(200, math.floor(base / 2)))
+        return max(4, min(200, math.floor(base / 2)))
     else:
-        result = max(10, min(200, math.floor(base)))
-    logging.debug(f"Calculated grids: {result}")
-    return result
+        return max(10, min(200, math.floor(base)))
 
 def grid_type_hint(rng_pct, vol):
     if rng_pct < 1.5 and vol < 1.2:
@@ -147,15 +136,13 @@ def money(p):
     return f"${p:.8f}" if p < 0.1 else f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
 def score_signal(d):
-    score = round(
+    return round(
         d["vol"] * 2 +
         ((200 - d["grids"]) / 200) * 10 +
         ((1.5 - min(d["spacing"], 1.5)) * 15) +
         (1.5 / max(d["cycle"], 0.1)) * 10,
         1
     )
-    logging.debug(f"Calculated score for {d['symbol']}: {score}")
-    return score
 
 # ── STATE MANAGEMENT ────────────────────────────────
 def load_state():
@@ -188,13 +175,17 @@ def start_msg(d, rank=None):
     minutes = int((remaining_seconds % 3600) // 60)
     cycle_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
+    
+    # Add relaxed conditions warning
+    warning = "\n⚠️ *RELAXED CONDITIONS ACTIVE* - Review before trading!"
+    
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
             f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
-            f"🔧 Grid Mode Hint: {mode}")
+            f"🔧 Grid Mode Hint: {mode}{warning}")
 
 def stop_msg(sym, reason, info):
     closes = fetch_closes(sym, interval="5M", limit=1)
@@ -288,29 +279,23 @@ def regime_type(std_dev, vol):
         return "Sideways"
     return "Normal"
 
-# ── UPDATED ANALYSE FUNCTION ─────────────────────────
+# ── RELAXED ANALYSE FUNCTION ─────────────────────────
 def analyse(sym, interval="5M", limit=400):
-    logging.debug(f"Analyzing {sym} with interval {interval}")
     closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
-        logging.debug(f"Insufficient data for {sym}: {len(closes)} closes")
         return None
     
     low, high = min(closes), max(closes)
     px = closes[-1]
     rng = high - low
     
-    logging.debug(f"{sym}: low={low}, high={high}, current={px}, range={rng}")
-    
     if rng <= 0 or px == 0:
-        logging.debug(f"Invalid range or price for {sym}")
         return None
     
     pos = (px - low) / rng
-    logging.debug(f"{sym}: position in range = {pos:.3f}")
     
-    # Only trade if price is closer to one extreme
-    if 0.25 <= pos <= 0.75:
+    # RELAXED: Allow more centered positions
+    if POSITION_THRESHOLD <= pos <= (1 - POSITION_THRESHOLD):
         logging.debug(f"{sym}: Price too centered in range ({pos:.3f}), skipping")
         return None
     
@@ -321,54 +306,58 @@ def analyse(sym, interval="5M", limit=400):
     grids = calculate_grids(rng, px, spacing, vol)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     
-    logging.debug(f"{sym}: vol={vol:.2f}%, std={std:.5f}, spacing={spacing:.2f}%, grids={grids}, cycle={cycle}")
-    
     if cycle > CYCLE_MAX or cycle <= 0:
-        logging.debug(f"{sym}: Invalid cycle {cycle}, skipping")
         return None
     
     # Dynamically adjust range if price is outside the buffer
     if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
-        old_low, old_high = low, high
         low = min(px, low * 0.95)
         high = max(px, high * 1.05)
-        logging.debug(f"{sym}: Adjusted range from [{old_low}, {old_high}] to [{low}, {high}]")
     
     # Compute additional indicators
     rsi = compute_rsi(closes)
     bb_lower, bb_upper = compute_bollinger_bands(closes)
     macd_line, signal_line, macd_hist = compute_macd(closes)
     
-    logging.debug(f"{sym}: RSI={rsi:.1f}, BB=[{bb_lower:.4f}, {bb_upper:.4f}], MACD={macd_line:.4f}")
-    
-    # Determine current market regime
+    # RELAXED entry conditions
     regime = regime_type(std, vol)
     
-    # Dynamic thresholds
-    if regime == "Trending":
-        rsi_long_threshold = 35
-        rsi_short_threshold = 65
-    elif regime == "Sideways":
-        rsi_long_threshold = 30
-        rsi_short_threshold = 70
-    else:  # Normal regime
-        rsi_long_threshold = 30
-        rsi_short_threshold = 70
+    # More lenient RSI thresholds
+    rsi_long_threshold = RSI_OVERSOLD
+    rsi_short_threshold = RSI_OVERBOUGHT
     
-    # Evaluate combined entry conditions
-    macd_confirm_long = macd_line is not None and macd_line > signal_line
-    macd_confirm_short = macd_line is not None and macd_line < signal_line
+    # Check individual indicators
+    rsi_signal_long = rsi < rsi_long_threshold
+    rsi_signal_short = rsi > rsi_short_threshold
     
-    zone_check = None
-    if rsi < rsi_long_threshold and bb_lower is not None and px < bb_lower and macd_confirm_long:
-        zone_check = "Long"
-        logging.debug(f"{sym}: Long signal - RSI:{rsi:.1f}<{rsi_long_threshold}, px:{px:.4f}<BB_lower:{bb_lower:.4f}, MACD_long:{macd_confirm_long}")
-    elif rsi > rsi_short_threshold and bb_upper is not None and px > bb_upper and macd_confirm_short:
-        zone_check = "Short"
-        logging.debug(f"{sym}: Short signal - RSI:{rsi:.1f}>{rsi_short_threshold}, px:{px:.4f}>BB_upper:{bb_upper:.4f}, MACD_short:{macd_confirm_short}")
+    bb_signal_long = bb_lower is not None and px < bb_lower
+    bb_signal_short = bb_upper is not None and px > bb_upper
+    
+    macd_signal_long = macd_line is not None and macd_line > signal_line
+    macd_signal_short = macd_line is not None and macd_line < signal_line
+    
+    # RELAXED: Require only 2 out of 3 indicators OR all 3 if REQUIRE_ALL_INDICATORS is True
+    if REQUIRE_ALL_INDICATORS:
+        # Original strict logic
+        if rsi_signal_long and bb_signal_long and macd_signal_long:
+            zone_check = "Long"
+        elif rsi_signal_short and bb_signal_short and macd_signal_short:
+            zone_check = "Short"
+        else:
+            return None
     else:
-        logging.debug(f"{sym}: No signal - RSI:{rsi:.1f}, regime:{regime}, MACD_long:{macd_confirm_long}, MACD_short:{macd_confirm_short}")
-        return None
+        # Relaxed logic: 2 out of 3 indicators
+        long_signals = sum([rsi_signal_long, bb_signal_long, macd_signal_long])
+        short_signals = sum([rsi_signal_short, bb_signal_short, macd_signal_short])
+        
+        if long_signals >= 2:
+            zone_check = "Long"
+            logging.info(f"{sym}: Long signal - RSI:{rsi_signal_long}, BB:{bb_signal_long}, MACD:{macd_signal_long} ({long_signals}/3)")
+        elif short_signals >= 2:
+            zone_check = "Short"
+            logging.info(f"{sym}: Short signal - RSI:{rsi_signal_short}, BB:{bb_signal_short}, MACD:{macd_signal_short} ({short_signals}/3)")
+        else:
+            return None
     
     result = dict(
         symbol=sym,
@@ -387,34 +376,32 @@ def analyse(sym, interval="5M", limit=400):
     return result
 
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    logging.debug(f"Scanning {sym} with fallback")
     r60 = analyse(sym, interval="60M", limit=200)
     if not r60:
-        logging.debug(f"{sym}: No 60M signal")
         return None
     
     if r60["vol"] >= vol_threshold:
-        logging.debug(f"{sym}: High volatility ({r60['vol']}%), checking 5M")
         r5 = analyse(sym, interval="5M", limit=400)
         if r5 and should_trigger(sym, r5["vol"], r5["std"]):
-            logging.info(f"{sym}: 5M signal confirmed")
             return r5
-        logging.debug(f"{sym}: 5M signal not confirmed or cooldown active")
         return None
     elif should_trigger(sym, r60["vol"], r60["std"]):
-        logging.info(f"{sym}: 60M signal confirmed")
         return r60
     
-    logging.debug(f"{sym}: 60M signal not confirmed or cooldown active")
     return None
 
 # ── MAIN FUNCTION ───────────────────────────────────
 def main():
-    logging.info("=== Starting RSI Bot Scan ===")
+    logging.info("=== Starting RSI Bot Scan (RELAXED CONDITIONS) ===")
     
-    # Test Telegram connection
+    # Send startup message with configuration
     if TG_TOKEN and TG_CHAT_ID:
-        tg("🤖 RSI Bot started - scanning for opportunities...")
+        startup_msg = (f"🤖 RSI Bot started with RELAXED conditions\n"
+                      f"📊 Position threshold: {POSITION_THRESHOLD} (was 0.25)\n"
+                      f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT} (was 30/70)\n"
+                      f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
+                      f"🔍 Scanning {TOP_N} symbols...")
+        tg(startup_msg)
     
     prev = load_state()
     nxt, scored, stops = {}, [], []
@@ -428,9 +415,7 @@ def main():
     logging.info(f"Scanning {len(symbols)} symbols...")
     
     signals_found = 0
-    for i, sym in enumerate(symbols):
-        logging.debug(f"Processing symbol {i+1}/{len(symbols)}: {sym}")
-        
+    for i, sym in enumerate(symbols):        
         res = scan_with_fallback(sym)
         if not res:
             continue
@@ -498,9 +483,9 @@ def main():
         logging.info(f"Sent {len(scored)} new signals")
     else:
         logging.info("No new signals to send")
-        # Send a status message if no signals found
         if TG_TOKEN and TG_CHAT_ID:
-            tg(f"📊 Scan completed - {len(symbols)} symbols checked, no new opportunities found")
+            tg(f"📊 Scan completed - {len(symbols)} symbols checked, no new opportunities found\n"
+               f"⚙️ Try adjusting thresholds if this persists")
 
     # Send stop alerts
     if stops:
