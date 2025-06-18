@@ -50,6 +50,11 @@ def fetch_ohlcv(symbol, interval="5M", limit=100):
     
     data = response.json().get("data", {})
     klines = data.get("klines") if isinstance(data, dict) else data
+
+    if not klines:
+        logging.error("No 'klines' found in response. Full response: %s", response.json())
+        sys.exit(1)
+        
     ohlcv = []
     for k in klines:
         if isinstance(k, dict) and "close" in k:
@@ -73,7 +78,7 @@ def fetch_ohlcv(symbol, interval="5M", limit=100):
         ohlcv.append(candle)
     
     if not ohlcv:
-        logging.error("No valid OHLCV data received.")
+        logging.error("No valid OHLCV data received after parsing.")
         sys.exit(1)
     return ohlcv
 
