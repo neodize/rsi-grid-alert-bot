@@ -7,20 +7,20 @@ TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).stri
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
 API = "https://api.pionex.com/api/v1"
-TOP_N = 100
-MIN_NOTIONAL_USD = 1_000_000
-SPACING_MIN = 0.3
+# TOP_N = 100  # Removed to scan all valid pairs
+MIN_NOTIONAL_USD = 100_000  # Lowered for more small coins
+SPACING_MIN = 0.5  # Increased for low-priced coins
 SPACING_MAX = 1.2
 SPACING_TARGET = 0.75
-CYCLE_MAX = 3.0
+CYCLE_MAX = 3.0  # Increased for longer cycles
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
-VOL_THRESHOLD = 2.0
-GRID_HEIGHT = 0.05  # 5% of current price as total range width
-GRIDS_AMOUNT = 21   # Default number of grids (optional fixed value)
+VOL_THRESHOLD = 1.5  # Lowered for more opportunities
+GRID_HEIGHT = 0.10  # Increased for small coins
+GRIDS_AMOUNT = 21
 
-# RELAXED THRESHOLDS FOR TESTING
-POSITION_THRESHOLD = 0.3
+# RELAXED THRESHOLDS
+POSITION_THRESHOLD = 0.3  # Relaxed for more signals
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 REQUIRE_ALL_INDICATORS = False
@@ -68,7 +68,7 @@ def fetch_symbols():
         logging.info(f"Total tickers received: {len(tickers)}")
         pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
         pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
-        symbols = [p["symbol"] for p in pairs][:TOP_N]
+        symbols = [p["symbol"] for p in pairs]  # Removed TOP_N cap
         logging.info(f"Selected {len(symbols)} symbols")
         return symbols
     except Exception as e:
@@ -121,6 +121,8 @@ def calculate_grids(rng, px, spacing, vol, use_fixed_grids=False):
     if use_fixed_grids:
         return GRIDS_AMOUNT
     base = rng / (px * spacing / 100)
+    if px < 0.01:  # Adjust for very low-priced coins
+        base *= 2
     if vol < 1.5:
         return max(4, min(200, math.floor(base / 2)))
     else:
@@ -143,39 +145,76 @@ def score_signal(d):
         1
     )
 
-def simulate_grid_orders(sym, low, high, grids, spacing, px, account_allocation=0.5):
+def compute_atr(sym, closes, period=14):
+    try:
+        r = requests.get(
+            f"{API}/market/klines",
+            params={"symbol": sym, "interval": "5M", "limit": period + 1, "type": "PERP"},
+            timeout=10
+        )
+        r.raise_for_status()
+        kl = r.json().get("data", {}).get("klines", [])
+        if len(kl) < period + 1:
+            return None
+        trs = []
+        for i in range(1, len(kl)):
+            high = float(kl[i]["high"])
+            low = float(kl[i]["low"])
+            prev_close = float(kl[i-1]["close"])
+            tr = max(high - low, abs(high - prev_close), abs(prev_close - low))
+            trs.append(tr)
+        return np.mean(trs)
+    except Exception as e:
+        logging.error(f"Error computing ATR for {sym}: {e}")
+        return None
+
+def simulate_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, leverage=10):
     orders = []
     interval = (high - low) / (grids - 1) if grids > 1 else (high - low)
     grid_levels = [low + i * interval for i in range(grids)]
     base_currency = sym.split('_')[0]
-    quote_currency = sym.split('_')[1]
-    order_size = (1000 * account_allocation) / (px * sum(1 for level in grid_levels if level < px or px == level))
-    
+    # Calculate leveraged position size
+    effective_capital = capital * leverage
+    num_buy_grids = sum(1 for level in grid_levels if level <= px) or 1
+    order_size = (effective_capital / num_buy_grids) / px  # In base currency
+    atr = compute_atr(sym, closes)
+    stop_reason = None
+    if atr:
+        if px > high + 2 * atr:
+            stop_reason = f"Price {money(px)} above upper limit {money(high)} + 2*ATR {money(2*atr)}"
+        elif px < low - 2 * atr:
+            stop_reason = f"Price {money(px)} below lower limit {money(low)} - 2*ATR {money(2*atr)}"
+    if stop_reason:
+        logging.info(f"Bot stop triggered for {sym}: {stop_reason}")
+        tg(f"🛑 Stop Grid Bot: {sym}\n📉 Reason: {stop_reason}\n📊 Range: {money(low)} – {money(high)}\n💱 Current Price: {money(px)}")
+        return [], stop_reason
     for level in grid_levels:
         try:
-            if level < px:
+            if level <= px:
                 order = {
                     'symbol': sym,
                     'type': 'limit',
                     'side': 'buy',
                     'amount': order_size,
-                    'price': level
+                    'price': level,
+                    'leverage': leverage
                 }
                 orders.append(order)
-                logging.info(f"Simulated buy order for {sym} at {money(level)}: {order_size:.6f} {base_currency}")
-            elif level > px:
+                logging.info(f"Simulated buy order for {sym} at {money(level)}: {order_size:.6f} {base_currency} (leverage: {leverage}x)")
+            else:
                 order = {
                     'symbol': sym,
                     'type': 'limit',
                     'side': 'sell',
                     'amount': order_size,
-                    'price': level
+                    'price': level,
+                    'leverage': leverage
                 }
                 orders.append(order)
-                logging.info(f"Simulated sell order for {sym} at {money(level)}: {order_size:.6f} {base_currency}")
+                logging.info(f"Simulated sell order for {sym} at {money(level)}: {order_size:.6f} {base_currency} (leverage: {leverage}x)")
         except Exception as e:
             logging.error(f"Error simulating order for {sym} at {money(level)}: {e}")
-    return orders
+    return orders, None
 
 # ── STATE MANAGEMENT ────────────────────────────────
 def load_state():
@@ -309,15 +348,17 @@ def regime_type(std_dev, vol):
     return "Normal"
 
 # ── RELAXED ANALYSE FUNCTION ─────────────────────────
-def analyse(sym, interval="5M", limit=400, use_grid_height=False):
+def analyse(sym, interval="5M", limit=400, use_grid_height=True):
     closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
         return None
     
     px = closes[-1]
+    # Adjust GRID_HEIGHT for small coins
+    grid_height = 0.10 if px < 0.01 else 0.05
     if use_grid_height:
-        low = px * (1 - GRID_HEIGHT / 2)
-        high = px * (1 + GRID_HEIGHT / 2)
+        low = px * (1 - grid_height / 2)
+        high = px * (1 + grid_height / 2)
         rng = high - low
     else:
         low, high = min(closes), max(closes)
@@ -336,7 +377,9 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=False):
     vol = rng / px * 100
     vf = max(0.1, vol + std * 100)
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
-    grids = calculate_grids(rng, px, spacing, vol, use_fixed_grids=use_grid_height)
+    # Use dynamic grids for high volatility or small coins
+    use_fixed_grids = use_grid_height and not (px < 0.01 or vol > 5)
+    grids = calculate_grids(rng, px, spacing, vol, use_fixed_grids)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     
     if cycle > CYCLE_MAX or cycle <= 0:
@@ -381,6 +424,11 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=False):
         else:
             return None
     
+    # Simulate orders with leverage
+    orders, stop_reason = simulate_grid_orders(sym, low, high, grids, spacing, px, closes, capital=100, leverage=10)
+    if stop_reason:
+        return None
+    
     result = dict(
         symbol=sym,
         zone=zone_check,
@@ -391,12 +439,9 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=False):
         spacing=round(spacing, 2),
         vol=round(vol, 1),
         std=round(std, 5),
-        cycle=cycle
+        cycle=cycle,
+        orders=orders
     )
-    
-    # Simulate grid orders if a valid signal is found
-    orders = simulate_grid_orders(sym, low, high, grids, spacing, px)
-    result['orders'] = orders
     
     logging.info(f"Valid signal found for {sym}: {zone_check} zone, vol={vol:.1f}%, score={score_signal(result)}")
     return result
@@ -489,7 +534,8 @@ def main():
         config_info = (f"📊 Position threshold: {POSITION_THRESHOLD}\n"
                       f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
                       f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
-                      f"📏 Grid height: {GRID_HEIGHT*100}% | 🧮 Default grids: {GRIDS_AMOUNT}\n\n")
+                      f"📏 Grid height: {GRID_HEIGHT*100}% | 🧮 Default grids: {GRIDS_AMOUNT}\n"
+                      f"💰 Capital: $100 | 📈 Leverage: 10x\n")
         
         for i, (score, r) in enumerate(scored, 1):
             m = start_msg(r, i)
