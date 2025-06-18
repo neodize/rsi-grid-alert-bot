@@ -1,445 +1,424 @@
-import os, json, math, logging, time, requests
-import numpy as np
-from pathlib import Path
-import sys
+import time
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import math
 
-# ── ENV + CONFIG ─────────────────────────────────────
-TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
+# Configuration
+DEBUG_MODE = True  # Changed to True for better debugging
+MAX_WORKERS = 10  # Increased for better throughput
+REQUEST_DELAY = 0.1  # Reduced delay for faster processing
+BATCH_SIZE = 30  # Increased batch size
+TELEGRAM_MAX_LENGTH = 4000  # Leave some buffer for Telegram's 4096 limit
+MAX_SIGNALS_PER_MESSAGE = 50  # Much higher limit for signals per message
 
-API = "https://api.pionex.com/api/v1"
-STATE_FILE = Path("active_grids.json")
+# Rate limiting
+request_lock = Lock()
+last_request_time = 0
 
-# EXTREMELY relaxed thresholds for debugging
-VOL_THRESHOLD = 0.1    # 0.1% minimum volatility
-RSI_OVERSOLD = 45      # Buy when RSI >= 45
-RSI_OVERBOUGHT = 55    # Sell when RSI <= 55
-DEBUG_MODE = True
-
-print(f"🐛 ENHANCED DEBUG MODE: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} (Short), RSI≥{RSI_OVERSOLD} (Long)")
-sys.stdout.flush()
-
-# ── TELEGRAM NOTIFICATION ───────────────────────────
-def tg(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("❌ Missing Telegram credentials")
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"❌ Telegram error: {e}")
-        return False
-
-# ── SYMBOL FETCHING ──────────────────────────────────
-def fetch_symbols():
-    """Get symbols with debug info."""
-    try:
-        print("🔍 Fetching symbols from API...")
-        sys.stdout.flush()
-        
-        r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=15)
-        print(f"📡 API Response status: {r.status_code}")
-        sys.stdout.flush()
-        
-        if r.status_code != 200:
-            print(f"❌ API Error: {r.status_code}")
-            print(f"❌ Response text: {r.text[:500]}")
-            sys.stdout.flush()
-            return []
-        
-        data = r.json()
-        print(f"🔍 API Response keys: {list(data.keys())}")
-        sys.stdout.flush()
-        
-        tickers = data.get("data", {}).get("tickers", [])
-        print(f"📊 Raw tickers count: {len(tickers)}")
-        sys.stdout.flush()
-        
-        if len(tickers) > 0:
-            print(f"📋 First ticker sample: {tickers[0]}")
-            sys.stdout.flush()
-        
-        symbols = []
-        for i, t in enumerate(tickers[:10]):  # Check first 10 in detail
-            if isinstance(t, dict) and 'symbol' in t:
-                symbols.append(t["symbol"])
+def rate_limited_request(url, params, timeout=15, max_retries=5):
+    """Make rate-limited API requests with exponential backoff."""
+    global last_request_time
+    
+    for attempt in range(max_retries):
+        try:
+            # Rate limiting with lock
+            with request_lock:
+                current_time = time.time()
+                time_since_last = current_time - last_request_time
+                if time_since_last < REQUEST_DELAY:
+                    time.sleep(REQUEST_DELAY - time_since_last)
+                last_request_time = time.time()
+            
+            response = requests.get(url, params=params, timeout=timeout)
+            
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 429:  # Rate limited
+                wait_time = min(2 ** attempt, 60)  # Max 60 seconds
+                print(f"⏳ Rate limited, waiting {wait_time}s (attempt {attempt + 1})")
+                time.sleep(wait_time)
+                continue
+            elif response.status_code in [500, 502, 503, 504]:  # Server errors
+                wait_time = min(2 ** attempt, 30)
+                print(f"🔄 Server error {response.status_code}, retrying in {wait_time}s")
+                time.sleep(wait_time)
+                continue
+            else:
                 if DEBUG_MODE:
-                    print(f"   {i+1:2d}: {t['symbol']:<15} - Close: {t.get('close', 'N/A')}")
-                    sys.stdout.flush()
-        
-        print(f"✅ Extracted {len(symbols)} symbols from first 10")
-        sys.stdout.flush()
-        
-        # Get more symbols
-        for t in tickers[10:]:
-            if isinstance(t, dict) and 'symbol' in t:
-                symbols.append(t["symbol"])
-        
-        print(f"✅ Total symbols extracted: {len(symbols)}")
-        limited_symbols = symbols[:5]  # Focus on just 5 for detailed debug
-        print(f"🎯 Will analyze these {len(limited_symbols)} symbols: {limited_symbols}")
-        sys.stdout.flush()
-        
-        return limited_symbols
-        
-    except Exception as e:
-        print(f"❌ Exception fetching symbols: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
-        return []
+                    print(f"❌ HTTP {response.status_code} for {params.get('symbol', 'unknown')}: {response.text[:100]}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            wait_time = min(2 ** attempt, 30)
+            if DEBUG_MODE:
+                print(f"⏰ Timeout for {params.get('symbol', 'unknown')}, retrying in {wait_time}s (attempt {attempt + 1})")
+            time.sleep(wait_time)
+            continue
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                if DEBUG_MODE:
+                    print(f"❌ Request failed after {max_retries} attempts for {params.get('symbol', 'unknown')}: {e}")
+                return None
+            time.sleep(2 ** attempt)
+    
+    return None
 
-# ── PRICE DATA FETCHING ──────────────────────────────
-def fetch_closes(sym, interval="5M", limit=100):
-    """Fetch closes with enhanced debug."""
+def fetch_closes_safe(sym, interval="5M", limit=100):
+    """Safely fetch closes with proper rate limiting."""
     try:
-        print(f"  📥 Fetching {sym} klines data...")
-        sys.stdout.flush()
-        
         url = f"{API}/market/klines"
-        params = {
-            "symbol": sym, 
-            "interval": interval, 
-            "limit": limit, 
-            "type": "PERP"
-        }
-        print(f"  📡 Request URL: {url}")
-        print(f"  📡 Request params: {params}")
-        sys.stdout.flush()
+        params = {"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"}
         
-        r = requests.get(url, params=params, timeout=15)
-        print(f"  📡 Response status: {r.status_code}")
-        sys.stdout.flush()
-        
-        if r.status_code != 200:
-            print(f"    ❌ HTTP {r.status_code} for {sym}")
-            print(f"    ❌ Response: {r.text[:200]}")
-            sys.stdout.flush()
+        response = rate_limited_request(url, params)
+        if not response:
+            if DEBUG_MODE:
+                print(f"❌ No response for {sym}")
             return []
         
-        data = r.json()
-        print(f"  📊 Response keys: {list(data.keys())}")
-        sys.stdout.flush()
-        
+        data = response.json()
+        if DEBUG_MODE and 'error' in data:
+            print(f"❌ API Error for {sym}: {data.get('error', 'Unknown error')}")
+            
         klines = data.get("data", {}).get("klines", [])
-        print(f"  📊 {sym}: Got {len(klines)} klines")
-        sys.stdout.flush()
-        
-        if not klines:
-            print(f"    ⚠️  No klines data for {sym}")
-            sys.stdout.flush()
-            return []
-        
-        # Debug first few klines structure
-        print(f"  📋 First 3 klines structure:")
-        for i, k in enumerate(klines[:3]):
-            print(f"    {i+1}: {k} (type: {type(k)}, len: {len(k) if hasattr(k, '__len__') else 'N/A'})")
-            sys.stdout.flush()
         
         closes = []
-        for i, k in enumerate(klines):
-            try:
-                # Handle both dictionary format (current API) and array format
-                if isinstance(k, dict):
-                    # Dictionary format: {'close': '0.04586', ...}
-                    close_str = k.get('close')
-                    if close_str:
-                        close = float(close_str)
-                        if close > 0:
-                            closes.append(close)
-                            if i < 3:  # Debug first 3
-                                print(f"    Kline {i+1}: Close = {close} (from dict)")
-                                sys.stdout.flush()
-                elif isinstance(k, (list, tuple)) and len(k) > 4:
-                    # Array format: [timestamp, open, high, low, close, volume]
-                    close = float(k[4])
+        for k in klines:
+            if isinstance(k, dict) and 'close' in k:
+                try:
+                    close = float(k['close'])
                     if close > 0:
                         closes.append(close)
-                        if i < 3:  # Debug first 3
-                            print(f"    Kline {i+1}: Close = {close} (from array)")
-                            sys.stdout.flush()
-                else:
-                    if i < 3:  # Only log first few to avoid spam
-                        print(f"    ❌ Unknown kline format {i+1}: {type(k)} - {k}")
-                        sys.stdout.flush()
-                        
-            except (ValueError, TypeError) as e:
-                if i < 3:  # Only log first few errors
-                    print(f"    ❌ Error parsing kline {i+1}: {e}")
-                    sys.stdout.flush()
+                except (ValueError, TypeError):
+                    continue
         
-        print(f"  ✅ {sym}: Extracted {len(closes)} valid closes")
-        if len(closes) > 0:
-            print(f"    💰 Price range: {min(closes):.8f} - {max(closes):.8f}")
-            print(f"    📈 Latest price: {closes[-1]:.8f}")
-            print(f"    📊 Sample closes: {closes[:5]} ... {closes[-3:]}")
-        sys.stdout.flush()
+        if DEBUG_MODE and len(closes) < 20:
+            print(f"⚠️  {sym}: Only {len(closes)} closes (need 20+)")
         
         return closes
         
     except Exception as e:
-        print(f"  ❌ Exception fetching {sym}: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
+        if DEBUG_MODE:
+            print(f"❌ Error fetching {sym}: {e}")
         return []
 
-# ── RSI CALCULATION ──────────────────────────────────
-def calc_rsi(sym, closes, period=14):
-    """Calculate RSI with enhanced debug."""
-    print(f"  📈 Calculating RSI for {sym}...")
-    print(f"    📊 Closes count: {len(closes)}, Period: {period}")
-    sys.stdout.flush()
-    
-    if len(closes) < period + 5:
-        print(f"    ❌ {sym}: Need {period+5}+ closes, got {len(closes)}")
-        sys.stdout.flush()
-        return None
-    
-    deltas = np.diff(closes)
-    print(f"    📊 Deltas count: {len(deltas)}")
-    print(f"    📊 Sample deltas: {deltas[:5]}")
-    sys.stdout.flush()
-    
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, abs(deltas), 0)
-    
-    print(f"    📊 Gains: count={len(gains)}, avg={np.mean(gains):.8f}, max={np.max(gains):.8f}")
-    print(f"    📊 Losses: count={len(losses)}, avg={np.mean(losses):.8f}, max={np.max(losses):.8f}")
-    sys.stdout.flush()
-    
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    
-    print(f"    📊 Avg gain (last {period}): {avg_gain:.8f}")
-    print(f"    📊 Avg loss (last {period}): {avg_loss:.8f}")
-    sys.stdout.flush()
-    
-    if avg_loss == 0:
-        rsi = 100
-        print(f"    📈 RSI = 100 (no losses)")
-    else:
+def calc_rsi(symbol, closes, period=14):
+    """Calculate RSI with error handling."""
+    try:
+        if len(closes) < period + 1:
+            return None
+        
+        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        gains = [max(delta, 0) for delta in deltas]
+        losses = [abs(min(delta, 0)) for delta in deltas]
+        
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        
+        if avg_loss == 0:
+            return 100
+        
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
-        print(f"    📊 RS ratio: {rs:.6f}")
-        print(f"    📈 RSI calculation: 100 - (100 / (1 + {rs:.6f})) = {rsi:.2f}")
-    
-    sys.stdout.flush()
-    return round(rsi, 2)
-
-# ── MAIN ANALYSIS ────────────────────────────────────
-def analyze_symbol(sym):
-    """Analyze single symbol with ENHANCED debug."""
-    print(f"\n🔍 ANALYZING {sym}")
-    print("=" * 50)
-    sys.stdout.flush()
-    
-    # Get price data with EXTRA debug
-    print(f"  📥 Step 1: Fetching price data for {sym}...")
-    sys.stdout.flush()
-    
-    closes = fetch_closes(sym, "5M", 100)
-    print(f"  📊 Step 1 Result: Got {len(closes)} closes")
-    sys.stdout.flush()
-    
-    if len(closes) < 20:
-        print(f"❌ {sym}: INSUFFICIENT DATA - need 20+, got {len(closes)} - SKIPPING")
-        sys.stdout.flush()
-        return None
-    
-    # Calculate RSI with EXTRA debug
-    print(f"  📈 Step 2: Calculating RSI for {sym}...")
-    sys.stdout.flush()
-    
-    rsi = calc_rsi(sym, closes)
-    print(f"  📈 Step 2 Result: RSI = {rsi}")
-    sys.stdout.flush()
-    
-    if rsi is None:
-        print(f"❌ {sym}: RSI CALCULATION FAILED - SKIPPING")
-        sys.stdout.flush()
-        return None
-    
-    # Calculate volatility with EXTRA debug
-    print(f"  📊 Step 3: Calculating volatility for {sym}...")
-    sys.stdout.flush()
-    
-    recent_closes = closes[-50:] if len(closes) >= 50 else closes
-    low = min(recent_closes)
-    high = max(recent_closes)
-    current = closes[-1]
-    
-    if high == low:
-        volatility = 0
-    else:
-        volatility = ((high - low) / current) * 100
-    
-    print(f"  📊 Step 3 Result: Volatility = {volatility:.6f}%")
-    print(f"    💰 Current: {current:.8f}")
-    print(f"    📉 Low: {low:.8f}")
-    print(f"    📈 High: {high:.8f}")
-    print(f"    📊 Range: {high - low:.8f}")
-    sys.stdout.flush()
-    
-    # ULTRA DETAILED signal logic
-    print(f"  🎯 Step 4: Signal Detection for {sym}...")
-    print(f"    🔍 Current thresholds:")
-    print(f"      VOL_THRESHOLD: {VOL_THRESHOLD}%")
-    print(f"      RSI_OVERBOUGHT: {RSI_OVERBOUGHT} (Short trigger)")
-    print(f"      RSI_OVERSOLD: {RSI_OVERSOLD} (Long trigger)")
-    sys.stdout.flush()
-    
-    zone = None
-    reason = "No signal"
-    
-    print(f"    🔍 Volatility check: {volatility:.6f}% >= {VOL_THRESHOLD}% ?")
-    vol_pass = volatility >= VOL_THRESHOLD
-    print(f"    📊 Volatility check result: {vol_pass}")
-    sys.stdout.flush()
-    
-    if not vol_pass:
-        reason = f"REJECTED: Low volatility ({volatility:.6f}% < {VOL_THRESHOLD}%)"
-        print(f"    ❌ {reason}")
-        sys.stdout.flush()
-    else:
-        print(f"    ✅ Volatility check PASSED")
         
-        print(f"    🔍 RSI checks:")
-        print(f"      Short check: {rsi} <= {RSI_OVERBOUGHT} ? {rsi <= RSI_OVERBOUGHT}")
-        print(f"      Long check: {rsi} >= {RSI_OVERSOLD} ? {rsi >= RSI_OVERSOLD}")
-        sys.stdout.flush()
+        return round(rsi, 2)
         
-        if rsi <= RSI_OVERBOUGHT:
-            zone = "Short"
-            reason = f"✅ SHORT SIGNAL: RSI {rsi} <= {RSI_OVERBOUGHT}"
-            print(f"    🎯 SHORT SIGNAL DETECTED!")
-        elif rsi >= RSI_OVERSOLD:
-            zone = "Long" 
-            reason = f"✅ LONG SIGNAL: RSI {rsi} >= {RSI_OVERSOLD}"
-            print(f"    🎯 LONG SIGNAL DETECTED!")
-        else:
-            reason = f"REJECTED: RSI {rsi} in neutral zone ({RSI_OVERBOUGHT} < RSI < {RSI_OVERSOLD})"
-            print(f"    ❌ {reason}")
-        
-        sys.stdout.flush()
-    
-    print(f"  🎯 FINAL DECISION: {reason}")
-    sys.stdout.flush()
-    
-    if zone:
-        print(f"  ✅ RETURNING SIGNAL DATA")
-        result = {
-            "symbol": sym,
-            "zone": zone,
-            "rsi": rsi,
-            "vol": volatility,
-            "price": current,
-            "low": low,
-            "high": high
-        }
-        print(f"  📋 Signal data: {result}")
-        sys.stdout.flush()
-        return result
-    else:
-        print(f"  ❌ RETURNING NONE (no signal)")
-        sys.stdout.flush()
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"❌ RSI calculation error for {symbol}: {e}")
         return None
 
-# ── MAIN FUNCTION ────────────────────────────────────
-def main():
-    """Enhanced debug run."""
-    print("🐛 RSI BOT - ENHANCED DEBUG MODE")
-    print("=" * 60)
-    print(f"🎯 Thresholds: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}(Short)|≥{RSI_OVERSOLD}(Long)")
-    sys.stdout.flush()
+def analyze_symbol_batch(symbols_batch):
+    """Analyze a batch of symbols sequentially to control rate limits."""
+    results = []
     
-    # Send debug start message
-    start_msg = f"🐛 Enhanced Debug Started\nVol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}"
-    tg(start_msg)
+    for sym in symbols_batch:
+        try:
+            if DEBUG_MODE:
+                print(f"🔍 Analyzing {sym}...")
+                
+            closes = fetch_closes_safe(sym, "5M", 100)
+            if len(closes) < 20:
+                if DEBUG_MODE:
+                    print(f"⚠️  {sym}: Insufficient data ({len(closes)} closes)")
+                continue
+            
+            rsi = calc_rsi(sym, closes)
+            if rsi is None:
+                if DEBUG_MODE:
+                    print(f"⚠️  {sym}: RSI calculation failed")
+                continue
+            
+            # Calculate volatility
+            recent_closes = closes[-50:] if len(closes) >= 50 else closes
+            low, high, current = min(recent_closes), max(recent_closes), closes[-1]
+            
+            volatility = ((high - low) / current) * 100 if high != low else 0
+            
+            # Signal detection (you need to define these constants)
+            VOL_THRESHOLD = 5.0  # Add your volatility threshold
+            RSI_OVERSOLD = 30    # Add your RSI oversold level
+            RSI_OVERBOUGHT = 70  # Add your RSI overbought level
+            
+            if volatility >= VOL_THRESHOLD:
+                if rsi <= RSI_OVERSOLD:  # Long signal
+                    signal = {
+                        "symbol": sym, 
+                        "zone": "LONG", 
+                        "rsi": rsi, 
+                        "vol": volatility, 
+                        "price": current
+                    }
+                    results.append(signal)
+                    if DEBUG_MODE:
+                        print(f"🟢 {sym}: LONG signal (RSI: {rsi}, Vol: {volatility:.2f}%)")
+                        
+                elif rsi >= RSI_OVERBOUGHT:  # Short signal  
+                    signal = {
+                        "symbol": sym, 
+                        "zone": "SHORT", 
+                        "rsi": rsi, 
+                        "vol": volatility, 
+                        "price": current
+                    }
+                    results.append(signal)
+                    if DEBUG_MODE:
+                        print(f"🔴 {sym}: SHORT signal (RSI: {rsi}, Vol: {volatility:.2f}%)")
+            
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"❌ Error analyzing {sym}: {e}")
+            continue
     
-    # Get symbols
-    print("\n📡 FETCHING SYMBOLS...")
-    sys.stdout.flush()
-    symbols = fetch_symbols()
-    
-    if not symbols:
-        print("❌ NO SYMBOLS TO ANALYZE - EXITING")
-        sys.stdout.flush()
+    return results
+
+def send_telegram_optimized(signals):
+    """Send signals to Telegram using maximum message length efficiently."""
+    if not signals:
         return
     
-    print(f"\n🎯 SYMBOLS TO ANALYZE: {symbols}")
-    sys.stdout.flush()
-    
-    # Analyze each symbol
-    signals = []
-    analyzed_count = 0
-    
-    for i, sym in enumerate(symbols, 1):
-        try:
-            print(f"\n🔄 PROCESSING {i}/{len(symbols)}: {sym}")
-            print("-" * 60)
-            sys.stdout.flush()
+    try:
+        messages = []
+        current_message = ""
+        signals_in_current = 0
+        
+        # Header for first message
+        header = "🚨 RSI SIGNALS DETECTED\n" + "=" * 30 + "\n"
+        current_message = header
+        
+        for i, signal in enumerate(signals):
+            # Compact signal format to fit more signals per message
+            signal_text = (
+                f"{signal['symbol']} | {signal['zone']} | "
+                f"RSI:{signal['rsi']:.1f} | Vol:{signal['vol']:.1f}% | "
+                f"${signal['price']:.4f}\n"
+            )
             
-            result = analyze_symbol(sym)
-            analyzed_count += 1
+            # Check if adding this signal would exceed limits
+            would_exceed_length = len(current_message + signal_text) > TELEGRAM_MAX_LENGTH
+            would_exceed_count = signals_in_current >= MAX_SIGNALS_PER_MESSAGE
             
-            if result:
-                signals.append(result)
-                print(f"🚨 SIGNAL #{len(signals)} FOUND: {sym} - {result['zone']}")
-                sys.stdout.flush()
+            if would_exceed_length or would_exceed_count:
+                # Finalize current message
+                if current_message.strip():
+                    current_message += f"\n📊 {signals_in_current} signals in this batch"
+                    messages.append(current_message)
+                
+                # Start new message
+                batch_num = len(messages) + 1
+                header = f"🚨 RSI SIGNALS (Batch {batch_num})\n" + "=" * 30 + "\n"
+                current_message = header + signal_text
+                signals_in_current = 1
             else:
-                print(f"😴 No signal for {sym}")
-                sys.stdout.flush()
+                current_message += signal_text
+                signals_in_current += 1
         
-        except Exception as e:
-            print(f"💥 ERROR analyzing {sym}: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.stdout.flush()
-    
-    # Final summary
-    print(f"\n📊 ENHANCED DEBUG SUMMARY")
-    print("=" * 40)
-    print(f"🔍 Symbols analyzed: {analyzed_count}")
-    print(f"🎯 Signals found: {len(signals)}")
-    print(f"📋 Criteria: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} OR RSI≥{RSI_OVERSOLD}")
-    sys.stdout.flush()
-    
-    summary_msg = f"🐛 *Enhanced Debug Complete*\n📊 Analyzed: {analyzed_count}\n🎯 Signals: {len(signals)}"
-    
-    if signals:
-        print(f"\n🚨 SIGNALS DETECTED:")
-        for s in signals:
-            signal_detail = f"  • {s['symbol']}: {s['zone']} | RSI: {s['rsi']} | Vol: {s['vol']:.4f}% | Price: {s['price']:.8f}"
-            print(signal_detail)
+        # Add final message if it has content
+        if current_message.strip() and signals_in_current > 0:
+            current_message += f"\n📊 {signals_in_current} signals in this batch"
+            messages.append(current_message)
+        
+        # Send all messages
+        print(f"📱 Sending {len(signals)} signals in {len(messages)} Telegram messages...")
+        
+        for i, message in enumerate(messages, 1):
+            success = send_telegram(message)
+            if success:
+                print(f"✅ Sent message {i}/{len(messages)}")
+            else:
+                print(f"❌ Failed to send message {i}/{len(messages)}")
             
-        summary_msg += f"\n🎯 Signals found!"
-        
-        # Send individual notifications
-        for signal in signals:
-            signal_msg = (f"🎯 *{signal['symbol']}* - {signal['zone']}\n"
-                         f"📊 RSI: {signal['rsi']}\n"
-                         f"📈 Vol: {signal['vol']:.4f}%\n"
-                         f"💰 Price: {signal['price']:.8f}")
-            tg(signal_msg)
-            time.sleep(1)
-    else:
-        print(f"\n😴 NO SIGNALS FOUND")
-        print(f"🤔 With thresholds Vol≥{VOL_THRESHOLD}% and RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}")
-        print(f"🤔 This suggests either:")
-        print(f"   • All volatility < {VOL_THRESHOLD}%")
-        print(f"   • All RSI between {RSI_OVERBOUGHT}-{RSI_OVERSOLD}")
-        print(f"   • API/data issues")
-        
-        summary_msg += "\n😴 No signals with relaxed thresholds"
+            if i < len(messages):  # Don't sleep after last message
+                time.sleep(1)  # Small delay between messages
+                
+    except Exception as e:
+        print(f"❌ Error in optimized Telegram sending: {e}")
+
+def main_optimized_scan():
+    """Optimized full scan with better debugging and Telegram batching."""
+    print("🚀 RSI BOT - OPTIMIZED FULL SCAN")
+    print("=" * 60)
     
-    sys.stdout.flush()
-    tg(summary_msg)
+    # Fetch symbols with rate limiting
+    print("📡 Fetching symbols list...")
+    symbols = fetch_symbols_safe()
+    if not symbols:
+        print("❌ Failed to fetch symbols")
+        return []
+    
+    print(f"🎯 Found {len(symbols)} symbols")
+    if DEBUG_MODE:
+        print(f"📝 First 10 symbols: {symbols[:10]}")
+    
+    print(f"⚙️  Using {MAX_WORKERS} workers with {REQUEST_DELAY}s delay")
+    
+    # Split symbols into batches for controlled processing
+    symbol_batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+    print(f"📦 Split into {len(symbol_batches)} batches of {BATCH_SIZE} symbols each")
+    
+    all_signals = []
+    processed_count = 0
+    start_time = time.time()
+    
+    # Process batches with thread pool
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit batch jobs
+        future_to_batch = {
+            executor.submit(analyze_symbol_batch, batch): i 
+            for i, batch in enumerate(symbol_batches)
+        }
+        
+        # Process completed batches
+        for future in as_completed(future_to_batch):
+            batch_idx = future_to_batch[future]
+            processed_count += len(symbol_batches[batch_idx])
+            
+            try:
+                batch_signals = future.result()
+                if batch_signals:
+                    all_signals.extend(batch_signals)
+                    print(f"🎯 Batch {batch_idx + 1}: Found {len(batch_signals)} signals")
+                else:
+                    print(f"📊 Batch {batch_idx + 1}: No signals found")
+                
+                # Progress update
+                progress = (processed_count / len(symbols)) * 100
+                elapsed = time.time() - start_time
+                eta = (elapsed / processed_count) * (len(symbols) - processed_count) if processed_count > 0 else 0
+                
+                print(f"📈 Progress: {processed_count}/{len(symbols)} ({progress:.1f}%) | ETA: {eta/60:.1f}min")
+                
+            except Exception as e:
+                print(f"❌ Error processing batch {batch_idx + 1}: {e}")
+    
+    # Final results
+    elapsed_time = time.time() - start_time
+    print(f"\n📊 SCAN COMPLETE!")
+    print(f"⏱️  Time: {elapsed_time/60:.1f} minutes")
+    print(f"✅ Processed: {processed_count}/{len(symbols)} symbols")
+    print(f"🚨 Total Signals: {len(all_signals)}")
+    
+    # Send results to Telegram with optimized batching
+    if all_signals:
+        # Send summary first
+        summary_msg = (
+            f"🚀 RSI SCAN COMPLETE!\n"
+            f"⏱️ Time: {elapsed_time/60:.1f} minutes\n"
+            f"📊 Analyzed: {processed_count} symbols\n"
+            f"🎯 Found: {len(all_signals)} signals\n\n"
+            f"Sending detailed signals..."
+        )
+        send_telegram(summary_msg)
+        
+        # Send optimized signal batches
+        send_telegram_optimized(all_signals)
+        
+        # Send completion message
+        completion_msg = f"✅ All {len(all_signals)} signals sent successfully!"
+        send_telegram(completion_msg)
+        
+    else:
+        no_signals_msg = "📊 Scan completed - No signals found matching criteria"
+        send_telegram(no_signals_msg)
+        print(no_signals_msg)
+    
+    return all_signals
+
+def fetch_symbols_safe():
+    """Safely fetch symbols list with rate limiting and better error handling."""
+    try:
+        url = f"{API}/market/symbols"
+        print(f"🔗 Fetching from: {url}")
+        
+        response = rate_limited_request(url, {"type": "PERP"})
+        
+        if not response:
+            print("❌ Failed to get symbols response")
+            return []
+        
+        data = response.json()
+        
+        if DEBUG_MODE:
+            print(f"📋 API Response keys: {list(data.keys())}")
+        
+        symbols_data = data.get("data", {}).get("symbols", [])
+        
+        if not symbols_data:
+            print(f"⚠️  No symbols in response. Full response: {data}")
+            return []
+        
+        symbols = []
+        for s in symbols_data:
+            if isinstance(s, dict) and s.get("symbol"):
+                symbol = s["symbol"].strip()
+                if symbol and not symbol.endswith("_"):  # Filter out invalid symbols
+                    symbols.append(symbol)
+        
+        if DEBUG_MODE:
+            print(f"✅ Extracted {len(symbols)} valid symbols from {len(symbols_data)} total")
+        
+        return symbols
+        
+    except Exception as e:
+        print(f"❌ Error fetching symbols: {e}")
+        return []
+
+def send_telegram(message):
+    """Send message to Telegram with error handling."""
+    try:
+        # You need to define these constants
+        TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"  # Replace with your actual token
+        TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"  # Replace with your actual chat ID
+        
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN":
+            print("⚠️  Telegram not configured - add your TELEGRAM_TOKEN and TELEGRAM_CHAT_ID")
+            return False
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        
+        response = requests.post(url, data=data, timeout=10)
+        if response.status_code == 200:
+            return True
+        else:
+            print(f"❌ Telegram error: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Telegram send error: {e}")
+        return False
+
+# You also need to define these constants that were missing:
+API = "https://api.pionex.com"  # Replace with actual Pionex API URL
+VOL_THRESHOLD = 5.0
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
 
 if __name__ == "__main__":
-    main()
+    # Run the optimized scan
+    signals = main_optimized_scan()
