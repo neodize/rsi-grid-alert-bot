@@ -1,173 +1,12 @@
-#!/usr/bin/env python3
-"""
-Combined RSI Bot and ATR Price Range Helper
-
-This file includes:
-  1. The ATR-based Price Range Helper (non-intrusive add-on)
-  2. Your original RSI bot script (kept intact, only wrapped into rsi_bot_main())
-  
-At runtime, you can choose:
-  [1] Run the original RSI Bot scan (unchanged logic)
-  [2] Test the ATR Price Range Helper for a token
-  
-No core logic of your original script is modified.
-"""
-
 import os, json, math, logging, time, requests
 from pathlib import Path
 import numpy as np
-import sys
-
-# =============================================================================
-#                     ATR-Based Price Range Helper Module
-# =============================================================================
-
-# Configure logging (this configuration is shared)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-# Pionex API endpoint for fetching candles (to match your original script)
-API = "https://api.pionex.com/api/v1"
-
-def fetch_ohlcv(symbol, interval="5M", limit=100):
-    """
-    Fetch OHLCV data for the given token symbol using the Pionex API.
-    Returns a list of candles (dicts with keys: open, high, low, close, volume).
-    """
-    url = f"{API}/market/klines"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-        "type": "PERP"
-    }
-    
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-    except Exception as e:
-        logging.error("Error fetching OHLCV data: %s", e)
-        sys.exit(1)
-    
-    data = response.json().get("data", {})
-    # The API may return a dict with "klines" or a raw list
-    klines = data.get("klines") if isinstance(data, dict) else data
-    ohlcv = []
-    for k in klines:
-        if isinstance(k, dict) and "close" in k:
-            candle = {
-                "open": float(k["open"]),
-                "high": float(k["high"]),
-                "low": float(k["low"]),
-                "close": float(k["close"]),
-                "volume": float(k.get("volume", 0))
-            }
-        elif isinstance(k, (list, tuple)) and len(k) >= 5:
-            candle = {
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]) if len(k) > 5 else 0
-            }
-        else:
-            continue
-        ohlcv.append(candle)
-    
-    if not ohlcv:
-        logging.error("No valid OHLCV data received.")
-        sys.exit(1)
-    return ohlcv
-
-def calculate_atr(ohlcv, period=14):
-    """
-    Calculate the Average True Range (ATR) on the provided OHLCV data.
-    
-    ATR is computed by:
-      TR = max[(High - Low), abs(High - Previous Close), abs(Low - Previous Close)]
-      ATR = Mean of the last `period` TR calculations.
-    """
-    if len(ohlcv) < period + 1:
-        logging.error("Not enough data to calculate ATR. Need at least %d candles.", period + 1)
-        sys.exit(1)
-    
-    tr_values = []
-    for i in range(1, len(ohlcv)):
-        current = ohlcv[i]
-        prev = ohlcv[i - 1]
-        high_low = current["high"] - current["low"]
-        high_prev = abs(current["high"] - prev["close"])
-        low_prev = abs(current["low"] - prev["close"])
-        tr = max(high_low, high_prev, low_prev)
-        tr_values.append(tr)
-    
-    atr = np.mean(tr_values[-period:])
-    return atr
-
-def determine_price_range(symbol, interval="5M", atr_period=14, atr_multiplier=2.0):
-    """
-    Determine a volatility-adjusted price range using ATR.
-    
-    Uses the last candle's close as the center, and computes:
-       Lower Bound = current_price - (atr_multiplier * ATR)
-       Upper Bound = current_price + (atr_multiplier * ATR)
-       
-    Returns a dict with keys: symbol, current_price, atr, lower_bound, upper_bound.
-    """
-    logging.info("Calculating price range for %s using interval %s", symbol, interval)
-    candles = fetch_ohlcv(symbol, interval=interval, limit=atr_period+50)
-    atr = calculate_atr(candles, period=atr_period)
-    current_price = candles[-1]["close"]
-    lower_bound = current_price - atr_multiplier * atr
-    upper_bound = current_price + atr_multiplier * atr
-    
-    return {
-        "symbol": symbol,
-        "current_price": current_price,
-        "atr": atr,
-        "lower_bound": lower_bound,
-        "upper_bound": upper_bound
-    }
-
-def format_currency(val):
-    """
-    Format numeric value into a currency string (consistent with your bot's style).
-    """
-    if val < 0.1:
-        return f"${val:.8f}"
-    elif val < 1:
-        return f"${val:,.4f}"
-    else:
-        return f"${val:,.2f}"
-
-def print_price_range(range_data):
-    """
-    Print the ATR-based price range in a formatted style.
-    """
-    symbol = range_data["symbol"]
-    current_price = format_currency(range_data["current_price"])
-    atr = range_data["atr"]
-    lower_bound = format_currency(range_data["lower_bound"])
-    upper_bound = format_currency(range_data["upper_bound"])
-    
-    print("========================================")
-    print(f"Token: {symbol}")
-    print(f"Current Price: {current_price}")
-    print(f"ATR (period): {atr:.4f}")
-    print("Suggested ATR-Based Price Range:")
-    print(f"  Lower Bound: {lower_bound}")
-    print(f"  Upper Bound: {upper_bound}")
-    print("========================================")
-
-
-# =============================================================================
-#                     Original RSI Bot Script (Untouched)
-# =============================================================================
 
 # ── ENV + CONFIG ────────────────────────────────────
 TG_TOKEN = os.environ.get("TG_TOKEN", os.environ.get("TELEGRAM_TOKEN", "")).strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
 
-API_ORIG = "https://api.pionex.com/api/v1"
+API = "https://api.pionex.com/api/v1"
 TOP_N = 100
 MIN_NOTIONAL_USD = 1_000_000
 SPACING_MIN = 0.3
@@ -177,12 +16,14 @@ CYCLE_MAX = 2.0
 STOP_BUFFER = 0.01
 STATE_FILE = Path("active_grids.json")
 VOL_THRESHOLD = 2.5
+GRID_HEIGHT = 0.05  # 5% of current price as total range width
+GRIDS_AMOUNT = 21   # Default number of grids (optional fixed value)
 
 # RELAXED THRESHOLDS FOR TESTING
-POSITION_THRESHOLD = 0.4  # Relaxed from 0.25/0.75 to 0.4/0.6
-RSI_OVERSOLD = 40         # Relaxed from 30/35
-RSI_OVERBOUGHT = 60       # Relaxed from 65/70
-REQUIRE_ALL_INDICATORS = False  # Allow 2 out of 3 indicators instead of all 3
+POSITION_THRESHOLD = 0.4
+RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 60
+REQUIRE_ALL_INDICATORS = False
 
 WRAPPED = {"WBTC", "WETH", "WSOL", "WBNB"}
 STABLE = {"USDT", "USDC", "BUSD", "DAI"}
@@ -217,16 +58,14 @@ def valid(sym):
     return (u.split("_")[0] not in WRAPPED | STABLE | EXCL and 
             not u.endswith(("UP", "DOWN", "3L", "3S", "5L", "5S")))
 
-def fetch_symbols_orig():
+def fetch_symbols():
     logging.info("Fetching symbols...")
     try:
-        r = requests.get(f"{API_ORIG}/market/tickers", params={"type": "PERP"}, timeout=10)
+        r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        
         tickers = data.get("data", {}).get("tickers", [])
         logging.info(f"Total tickers received: {len(tickers)}")
-        
         pairs = [t for t in tickers if valid(t["symbol"]) and float(t.get("amount", 0)) > MIN_NOTIONAL_USD]
         pairs.sort(key=lambda x: float(x["amount"]), reverse=True)
         symbols = [p["symbol"] for p in pairs][:TOP_N]
@@ -240,21 +79,19 @@ def fetch_symbols_orig():
 def fetch_closes(sym, interval="5M", limit=400):
     try:
         r = requests.get(
-            f"{API_ORIG}/market/klines",
+            f"{API}/market/klines",
             params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"},
             timeout=10
         )
         r.raise_for_status()
         payload = r.json().get("data", {})
         kl = payload.get("klines") or payload
-        
         closes = []
         for k in kl:
             if isinstance(k, dict) and "close" in k:
                 closes.append(float(k["close"]))
             elif isinstance(k, (list, tuple)) and len(k) >= 5:
                 closes.append(float(k[4]))
-        
         return closes
     except Exception as e:
         logging.error(f"Error fetching closes for {sym}: {e}")
@@ -280,7 +117,9 @@ def should_trigger(sym, vol_pct, std_dev):
         return True
     return False
 
-def calculate_grids(rng, px, spacing, vol):
+def calculate_grids(rng, px, spacing, vol, use_fixed_grids=False):
+    if use_fixed_grids:
+        return GRIDS_AMOUNT
     base = rng / (px * spacing / 100)
     if vol < 1.5:
         return max(4, min(200, math.floor(base / 2)))
@@ -303,6 +142,40 @@ def score_signal(d):
         (1.5 / max(d["cycle"], 0.1)) * 10,
         1
     )
+
+def simulate_grid_orders(sym, low, high, grids, spacing, px, account_allocation=0.5):
+    orders = []
+    interval = (high - low) / (grids - 1) if grids > 1 else (high - low)
+    grid_levels = [low + i * interval for i in range(grids)]
+    base_currency = sym.split('_')[0]
+    quote_currency = sym.split('_')[1]
+    order_size = (1000 * account_allocation) / (px * sum(1 for level in grid_levels if level < px or px == level))
+    
+    for level in grid_levels:
+        try:
+            if level < px:
+                order = {
+                    'symbol': sym,
+                    'type': 'limit',
+                    'side': 'buy',
+                    'amount': order_size,
+                    'price': level
+                }
+                orders.append(order)
+                logging.info(f"Simulated buy order for {sym} at {money(level)}: {order_size:.6f} {base_currency}")
+            elif level > px:
+                order = {
+                    'symbol': sym,
+                    'type': 'limit',
+                    'side': 'sell',
+                    'amount': order_size,
+                    'price': level
+                }
+                orders.append(order)
+                logging.info(f"Simulated sell order for {sym} at {money(level)}: {order_size:.6f} {base_currency}")
+        except Exception as e:
+            logging.error(f"Error simulating order for {sym} at {money(level)}: {e}")
+    return orders
 
 # ── STATE MANAGEMENT ────────────────────────────────
 def load_state():
@@ -335,7 +208,6 @@ def start_msg(d, rank=None):
     minutes = int((remaining_seconds % 3600) // 60)
     cycle_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
-    
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
@@ -437,21 +309,25 @@ def regime_type(std_dev, vol):
     return "Normal"
 
 # ── RELAXED ANALYSE FUNCTION ─────────────────────────
-def analyse(sym, interval="5M", limit=400):
+def analyse(sym, interval="5M", limit=400, use_grid_height=False):
     closes = fetch_closes(sym, interval, limit=limit)
     if len(closes) < 60:
         return None
     
-    low, high = min(closes), max(closes)
     px = closes[-1]
-    rng = high - low
+    if use_grid_height:
+        low = px * (1 - GRID_HEIGHT / 2)
+        high = px * (1 + GRID_HEIGHT / 2)
+        rng = high - low
+    else:
+        low, high = min(closes), max(closes)
+        rng = high - low
     
     if rng <= 0 or px == 0:
         return None
     
     pos = (px - low) / rng
     
-    # RELAXED: Allow more centered positions
     if POSITION_THRESHOLD <= pos <= (1 - POSITION_THRESHOLD):
         logging.debug(f"{sym}: Price too centered in range ({pos:.3f}), skipping")
         return None
@@ -460,18 +336,16 @@ def analyse(sym, interval="5M", limit=400):
     vol = rng / px * 100
     vf = max(0.1, vol + std * 100)
     spacing = max(SPACING_MIN, min(SPACING_MAX, SPACING_TARGET * (30 / max(vf, 1))))
-    grids = calculate_grids(rng, px, spacing, vol)
+    grids = calculate_grids(rng, px, spacing, vol, use_fixed_grids=use_grid_height)
     cycle = round((grids * spacing) / (vf + 1e-9) * 2, 1)
     
     if cycle > CYCLE_MAX or cycle <= 0:
         return None
     
-    # Dynamically adjust range if price is outside the buffer
     if px < low * (1 - STOP_BUFFER) or px > high * (1 + STOP_BUFFER):
         low = min(px, low * 0.95)
         high = max(px, high * 1.05)
     
-    # Compute additional indicators
     rsi = compute_rsi(closes)
     bb_lower, bb_upper = compute_bollinger_bands(closes)
     macd_line, signal_line, macd_hist = compute_macd(closes)
@@ -498,7 +372,6 @@ def analyse(sym, interval="5M", limit=400):
     else:
         long_signals = sum([rsi_signal_long, bb_signal_long, macd_signal_long])
         short_signals = sum([rsi_signal_short, bb_signal_short, macd_signal_short])
-        
         if long_signals >= 2:
             zone_check = "Long"
             logging.info(f"{sym}: Long signal - RSI:{rsi_signal_long}, BB:{bb_signal_long}, MACD:{macd_signal_long} ({long_signals}/3)")
@@ -521,16 +394,20 @@ def analyse(sym, interval="5M", limit=400):
         cycle=cycle
     )
     
+    # Simulate grid orders if a valid signal is found
+    orders = simulate_grid_orders(sym, low, high, grids, spacing, px)
+    result['orders'] = orders
+    
     logging.info(f"Valid signal found for {sym}: {zone_check} zone, vol={vol:.1f}%, score={score_signal(result)}")
     return result
 
 def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
-    r60 = analyse(sym, interval="60M", limit=200)
+    r60 = analyse(sym, interval="60M", limit=200, use_grid_height=True)
     if not r60:
         return None
     
     if r60["vol"] >= vol_threshold:
-        r5 = analyse(sym, interval="5M", limit=400)
+        r5 = analyse(sym, interval="5M", limit=400, use_grid_height=True)
         if r5 and should_trigger(sym, r5["vol"], r5["std"]):
             return r5
         return None
@@ -539,15 +416,15 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
     
     return None
 
-# ── ORIGINAL MAIN FUNCTION (wrapped as rsi_bot_main) ─────────────────
-def rsi_bot_main():
+# ── MAIN FUNCTION ───────────────────────────────────
+def main():
     logging.info("=== Starting RSI Bot Scan (RELAXED CONDITIONS) ===")
     
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
     
-    symbols = fetch_symbols_orig()
+    symbols = fetch_symbols()
     if not symbols:
         logging.error("No symbols fetched, exiting")
         return
@@ -609,9 +486,10 @@ def rsi_bot_main():
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
-        config_info = (f"📊 Position threshold: {POSITION_THRESHOLD} (was 0.25)\n"
-                      f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT} (was 30/70)\n"
-                      f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n\n")
+        config_info = (f"📊 Position threshold: {POSITION_THRESHOLD}\n"
+                      f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                      f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
+                      f"📏 Grid height: {GRID_HEIGHT*100}% | 🧮 Default grids: {GRIDS_AMOUNT}\n\n")
         
         for i, (score, r) in enumerate(scored, 1):
             m = start_msg(r, i)
@@ -642,35 +520,6 @@ def rsi_bot_main():
         if buf:
             tg(buf)
         logging.info(f"Sent {len(stops)} stop alerts")
-
-# =============================================================================
-#                     Dispatcher / Combined Main Function
-# =============================================================================
-
-def main():
-    print("Select Mode:")
-    print("1: Run Original RSI Bot Scan")
-    print("2: Test ATR-Based Price Range Helper")
-    mode = input("Enter 1 or 2: ").strip()
-
-    if mode == "1":
-        rsi_bot_main()
-    elif mode == "2":
-        token = input("Enter token symbol (e.g., NXPCUSDTPERP): ").strip().upper()
-        interval = input("Enter candle interval (default '5M'): ").strip() or "5M"
-        try:
-            atr_period = int(input("Enter ATR period (default 14): ").strip() or "14")
-        except ValueError:
-            atr_period = 14
-        try:
-            atr_multiplier = float(input("Enter ATR multiplier (default 2.0): ").strip() or "2.0")
-        except ValueError:
-            atr_multiplier = 2.0
-
-        range_data = determine_price_range(token, interval=interval, atr_period=atr_period, atr_multiplier=atr_multiplier)
-        print_price_range(range_data)
-    else:
-        print("Invalid selection. Exiting.")
 
 if __name__ == "__main__":
     main()
