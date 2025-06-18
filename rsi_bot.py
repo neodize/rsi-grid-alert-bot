@@ -11,22 +11,44 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "")
 API = "https://api.pionex.com/api/v1"
 STATE_FILE = Path("active_grids.json")
 
-# EXTREMELY relaxed thresholds for debugging
+# Telegram message limits
+TG_MAX_MESSAGE_LENGTH = 4000  # Telegram limit is 4096, leave some buffer
+TG_MAX_SIGNALS_PER_MESSAGE = 10  # Max signals per message to keep readable
 
-VOL_THRESHOLD = 0.5  # 0.001% - almost any movement
-RSI_OVERSOLD = 30      # Almost impossible not to trigger
-RSI_OVERBOUGHT = 70    # Almost impossible not to trigger
-DEBUG_MODE = True
+# Trading thresholds
+VOL_THRESHOLD = 0.5  # 0.5% volatility minimum
+RSI_OVERSOLD = 30      
+RSI_OVERBOUGHT = 70    
+DEBUG_MODE = False  # Set to False for production scanning
 
-print(f"🐛 ENHANCED DEBUG MODE: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} (Short), RSI≥{RSI_OVERSOLD} (Long)")
+print(f"🚀 RSI BOT - FULL SCAN MODE")
+print(f"🎯 Thresholds: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} (Short), RSI≥{RSI_OVERSOLD} (Long)")
 sys.stdout.flush()
 
 # ── TELEGRAM NOTIFICATION ───────────────────────────
 
 def tg(msg):
+    """Send Telegram message with length checking."""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("❌ Missing Telegram credentials")
         return False
+    
+    # Split message if too long
+    if len(msg) > TG_MAX_MESSAGE_LENGTH:
+        print(f"📱 Message too long ({len(msg)} chars), splitting...")
+        messages = split_message(msg)
+        success = True
+        for i, part in enumerate(messages, 1):
+            print(f"📱 Sending part {i}/{len(messages)}")
+            if not send_single_message(part):
+                success = False
+            time.sleep(1)  # Rate limiting
+        return success
+    else:
+        return send_single_message(msg)
+
+def send_single_message(msg):
+    """Send a single Telegram message."""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -38,244 +60,150 @@ def tg(msg):
         print(f"❌ Telegram error: {e}")
         return False
 
+def split_message(msg):
+    """Split long message into smaller parts."""
+    parts = []
+    lines = msg.split('\n')
+    current_part = ""
+    
+    for line in lines:
+        if len(current_part + line + '\n') > TG_MAX_MESSAGE_LENGTH:
+            if current_part:
+                parts.append(current_part.strip())
+                current_part = line + '\n'
+            else:
+                # Single line too long, force split
+                parts.append(line[:TG_MAX_MESSAGE_LENGTH-3] + "...")
+        else:
+            current_part += line + '\n'
+    
+    if current_part:
+        parts.append(current_part.strip())
+    
+    return parts
+
 # ── SYMBOL FETCHING ──────────────────────────────────
 
 def fetch_symbols():
-    """Get symbols with debug info."""
+    """Get ALL symbols from API."""
     try:
-        print("🔍 Fetching symbols from API…")
+        print("🔍 Fetching ALL symbols from API…")
         sys.stdout.flush()
 
         r = requests.get(f"{API}/market/tickers", params={"type": "PERP"}, timeout=15)
-        print(f"📡 API Response status: {r.status_code}")
-        sys.stdout.flush()
         
         if r.status_code != 200:
-            print(f"❌ API Error: {r.status_code}")
-            print(f"❌ Response text: {r.text[:500]}")
+            print(f"❌ API Error: {r.status_code} - {r.text[:200]}")
             sys.stdout.flush()
             return []
         
         data = r.json()
-        print(f"🔍 API Response keys: {list(data.keys())}")
-        sys.stdout.flush()
-        
         tickers = data.get("data", {}).get("tickers", [])
-        print(f"📊 Raw tickers count: {len(tickers)}")
-        sys.stdout.flush()
-        
-        if len(tickers) > 0:
-            print(f"📋 First ticker sample: {tickers[0]}")
-            sys.stdout.flush()
         
         symbols = []
-        for i, t in enumerate(tickers[:10]):  # Check first 10 in detail
-            if isinstance(t, dict) and 'symbol' in t:
-                symbols.append(t["symbol"])
-                if DEBUG_MODE:
-                    print(f"   {i+1:2d}: {t['symbol']:<15} - Close: {t.get('close', 'N/A')}")
-                    sys.stdout.flush()
-        
-        print(f"✅ Extracted {len(symbols)} symbols from first 10")
-        sys.stdout.flush()
-        
-        # Get more symbols
-        for t in tickers[10:]:
+        for t in tickers:
             if isinstance(t, dict) and 'symbol' in t:
                 symbols.append(t["symbol"])
         
-        print(f"✅ Total symbols extracted: {len(symbols)}")
-        limited_symbols = symbols[:5]  # Focus on just 5 for detailed debug
-        print(f"🎯 Will analyze these {len(limited_symbols)} symbols: {limited_symbols}")
+        print(f"✅ Found {len(symbols)} total symbols to analyze")
+        if DEBUG_MODE:
+            print(f"📋 First 10 symbols: {symbols[:10]}")
         sys.stdout.flush()
         
-        return limited_symbols
+        return symbols
         
     except Exception as e:
         print(f"❌ Exception fetching symbols: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
         return []
 
 # ── PRICE DATA FETCHING ──────────────────────────────
 
 def fetch_closes(sym, interval="5M", limit=100):
-    """Fetch closes with enhanced debug."""
+    """Fetch price closes for symbol."""
     try:
-        print(f"  📥 Fetching {sym} klines data…")
-        sys.stdout.flush()
+        if DEBUG_MODE:
+            print(f"  📥 Fetching {sym} data...")
 
-        url = f"{API}/market/klines"
-        params = {
-            "symbol": sym, 
-            "interval": interval, 
-            "limit": limit, 
-            "type": "PERP"
-        }
-        print(f"  📡 Request URL: {url}")
-        print(f"  📡 Request params: {params}")
-        sys.stdout.flush()
-        
-        r = requests.get(url, params=params, timeout=15)
-        print(f"  📡 Response status: {r.status_code}")
-        sys.stdout.flush()
+        r = requests.get(
+            f"{API}/market/klines",
+            params={"symbol": sym, "interval": interval, "limit": limit, "type": "PERP"},
+            timeout=15
+        )
         
         if r.status_code != 200:
-            print(f"    ❌ HTTP {r.status_code} for {sym}")
-            print(f"    ❌ Response: {r.text[:200]}")
-            sys.stdout.flush()
+            if DEBUG_MODE:
+                print(f"    ❌ HTTP {r.status_code} for {sym}")
             return []
         
         data = r.json()
-        print(f"  📊 Response keys: {list(data.keys())}")
-        sys.stdout.flush()
-        
         klines = data.get("data", {}).get("klines", [])
-        print(f"  📊 {sym}: Got {len(klines)} klines")
-        sys.stdout.flush()
         
         if not klines:
-            print(f"    ⚠️  No klines data for {sym}")
-            sys.stdout.flush()
+            if DEBUG_MODE:
+                print(f"    ⚠️  No data for {sym}")
             return []
         
-        # Debug first few klines structure
-        print(f"  📋 First 3 klines structure:")
-        for i, k in enumerate(klines[:3]):
-            print(f"    {i+1}: {k} (type: {type(k)}, len: {len(k) if hasattr(k, '__len__') else 'N/A'})")
-            sys.stdout.flush()
-        
         closes = []
-        for i, k in enumerate(klines):
+        for k in klines:
             try:
-                # Handle both dictionary format (current API) and array format
                 if isinstance(k, dict):
-                    # Dictionary format: {'close': '0.04586', ...}
                     close_str = k.get('close')
                     if close_str:
                         close = float(close_str)
                         if close > 0:
                             closes.append(close)
-                            if i < 3:  # Debug first 3
-                                print(f"    Kline {i+1}: Close = {close} (from dict)")
-                                sys.stdout.flush()
                 elif isinstance(k, (list, tuple)) and len(k) > 4:
-                    # Array format: [timestamp, open, high, low, close, volume]
                     close = float(k[4])
                     if close > 0:
                         closes.append(close)
-                        if i < 3:  # Debug first 3
-                            print(f"    Kline {i+1}: Close = {close} (from array)")
-                            sys.stdout.flush()
-                else:
-                    if i < 3:  # Only log first few to avoid spam
-                        print(f"    ❌ Unknown kline format {i+1}: {type(k)} - {k}")
-                        sys.stdout.flush()
-                        
-            except (ValueError, TypeError) as e:
-                if i < 3:  # Only log first few errors
-                    print(f"    ❌ Error parsing kline {i+1}: {e}")
-                    sys.stdout.flush()
+            except (ValueError, TypeError):
+                continue
         
-        print(f"  ✅ {sym}: Extracted {len(closes)} valid closes")
-        if len(closes) > 0:
-            print(f"    💰 Price range: {min(closes):.8f} - {max(closes):.8f}")
-            print(f"    📈 Latest price: {closes[-1]:.8f}")
-            print(f"    📊 Sample closes: {closes[:5]} ... {closes[-3:]}")
-        sys.stdout.flush()
+        if DEBUG_MODE and closes:
+            print(f"    ✅ {sym}: {len(closes)} closes, latest: {closes[-1]:.8f}")
         
         return closes
         
     except Exception as e:
-        print(f"  ❌ Exception fetching {sym}: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
+        if DEBUG_MODE:
+            print(f"  ❌ Error fetching {sym}: {e}")
         return []
 
 # ── RSI CALCULATION ──────────────────────────────────
 
-def calc_rsi(sym, closes, period=14):
-    """Calculate RSI with enhanced debug."""
-    print(f"  📈 Calculating RSI for {sym}…")
-    print(f"    📊 Closes count: {len(closes)}, Period: {period}")
-    sys.stdout.flush()
-
+def calc_rsi(closes, period=14):
+    """Calculate RSI efficiently."""
     if len(closes) < period + 5:
-        print(f"    ❌ {sym}: Need {period+5}+ closes, got {len(closes)}")
-        sys.stdout.flush()
         return None
 
     deltas = np.diff(closes)
-    print(f"    📊 Deltas count: {len(deltas)}")
-    print(f"    📊 Sample deltas: {deltas[:5]}")
-    sys.stdout.flush()
-
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, abs(deltas), 0)
-
-    print(f"    📊 Gains: count={len(gains)}, avg={np.mean(gains):.8f}, max={np.max(gains):.8f}")
-    print(f"    📊 Losses: count={len(losses)}, avg={np.mean(losses):.8f}, max={np.max(losses):.8f}")
-    sys.stdout.flush()
 
     avg_gain = np.mean(gains[-period:])
     avg_loss = np.mean(losses[-period:])
 
-    print(f"    📊 Avg gain (last {period}): {avg_gain:.8f}")
-    print(f"    📊 Avg loss (last {period}): {avg_loss:.8f}")
-    sys.stdout.flush()
-
     if avg_loss == 0:
-        rsi = 100
-        print(f"    📈 RSI = 100 (no losses)")
-    else:
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        print(f"    📊 RS ratio: {rs:.6f}")
-        print(f"    📈 RSI calculation: 100 - (100 / (1 + {rs:.6f})) = {rsi:.2f}")
-
-    sys.stdout.flush()
+        return 100
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
     return round(rsi, 2)
 
 # ── MAIN ANALYSIS ────────────────────────────────────
 
 def analyze_symbol(sym):
-    """Analyze single symbol with ENHANCED debug."""
-    print(f"\n🔍 ANALYZING {sym}")
-    print("=" * 50)
-    sys.stdout.flush()
-
-    # Get price data with EXTRA debug
-    print(f"  📥 Step 1: Fetching price data for {sym}...")
-    sys.stdout.flush()
-
+    """Analyze symbol for signals."""
     closes = fetch_closes(sym, "5M", 100)
-    print(f"  📊 Step 1 Result: Got {len(closes)} closes")
-    sys.stdout.flush()
-
+    
     if len(closes) < 20:
-        print(f"❌ {sym}: INSUFFICIENT DATA - need 20+, got {len(closes)} - SKIPPING")
-        sys.stdout.flush()
         return None
 
-    # Calculate RSI with EXTRA debug
-    print(f"  📈 Step 2: Calculating RSI for {sym}...")
-    sys.stdout.flush()
-
-    rsi = calc_rsi(sym, closes)
-    print(f"  📈 Step 2 Result: RSI = {rsi}")
-    sys.stdout.flush()
-
+    rsi = calc_rsi(closes)
     if rsi is None:
-        print(f"❌ {sym}: RSI CALCULATION FAILED - SKIPPING")
-        sys.stdout.flush()
         return None
 
-    # Calculate volatility with EXTRA debug
-    print(f"  📊 Step 3: Calculating volatility for {sym}...")
-    sys.stdout.flush()
-
+    # Calculate volatility
     recent_closes = closes[-50:] if len(closes) >= 50 else closes
     low = min(recent_closes)
     high = max(recent_closes)
@@ -286,61 +214,18 @@ def analyze_symbol(sym):
     else:
         volatility = ((high - low) / current) * 100
 
-    print(f"  📊 Step 3 Result: Volatility = {volatility:.6f}%")
-    print(f"    💰 Current: {current:.8f}")
-    print(f"    📉 Low: {low:.8f}")
-    print(f"    📈 High: {high:.8f}")
-    print(f"    📊 Range: {high - low:.8f}")
-    sys.stdout.flush()
-
-    # ULTRA DETAILED signal logic
-    print(f"  🎯 Step 4: Signal Detection for {sym}...")
-    print(f"    🔍 Current thresholds:")
-    print(f"      VOL_THRESHOLD: {VOL_THRESHOLD}%")
-    print(f"      RSI_OVERBOUGHT: {RSI_OVERBOUGHT} (Short trigger)")
-    print(f"      RSI_OVERSOLD: {RSI_OVERSOLD} (Long trigger)")
-    sys.stdout.flush()
-
+    # Check for signals
+    if volatility < VOL_THRESHOLD:
+        return None
+    
     zone = None
-    reason = "No signal"
-
-    print(f"    🔍 Volatility check: {volatility:.6f}% >= {VOL_THRESHOLD}% ?")
-    vol_pass = volatility >= VOL_THRESHOLD
-    print(f"    📊 Volatility check result: {vol_pass}")
-    sys.stdout.flush()
-
-    if not vol_pass:
-        reason = f"REJECTED: Low volatility ({volatility:.6f}% < {VOL_THRESHOLD}%)"
-        print(f"    ❌ {reason}")
-        sys.stdout.flush()
-    else:
-        print(f"    ✅ Volatility check PASSED")
-        
-        print(f"    🔍 RSI checks:")
-        print(f"      Short check: {rsi} <= {RSI_OVERBOUGHT} ? {rsi <= RSI_OVERBOUGHT}")
-        print(f"      Long check: {rsi} >= {RSI_OVERSOLD} ? {rsi >= RSI_OVERSOLD}")
-        sys.stdout.flush()
-        
-        if rsi <= RSI_OVERBOUGHT:
-            zone = "Short"
-            reason = f"✅ SHORT SIGNAL: RSI {rsi} <= {RSI_OVERBOUGHT}"
-            print(f"    🎯 SHORT SIGNAL DETECTED!")
-        elif rsi >= RSI_OVERSOLD:
-            zone = "Long" 
-            reason = f"✅ LONG SIGNAL: RSI {rsi} >= {RSI_OVERSOLD}"
-            print(f"    🎯 LONG SIGNAL DETECTED!")
-        else:
-            reason = f"REJECTED: RSI {rsi} in neutral zone ({RSI_OVERBOUGHT} < RSI < {RSI_OVERSOLD})"
-            print(f"    ❌ {reason}")
-        
-        sys.stdout.flush()
-
-    print(f"  🎯 FINAL DECISION: {reason}")
-    sys.stdout.flush()
-
+    if rsi <= RSI_OVERBOUGHT:
+        zone = "Short"
+    elif rsi >= RSI_OVERSOLD:
+        zone = "Long"
+    
     if zone:
-        print(f"  ✅ RETURNING SIGNAL DATA")
-        result = {
+        return {
             "symbol": sym,
             "zone": zone,
             "rsi": rsi,
@@ -349,104 +234,137 @@ def analyze_symbol(sym):
             "low": low,
             "high": high
         }
-        print(f"  📋 Signal data: {result}")
-        sys.stdout.flush()
-        return result
-    else:
-        print(f"  ❌ RETURNING NONE (no signal)")
-        sys.stdout.flush()
-        return None
+    
+    return None
+
+def format_signals_message(signals, batch_num=None, total_batches=None):
+    """Format signals into a consolidated Telegram message."""
+    if not signals:
+        return "😴 No signals found in this batch"
+    
+    # Header
+    header = "🎯 *Trading Signals Found*"
+    if batch_num and total_batches:
+        header += f" (Batch {batch_num}/{total_batches})"
+    header += f"\n📊 Found {len(signals)} opportunities\n"
+    header += f"🎯 Criteria: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}\n\n"
+    
+    # Group signals by type
+    long_signals = [s for s in signals if s['zone'] == 'Long']
+    short_signals = [s for s in signals if s['zone'] == 'Short']
+    
+    message = header
+    
+    # Long signals
+    if long_signals:
+        message += f"🟢 *LONG SIGNALS ({len(long_signals)})*\n"
+        for signal in long_signals:
+            line = f"• `{signal['symbol']}` RSI:{signal['rsi']} Vol:{signal['vol']:.2f}% ${signal['price']:.6f}\n"
+            message += line
+        message += "\n"
+    
+    # Short signals  
+    if short_signals:
+        message += f"🔴 *SHORT SIGNALS ({len(short_signals)})*\n"
+        for signal in short_signals:
+            line = f"• `{signal['symbol']}` RSI:{signal['rsi']} Vol:{signal['vol']:.2f}% ${signal['price']:.6f}\n"
+            message += line
+        message += "\n"
+    
+    # Footer
+    message += f"⏰ Scan completed at {time.strftime('%H:%M:%S UTC')}"
+    
+    return message.strip()
 
 # ── MAIN FUNCTION ────────────────────────────────────
 
 def main():
-    """Enhanced debug run."""
-    print("🐛 RSI BOT - ENHANCED DEBUG MODE")
+    """Main scanning function with consolidated reporting."""
+    print("🚀 RSI BOT - FULL MARKET SCAN")
     print("=" * 60)
-    print(f"🎯 Thresholds: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}(Short)|≥{RSI_OVERSOLD}(Long)")
     sys.stdout.flush()
 
-    # Send debug start message
-    start_msg = f"🐛 Enhanced Debug Started\nVol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}"
+    # Send start notification
+    start_msg = (f"🚀 *Full Market Scan Started*\n"
+                f"🎯 Criteria: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}\n"
+                f"⏰ Started at {time.strftime('%H:%M:%S UTC')}")
     tg(start_msg)
 
-    # Get symbols
-    print("\n📡 FETCHING SYMBOLS...")
-    sys.stdout.flush()
+    # Get all symbols
     symbols = fetch_symbols()
-
     if not symbols:
-        print("❌ NO SYMBOLS TO ANALYZE - EXITING")
-        sys.stdout.flush()
+        error_msg = "❌ *Scan Failed*\nNo symbols retrieved from API"
+        tg(error_msg)
         return
 
-    print(f"\n🎯 SYMBOLS TO ANALYZE: {symbols}")
+    print(f"🎯 Analyzing {len(symbols)} symbols...")
     sys.stdout.flush()
 
-    # Analyze each symbol
+    # Analyze symbols with progress tracking
     signals = []
     analyzed_count = 0
+    errors = 0
+    
+    total_symbols = len(symbols)
+    progress_interval = max(10, total_symbols // 20)  # Show progress every 5%
 
     for i, sym in enumerate(symbols, 1):
         try:
-            print(f"\n🔄 PROCESSING {i}/{len(symbols)}: {sym}")
-            print("-" * 60)
-            sys.stdout.flush()
-            
             result = analyze_symbol(sym)
             analyzed_count += 1
             
             if result:
                 signals.append(result)
-                print(f"🚨 SIGNAL #{len(signals)} FOUND: {sym} - {result['zone']}")
+                print(f"🚨 Signal #{len(signals)}: {sym} - {result['zone']} (RSI: {result['rsi']})")
+            
+            # Progress updates
+            if i % progress_interval == 0:
+                progress = (i / total_symbols) * 100
+                print(f"📊 Progress: {i}/{total_symbols} ({progress:.1f}%) - Signals: {len(signals)}")
                 sys.stdout.flush()
-            else:
-                print(f"😴 No signal for {sym}")
-                sys.stdout.flush()
-        
+                
         except Exception as e:
-            print(f"💥 ERROR analyzing {sym}: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.stdout.flush()
+            errors += 1
+            if DEBUG_MODE:
+                print(f"❌ Error analyzing {sym}: {e}")
+
+    # Send consolidated results
+    print(f"\n📊 SCAN COMPLETE")
+    print(f"🔍 Analyzed: {analyzed_count}/{total_symbols}")
+    print(f"🎯 Signals found: {len(signals)}")
+    print(f"❌ Errors: {errors}")
+    sys.stdout.flush()
+
+    # Send results in batches if needed
+    if signals:
+        # Split signals into batches to avoid message length limits
+        batch_size = TG_MAX_SIGNALS_PER_MESSAGE
+        signal_batches = [signals[i:i + batch_size] for i in range(0, len(signals), batch_size)]
+        
+        print(f"📱 Sending {len(signal_batches)} message batch(es)")
+        
+        for batch_num, signal_batch in enumerate(signal_batches, 1):
+            batch_msg = format_signals_message(
+                signal_batch, 
+                batch_num if len(signal_batches) > 1 else None,
+                len(signal_batches) if len(signal_batches) > 1 else None
+            )
+            tg(batch_msg)
+            if batch_num < len(signal_batches):
+                time.sleep(2)  # Rate limiting between batches
+    else:
+        no_signals_msg = (f"😴 *No Signals Found*\n"
+                         f"📊 Scanned {analyzed_count} symbols\n"
+                         f"🎯 Criteria: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}\n"
+                         f"💡 Try adjusting thresholds if market is quiet")
+        tg(no_signals_msg)
 
     # Final summary
-    print(f"\n📊 ENHANCED DEBUG SUMMARY")
-    print("=" * 40)
-    print(f"🔍 Symbols analyzed: {analyzed_count}")
-    print(f"🎯 Signals found: {len(signals)}")
-    print(f"📋 Criteria: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} OR RSI≥{RSI_OVERSOLD}")
-    sys.stdout.flush()
-
-    summary_msg = f"🐛 *Enhanced Debug Complete*\n📊 Analyzed: {analyzed_count}\n🎯 Signals: {len(signals)}"
-
-    if signals:
-        print(f"\n🚨 SIGNALS DETECTED:")
-        for s in signals:
-            signal_detail = f"  • {s['symbol']}: {s['zone']} | RSI: {s['rsi']} | Vol: {s['vol']:.4f}% | Price: {s['price']:.8f}"
-            print(signal_detail)
-            
-        summary_msg += f"\n🎯 Signals found!"
-        
-        # Send individual notifications
-        for signal in signals:
-            signal_msg = (f"🎯 *{signal['symbol']}* - {signal['zone']}\n"
-                         f"📊 RSI: {signal['rsi']}\n"
-                         f"📈 Vol: {signal['vol']:.4f}%\n"
-                         f"💰 Price: {signal['price']:.8f}")
-            tg(signal_msg)
-            time.sleep(1)
-    else:
-        print(f"\n😴 NO SIGNALS FOUND")
-        print(f"🤔 With thresholds Vol≥{VOL_THRESHOLD}% and RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}")
-        print(f"🤔 This suggests either:")
-        print(f"   • All volatility < {VOL_THRESHOLD}%")
-        print(f"   • All RSI between {RSI_OVERBOUGHT}-{RSI_OVERSOLD}")
-        print(f"   • API/data issues")
-        
-        summary_msg += "\n😴 No signals with relaxed thresholds"
-
-    sys.stdout.flush()
+    summary_msg = (f"✅ *Scan Summary*\n"
+                  f"📊 Analyzed: {analyzed_count}/{total_symbols}\n"
+                  f"🎯 Signals: {len(signals)}\n"
+                  f"❌ Errors: {errors}\n"
+                  f"⏰ Completed: {time.strftime('%H:%M:%S UTC')}")
     tg(summary_msg)
 
 if __name__ == "__main__":
