@@ -20,8 +20,8 @@ GRID_HEIGHT = 0.05  # 5% of current price as total range width
 GRIDS_AMOUNT = 21   # Default number of grids (optional fixed value)
 
 # RELAXED THRESHOLDS FOR TESTING
-POSITION_THRESHOLD = 0.4
-RSI_OVERSOLD = 40
+POSITION_THRESHOLD = 0.3
+RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 60
 REQUIRE_ALL_INDICATORS = False
 
