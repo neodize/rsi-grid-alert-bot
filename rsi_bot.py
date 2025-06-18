@@ -148,23 +148,45 @@ def calc_rsi(sym, closes, period=14):
 
 # ── MAIN ANALYSIS ────────────────────────────────────
 def analyze_symbol(sym):
-    """Analyze single symbol with full debug."""
+    """Analyze single symbol with ENHANCED debug."""
     print(f"\n🔍 ANALYZING {sym}")
     print("=" * 50)
     
-    # Get price data
+    # FORCE CONSOLE OUTPUT
+    import sys
+    sys.stdout.flush()
+    
+    # Get price data with EXTRA debug
+    print(f"  📥 About to fetch closes for {sym}...")
+    sys.stdout.flush()
+    
     closes = fetch_closes(sym, "5M", 100)
+    print(f"  📊 fetch_closes returned: {len(closes)} items")
+    print(f"  📊 closes type: {type(closes)}")
+    if closes:
+        print(f"  📊 First few closes: {closes[:5]}")
+        print(f"  📊 Last few closes: {closes[-5:]}")
+    sys.stdout.flush()
+    
     if len(closes) < 20:
-        print(f"❌ {sym}: Insufficient data ({len(closes)} closes)")
+        print(f"❌ {sym}: Insufficient data ({len(closes)} closes) - RETURNING NONE")
+        sys.stdout.flush()
         return None
     
-    # Calculate RSI
+    # Calculate RSI with EXTRA debug
+    print(f"  📈 About to calculate RSI for {sym}...")
+    sys.stdout.flush()
+    
     rsi = calc_rsi(sym, closes)
+    print(f"  📈 calc_rsi returned: {rsi}")
+    sys.stdout.flush()
+    
     if rsi is None:
-        print(f"❌ {sym}: RSI calculation failed")
+        print(f"❌ {sym}: RSI calculation failed - RETURNING NONE")
+        sys.stdout.flush()
         return None
     
-    # Calculate volatility
+    # Calculate volatility with EXTRA debug
     recent_closes = closes[-50:] if len(closes) >= 50 else closes
     low = min(recent_closes)
     high = max(recent_closes)
@@ -175,33 +197,48 @@ def analyze_symbol(sym):
     else:
         volatility = ((high - low) / current) * 100
     
-    print(f"  📊 {sym} METRICS:")
-    print(f"    💰 Current Price: {current:.6f}")
+    print(f"  📊 {sym} DETAILED METRICS:")
+    print(f"    💰 Current Price: {current}")
     print(f"    📈 RSI: {rsi}")
-    print(f"    📊 Volatility: {volatility:.2f}%")
-    print(f"    📏 Range: {low:.6f} - {high:.6f}")
+    print(f"    📊 Volatility: {volatility:.4f}%")
+    print(f"    📏 Low: {low}, High: {high}")
+    print(f"    🎯 VOL_THRESHOLD: {VOL_THRESHOLD}%")
+    print(f"    🎯 RSI_OVERBOUGHT: {RSI_OVERBOUGHT}")
+    print(f"    🎯 RSI_OVERSOLD: {RSI_OVERSOLD}")
+    sys.stdout.flush()
     
-    # Determine signal
+    # DETAILED signal logic
     zone = None
     reason = "No signal"
     
-    # Check volatility first
-    if volatility < VOL_THRESHOLD:
-        reason = f"Low volatility ({volatility:.2f}% < {VOL_THRESHOLD}%)"
-    # Check RSI conditions
-    elif rsi <= RSI_OVERBOUGHT:  # Remember we swapped these for debugging
-        zone = "Short"
-        reason = f"RSI {rsi} <= {RSI_OVERBOUGHT} (Short signal)"
-    elif rsi >= RSI_OVERSOLD:
-        zone = "Long" 
-        reason = f"RSI {rsi} >= {RSI_OVERSOLD} (Long signal)"
-    else:
-        reason = f"RSI {rsi} in neutral zone ({RSI_OVERBOUGHT}-{RSI_OVERSOLD})"
+    print(f"  🔍 SIGNAL LOGIC CHECK:")
+    print(f"    Volatility check: {volatility:.4f}% >= {VOL_THRESHOLD}% ? {volatility >= VOL_THRESHOLD}")
     
-    print(f"  🎯 DECISION: {reason}")
+    if volatility < VOL_THRESHOLD:
+        reason = f"FAILED: Low volatility ({volatility:.4f}% < {VOL_THRESHOLD}%)"
+        print(f"    ❌ {reason}")
+    else:
+        print(f"    ✅ Volatility passed")
+        print(f"    RSI check: {rsi} <= {RSI_OVERBOUGHT} (Short) ? {rsi <= RSI_OVERBOUGHT}")
+        print(f"    RSI check: {rsi} >= {RSI_OVERSOLD} (Long) ? {rsi >= RSI_OVERSOLD}")
+        
+        if rsi <= RSI_OVERBOUGHT:
+            zone = "Short"
+            reason = f"SIGNAL: RSI {rsi} <= {RSI_OVERBOUGHT} (Short signal)"
+            print(f"    ✅ SHORT SIGNAL DETECTED")
+        elif rsi >= RSI_OVERSOLD:
+            zone = "Long" 
+            reason = f"SIGNAL: RSI {rsi} >= {RSI_OVERSOLD} (Long signal)"
+            print(f"    ✅ LONG SIGNAL DETECTED")
+        else:
+            reason = f"FAILED: RSI {rsi} in neutral zone ({RSI_OVERBOUGHT}-{RSI_OVERSOLD})"
+            print(f"    ❌ {reason}")
+    
+    print(f"  🎯 FINAL DECISION: {reason}")
+    sys.stdout.flush()
     
     if zone:
-        print(f"  ✅ SIGNAL DETECTED: {zone}")
+        print(f"  ✅ RETURNING SIGNAL: {zone}")
         return {
             "symbol": sym,
             "zone": zone,
@@ -212,83 +249,9 @@ def analyze_symbol(sym):
             "high": high
         }
     else:
-        print(f"  ❌ NO SIGNAL")
+        print(f"  ❌ RETURNING NONE")
         return None
-
-# ── MAIN FUNCTION ────────────────────────────────────
-def main():
-    """Debug run."""
-    print("🐛 RSI BOT - FULL DEBUG MODE")
-    print("=" * 60)
-    
-    # Send debug start message
-    tg(f"🐛 Debug scan started\nThresholds: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT}|≥{RSI_OVERSOLD}")
-    
-    # Get symbols
-    symbols = fetch_symbols()
-    if not symbols:
-        print("❌ No symbols to analyze")
-        return
-    
-    print(f"\n🎯 Will analyze {len(symbols)} symbols in detail:")
-    for i, sym in enumerate(symbols, 1):
-        print(f"  {i:2d}: {sym}")
-    
-    # Analyze each symbol
-    signals = []
-    analyzed_count = 0
-    
-    for sym in symbols:
-        try:
-            result = analyze_symbol(sym)
-            analyzed_count += 1
-            
-            if result:
-                signals.append(result)
-                print(f"🚨 SIGNAL #{len(signals)}: {sym} - {result['zone']}")
         
-        except Exception as e:
-            print(f"💥 ERROR analyzing {sym}: {e}")
-    
-    # Summary
-    print(f"\n📊 DEBUG SUMMARY")
-    print("=" * 30)
-    print(f"🔍 Analyzed: {analyzed_count} symbols")
-    print(f"🎯 Signals: {len(signals)}")
-    print(f"📋 Criteria: Vol≥{VOL_THRESHOLD}%, RSI≤{RSI_OVERBOUGHT} OR RSI≥{RSI_OVERSOLD}")
-    
-    summary_msg = f"🐛 *Debug Complete*\n📊 Analyzed: {analyzed_count}\n🎯 Signals: {len(signals)}"
-    
-    if signals:
-        print(f"\n🚨 FOUND {len(signals)} SIGNALS:")
-        for s in signals:
-            print(f"  • {s['symbol']}: {s['zone']} (RSI: {s['rsi']}, Vol: {s['vol']:.2f}%)")
-            
-        summary_msg += f"\n✅ Found signals!"
-        
-        # Send individual signal notifications
-        for signal in signals:
-            signal_msg = (f"🎯 *{signal['symbol']}* - {signal['zone']}\n"
-                         f"📊 RSI: {signal['rsi']}\n"
-                         f"📈 Vol: {signal['vol']:.2f}%\n"
-                         f"💰 Price: {signal['price']:.6f}")
-            tg(signal_msg)
-            time.sleep(1)
-    else:
-        print("\n😴 NO SIGNALS FOUND")
-        summary_msg += "\n😴 No signals detected"
-        
-        # This means either:
-        # 1. All RSI values are between 40-60
-        # 2. All volatility is < 0.01%
-        # 3. Data quality issues
-        
-        print("\n🤔 POSSIBLE REASONS:")
-        print("  • All RSI values in 40-60 range (very neutral market)")
-        print("  • Volatility below 0.01% (extremely stable)")
-        print("  • API data quality issues")
-        print("  • Logic error in signal detection")
-    
     tg(summary_msg)
 
 if __name__ == "__main__":
