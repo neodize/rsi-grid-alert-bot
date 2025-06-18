@@ -252,7 +252,6 @@ def save_state(d):
 # ── NOTIFICATION FUNCTIONS ──────────────────────────
 def start_msg(d, rank=None):
     score = score_signal(d)
-    mode = grid_type_hint((d["high"] - d["low"]) / d["now"] * 100, d["vol"])
     total_seconds = d["cycle"] * 24 * 3600
     days = int(total_seconds // (24 * 3600))
     remaining_seconds = total_seconds % (24 * 3600)
@@ -265,8 +264,7 @@ def start_msg(d, rank=None):
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
-            f"🌀 Score: {score}\n"
-            f"🔧 Grid Mode Hint: {mode}")
+            f"🌀 Score: {score}")
 
 def stop_msg(sym, reason, info):
     closes = fetch_closes(sym, interval="5M", limit=1)
@@ -353,13 +351,6 @@ def compute_macd(closes, slow=26, fast=12, signal=9):
     histogram = macd_line - signal_line
     return macd_line[-1], signal_line[-1], histogram[-1]
 
-def regime_type(std_dev, vol):
-    if vol > 3 or std_dev > 0.015:
-        return "Trending"
-    elif vol < 1.5 and std_dev < 0.005:
-        return "Sideways"
-    return "Normal"
-
 # ── ANALYSE FUNCTION ────────────────────────────────
 def analyse(sym, interval="5M", limit=400, use_grid_height=True):
     closes = fetch_closes(sym, interval, limit=limit)
@@ -374,7 +365,7 @@ def analyse(sym, interval="5M", limit=400, use_grid_height=True):
         high = px * (1 + grid_height / 2)
         rng = high - low
     else:
-        low = min(closes) * 0.95  # Extend lower bound by 5% to include recent lows
+        low = min(closes) * 0.95
         high = max(closes)
         rng = high - low
     
@@ -543,11 +534,7 @@ def main():
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
-        config_info = (f"📊 Position threshold: {POSITION_THRESHOLD}\n"
-                       f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
-                       f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
-                       f"📏 Grid height: {GRID_HEIGHT*100}% | 🧮 Default grids: {GRIDS_AMOUNT}\n"
-                       f"💰 Capital: $100 | 📈 Leverage: 10x\n")
+        config_info = (f"💰 Capital: $100 | 📈 Leverage: 10x\n")
         
         for i, (score, r) in enumerate(scored, 1):
             m = start_msg(r, i)
