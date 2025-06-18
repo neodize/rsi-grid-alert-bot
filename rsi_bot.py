@@ -18,8 +18,8 @@ STATE_FILE = Path("active_grids.json")
 VOL_THRESHOLD = 2.5
 
 # RELAXED THRESHOLDS FOR TESTING
-POSITION_THRESHOLD = 0.3  # Relaxed from 0.25/0.75 to 0.4/0.6 - 0.4
-RSI_OVERSOLD = 30         # Relaxed from 30/35 - 40
+POSITION_THRESHOLD = 0.4  # Relaxed from 0.25/0.75 to 0.4/0.6
+RSI_OVERSOLD = 40         # Relaxed from 30/35
 RSI_OVERBOUGHT = 60       # Relaxed from 65/70
 REQUIRE_ALL_INDICATORS = False  # Allow 2 out of 3 indicators instead of all 3
 
@@ -176,16 +176,13 @@ def start_msg(d, rank=None):
     cycle_time = f"{days} Day(s) {hours} Hour(s) {minutes} Minute(s)" if days > 0 else f"{hours} Hour(s) {minutes} Minute(s)"
     prefix = f"🥇 Top {rank} — {d['symbol']}" if rank else f"📈 Start Grid Bot: {d['symbol']}"
     
-    # Add relaxed conditions warning
-    warning = "\n⚠️ *RELAXED CONDITIONS ACTIVE* - Review before trading!"
-    
     return (f"{prefix}\n"
             f"📊 Range: {money(d['low'])} – {money(d['high'])}\n"
             f"📈 Entry Zone: {ZONE_EMO[d['zone']]}\n"
             f"🧮 Grids: {d['grids']} | 📏 Spacing: {d['spacing']}%\n"
             f"🌪️ Volatility: {d['vol']}% | ⏱️ Cycle: {cycle_time}\n"
             f"🌀 Score: {score} | ⚙️ Leverage Hint: {lev}\n"
-            f"🔧 Grid Mode Hint: {mode}{warning}")
+            f"🔧 Grid Mode Hint: {mode}")
 
 def stop_msg(sym, reason, info):
     closes = fetch_closes(sym, interval="5M", limit=1)
@@ -394,15 +391,6 @@ def scan_with_fallback(sym, vol_threshold=VOL_THRESHOLD):
 def main():
     logging.info("=== Starting RSI Bot Scan (RELAXED CONDITIONS) ===")
     
-    # Send startup message with configuration
-    if TG_TOKEN and TG_CHAT_ID:
-        startup_msg = (f"🤖 RSI Bot started with RELAXED conditions\n"
-                      f"📊 Position threshold: {POSITION_THRESHOLD} (was 0.25)\n"
-                      f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT} (was 30/70)\n"
-                      f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n"
-                      f"🔍 Scanning {TOP_N} symbols...")
-        tg(startup_msg)
-    
     prev = load_state()
     nxt, scored, stops = {}, [], []
     current_time = time.time()
@@ -467,12 +455,21 @@ def main():
     
     logging.info(f"Scan complete: {signals_found} signals found, {len(scored)} new, {len(stops)} stops")
 
-    # Send new signals
+    # Send new signals (with configuration info in first message only)
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
         buf = ""
+        
+        # Add configuration info to the first message only
+        config_info = (f"📊 Position threshold: {POSITION_THRESHOLD} (was 0.25)\n"
+                      f"📈 RSI thresholds: {RSI_OVERSOLD}/{RSI_OVERBOUGHT} (was 30/70)\n"
+                      f"🔧 Require all indicators: {REQUIRE_ALL_INDICATORS}\n\n")
+        
         for i, (score, r) in enumerate(scored, 1):
             m = start_msg(r, i)
+            if i == 1:  # Add config info to first message
+                m = config_info + m
+            
             if len(buf) + len(m) > 3500:
                 tg(buf)
                 buf = m + "\n\n"
